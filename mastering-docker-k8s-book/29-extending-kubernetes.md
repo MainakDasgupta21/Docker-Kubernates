@@ -148,6 +148,21 @@ An **operator** is a controller (often packaged with its CRDs) that encodes huma
 
 The reconciliation loop is the same idea as built-in controllers:
 
+```mermaid
+flowchart LR
+  user["User applies TaskBatch custom resource"] --> apiServer["Kubernetes API server"]
+  apiServer --> etcd["etcd stores desired spec"]
+  apiServer --> operator["TaskBatch operator watches changes"]
+  operator --> compare{"Desired state matches live state?"}
+  compare -->|No| children["Create, update, or delete Jobs and Pods"]
+  children --> apiServer
+  compare -->|Yes| status["Update observed status"]
+  status --> apiServer
+  apiServer --> operator
+```
+
+*Figure 29.1: A CRD stores desired state while an operator repeatedly reconciles child resources and reports status.*
+
 ```text
 Watch TaskBatch objects
         │
@@ -219,6 +234,25 @@ CRDs extend the *same* apiserver process with new types. The **aggregation layer
 ### Under the hood
 
 You register an `APIService` that maps a group-version to a Service running your extension server:
+
+```mermaid
+sequenceDiagram
+  participant client as kubectl
+  participant apiServer as kube-apiserver
+  participant apiService as APIService registration
+  participant extensionService as Extension Service
+  participant extensionApi as Extension API server
+  client->>apiServer: Request aggregated API group
+  apiServer->>apiService: Resolve group and version
+  apiService-->>apiServer: Service destination and CA
+  apiServer->>extensionService: Proxy authenticated request
+  extensionService->>extensionApi: Forward request
+  extensionApi-->>extensionService: Extension API response
+  extensionService-->>apiServer: Proxied response
+  apiServer-->>client: API response
+```
+
+*Figure 29.2: The aggregation layer keeps kube-apiserver as the front door while proxying selected API groups to an extension server.*
 
 ```yaml
 apiVersion: apiregistration.k8s.io/v1
@@ -523,7 +557,31 @@ Use match conditions so you do not stack duplicate sidecars on every update. Pol
 | Admission that calls inventory/DB/IdP | Admission webhook |
 | Package CRDs + controller + RBAC for others | Operator + Helm/OLM-style distribution |
 
-<!-- VISUAL: Decision tree from "need new API?" to CRD/operator vs "need gate on write?" to CEL policy vs webhook -->
+Admission choices differ operationally as well as functionally:
+
+| Mechanism | Mutates | Validates | External lookup | Extra service | Best fit |
+|---|---:|---:|---:|---:|---|
+| ValidatingAdmissionPolicy | No | Yes | No | No | Local CEL validation |
+| MutatingAdmissionPolicy | Yes | Indirectly with paired validation | No | No | Local defaulting or injection |
+| Validating webhook | No | Yes | Yes | Yes | External or complex decisions |
+| Mutating webhook | Yes | Often paired with validation | Yes | Yes | Complex mutation needing external context |
+
+```mermaid
+flowchart TB
+  start{"Need a new API noun?"}
+  start -->|Yes| action{"Must software continuously act on it?"}
+  action -->|No| crd["Use a CRD"]
+  action -->|Yes| operator["Use a CRD and operator"]
+  start -->|No| gate{"Need to gate or change writes?"}
+  gate -->|No| builtIn["Use built-in APIs and controllers"]
+  gate -->|Yes| external{"Needs external data or complex side effects?"}
+  external -->|Yes| webhook["Use an admission webhook"]
+  external -->|No| change{"Change the object?"}
+  change -->|Yes| mutatingPolicy["Use MutatingAdmissionPolicy"]
+  change -->|No| validatingPolicy["Use ValidatingAdmissionPolicy"]
+```
+
+*Figure 29.3: Choose CRDs and operators for new declarative APIs, and choose CEL policies or webhooks for admission-time decisions.*
 
 ---
 

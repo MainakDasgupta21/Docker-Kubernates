@@ -69,4 +69,4 @@ If a feature is alpha/beta on your exact patch, check feature gates before teach
 - Appendix F maps chapters to official sections.
 - Prefer project docs over vendor blogs when the two disagree about defaults.
 
-**Prev:** [Appendix F — Official Docs Map](f-official-docs-map.md) · **Next:** [Back to README](../README.md)
+**Prev:** [Appendix F — Official Docs Map](f-official-docs-map.md) · **Next:** [Appendix H — Figure Index](h-figure-index.md)

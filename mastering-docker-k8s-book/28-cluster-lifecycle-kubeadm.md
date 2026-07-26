@@ -174,7 +174,25 @@ kube-proxy-abc12                   1/1     Running   0          10m
 kube-scheduler-cp-1                1/1     Running   0          1h
 ```
 
-<!-- VISUAL: Sequence: prepare nodes → kubeadm init → install CNI → kubeadm join workers → kubectl get nodes Ready -->
+```mermaid
+sequenceDiagram
+  participant operator as Operator
+  participant controlPlane as First control-plane node
+  participant cni as CNI plugin
+  participant workers as Worker nodes
+  participant apiServer as Kubernetes API
+  operator->>controlPlane: Prepare runtime, ports, and packages
+  operator->>controlPlane: kubeadm init
+  controlPlane->>apiServer: Start static control-plane Pods
+  operator->>cni: Install CNI manifest
+  cni->>apiServer: Establish Pod networking
+  operator->>workers: kubeadm join with token and CA hash
+  workers->>apiServer: Register nodes and start kubelet
+  operator->>apiServer: kubectl get nodes
+  apiServer-->>operator: Control plane and workers Ready
+```
+
+*Figure 28.1: kubeadm bootstrap establishes the control plane before networking and worker joins make the cluster ready.*
 
 ### In production
 
@@ -200,6 +218,26 @@ Two common kubeadm patterns:
 | **External etcd** | Separate etcd nodes | Independent scaling and failure domains | More hosts and operational surface |
 
 Both need a **load-balanced or VIP `controlPlaneEndpoint`** so clients and kubelets talk to one stable name.
+
+```mermaid
+flowchart TB
+  clients["kubectl and kubelets"] --> endpoint["Load balancer or VIP"]
+  endpoint --> cpOne["Control plane 1"]
+  endpoint --> cpTwo["Control plane 2"]
+  endpoint --> cpThree["Control plane 3"]
+  subgraph stackedTopology["Stacked topology"]
+    cpOne --> stackedEtcdOne["Local etcd 1"]
+    cpTwo --> stackedEtcdTwo["Local etcd 2"]
+    cpThree --> stackedEtcdThree["Local etcd 3"]
+  end
+  subgraph externalTopology["External-etcd topology"]
+    cpOne --> externalEtcd["Dedicated etcd quorum"]
+    cpTwo --> externalEtcd
+    cpThree --> externalEtcd
+  end
+```
+
+*Figure 28.2: Stacked HA co-locates an etcd member with each control plane, whereas external-etcd HA separates the quorum onto dedicated hosts.*
 
 ```text
                     ┌─────────────────────┐
@@ -359,6 +397,23 @@ $ sudo kubeadm upgrade node
 ```
 
 Worker drain pattern (next section) wraps the kubelet bump.
+
+```mermaid
+flowchart LR
+  review["Review release notes and API removals"] --> backup["Back up etcd"]
+  backup --> plan["Upgrade kubeadm and run upgrade plan"]
+  plan --> firstControlPlane["Apply first control-plane upgrade"]
+  firstControlPlane --> otherControlPlanes["Upgrade remaining control planes"]
+  otherControlPlanes --> drainWorker["Cordon and drain one worker"]
+  drainWorker --> upgradeWorker["Upgrade kubeadm, kubelet, and kubectl"]
+  upgradeWorker --> verifyWorker{"Node and workloads healthy?"}
+  verifyWorker -->|Yes| moreWorkers{"More workers?"}
+  moreWorkers -->|Yes| drainWorker
+  moreWorkers -->|No| finalChecks["Run cluster and workload checks"]
+  verifyWorker -->|No| stop["Stop rollout and recover"]
+```
+
+*Figure 28.3: A kubeadm minor upgrade proceeds through backup, control planes, and one drained worker at a time with health gates.*
 
 ### In production
 

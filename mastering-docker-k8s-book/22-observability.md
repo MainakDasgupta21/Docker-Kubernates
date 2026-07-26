@@ -19,6 +19,10 @@
 
 You would not fly a passenger jet with taped-over gauges. CPU spikes, memory leaks, crashing containers, and slow API calls are the turbulence of production systems. **Observability** is the discipline of making a system’s internal state visible from the outside through **metrics**, **logs**, and **traces**.
 
+![Aircraft instrument panel for metrics logs and traces](assets/analogy-instrument-panel.png)
+
+*Figure 22.A: Metrics, logs, and traces are the gauges that keep the cluster flight safe.*
+
 Kubernetes gives you building blocks (Events, container logs, resource metrics APIs, kubelet Summary API). Production teams usually add a metrics stack (often **Prometheus** + **Grafana**), a log pipeline, and eventually **OpenTelemetry** traces. This chapter builds the mental model and the first practical tools—without pretending a single dashboard solves reliability.
 
 ---
@@ -37,7 +41,17 @@ Kubernetes gives you building blocks (Events, container logs, resource metrics A
 | **Logs** | What exactly happened in this request/process? | stdout/stderr, node log query, Loki/ELK, cloud logs |
 | **Traces** | Where did time go across services? | OpenTelemetry, Jaeger, Tempo, cloud APM |
 
-<!-- VISUAL: Triangle labeled Metrics / Logs / Traces with Kubernetes API server and apps in the center -->
+```mermaid
+flowchart TB
+  metrics["Metrics"] --- center["Apps + API server"]
+  logs["Logs"] --- center
+  traces["Traces"] --- center
+  metrics --- logs
+  logs --- traces
+  traces --- metrics
+```
+
+*Figure 22.1: Metrics, logs, and traces form a triangle around workloads and the Kubernetes API—each answers different questions.*
 
 ### In production
 
@@ -76,6 +90,16 @@ task-api-6d7f8c9b5d-qw8pz    12m          58Mi
 > ⚠️ **Common Pitfall:** HPA on CPU/memory will not work without a functioning Metrics API. If `kubectl top` fails, fix metrics-server before debugging HPA formulas.
 
 > 💡 **Tip:** metrics-server is **not** long-term metrics storage. Historical graphs need Prometheus (or a cloud metrics backend).
+
+```mermaid
+flowchart LR
+  kubelet["kubelet Summary API"] --> ms["metrics-server"]
+  ms --> metricsApi["Metrics API metrics.k8s.io"]
+  metricsApi --> top["kubectl top"]
+  metricsApi --> hpa["Resource-based HPA"]
+```
+
+*Figure 22.2: metrics-server scrapes kubelets and exposes the Metrics API used by `kubectl top` and CPU/memory HPA.*
 
 ### In production
 
@@ -171,7 +195,19 @@ $ kubectl get --raw "/api/v1/nodes/worker-1/proxy/logs/?query=kubelet"
 
 Use this to inspect kubelet or other permitted system services without SSH. Access is still gated by RBAC on the node proxy/logs subresource—treat it as privileged.
 
-<!-- VISUAL: Nodes with DaemonSet agents shipping to a central log store; optional sidecar; node log query arrow from kubectl to kubelet -->
+```mermaid
+flowchart TB
+  subgraph nodes["Worker nodes"]
+    app["App stdout/stderr"] --> kubeletLogs["kubelet container logs"]
+    agent["DaemonSet log agent"] --> ship["Ship off-node"]
+    sidecar["Optional sidecar"] --> ship
+  end
+  kubeletLogs --> agent
+  ship --> store["Central log store"]
+  kubectl["kubectl"] -->|"node log query"| kubeletApi["kubelet logs API"]
+```
+
+*Figure 22.3: Node agents (DaemonSets) ship container logs centrally; sidecars help file-only apps; node log query reaches kubelet without SSH.*
 
 ### In production
 
@@ -226,6 +262,17 @@ metadata:
 
 (Exact discovery depends on your Prometheus configuration—annotations are a common beginner pattern; operators prefer PodMonitor/ServiceMonitor CRDs.)
 
+```mermaid
+flowchart LR
+  prom["Prometheus"] -->|"scrape"| apps["App /metrics"]
+  prom -->|"scrape"| ksm["kube-state-metrics"]
+  prom -->|"scrape"| nodeExp["node-exporter"]
+  prom --> grafana["Grafana dashboards"]
+  prom --> am["Alertmanager"]
+```
+
+*Figure 22.4: Prometheus scrapes workloads and cluster exporters; Grafana visualizes series and Alertmanager routes pages.*
+
 > 📘 **Deep Dive (optional):** Alertmanager routes alerts to Slack, PagerDuty, email. Good alerts are symptom-based (“error rate high”) rather than “pod restarted once.”
 
 ### In production
@@ -276,6 +323,23 @@ service:
       receivers: [otlp]
       exporters: [otlp]
 ```
+
+```mermaid
+sequenceDiagram
+  participant Client as client
+  participant Api as taskApi
+  participant Db as database
+  participant Collector as otelCollector
+  participant Backend as jaegerOrTempo
+  Client->>Api: request with traceparent
+  Api->>Db: span for query
+  Db-->>Api: result
+  Api-->>Client: response
+  Api->>Collector: export spans OTLP
+  Collector->>Backend: store trace tree
+```
+
+*Figure 22.5: OpenTelemetry propagates context across hops; the Collector exports the span tree to a tracing backend.*
 
 Correlate with logs by injecting the trace ID into structured log lines.
 

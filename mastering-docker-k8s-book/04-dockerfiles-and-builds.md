@@ -143,6 +143,16 @@ README.md
 
 Never rely on `.dockerignore` alone for secrets—do not put secrets in the directory at all if you can avoid it. Prefer BuildKit **secret mounts** (section 04.8) when a build step truly needs a token.
 
+```mermaid
+flowchart LR
+  contextDir["Project directory"] --> dockerignore[".dockerignore filters"]
+  dockerignore --> sentCtx["Build context sent to daemon"]
+  sentCtx --> dockerfile["Dockerfile instructions"]
+  dockerfile --> layers["Image layers"]
+```
+
+*Figure 04.1: The build context is everything you hand the daemon — `.dockerignore` keeps junk and secrets out before `COPY` ever runs.*
+
 ### In production
 
 Review `.dockerignore` in code review the same way you review `.gitignore`. CI should fail builds that accidentally copy `.env` or cloud credential files into layers.
@@ -300,6 +310,18 @@ $ docker build --build-arg APP_VERSION=0.1.0 -t task-api:0.1.0 .
 
 The `RUN --mount=type=cache,target=/root/.cache/pip` line keeps a pip cache *across builds* without committing cache files into image layers. That is BuildKit’s “why”: faster rebuilds without fatter images.
 
+```mermaid
+flowchart TD
+  syntax["syntax=docker/dockerfile:1"] --> buildkit["BuildKit build"]
+  buildkit --> cacheMount["Cache mount: pip cache stays on builder"]
+  buildkit --> secretMount["Secret mount: token for one RUN only"]
+  buildkit --> layers["Committed layers stay lean"]
+  cacheMount --> layers
+  secretMount --> layers
+```
+
+*Figure 04.2: BuildKit separates ephemeral mounts (cache, secrets) from what gets committed into image layers.*
+
 ```bash
 $ docker history task-api:0.1.0
 ```
@@ -318,7 +340,22 @@ Keep BuildKit enabled (default on current Desktop/Engine). In CI, use cache expo
 
 **How:** Stage `builder` installs into `/install`; stage `runtime` copies only `/install` and `app.py`. The final image never contains the compiler packages from the builder stage.
 
-<!-- VISUAL: Two boxes — builder (tools + wheels) arrow “COPY --from=builder” → slim runtime (gunicorn + app only) -->
+```mermaid
+flowchart LR
+  subgraph builder["Stage: builder"]
+    tools["build-essential + pip"]
+    wheels["Installed wheels in /install"]
+    tools --> wheels
+  end
+  subgraph runtime["Stage: runtime"]
+    slim["python:slim base"]
+    app["gunicorn + app.py only"]
+    slim --> app
+  end
+  wheels -->|"COPY --from=builder"| app
+```
+
+*Figure 04.3: Multi-stage builds compile or install in a heavy stage, then copy only runtime artifacts into a slim final image.*
 
 ### Under the hood
 
@@ -543,6 +580,18 @@ Keep `ENTRYPOINT` stable (the binary) and override `CMD` for flags. That pattern
 | Shell form wrapping | Avoid when possible; exec form (`JSON` array) handles signals better |
 
 Exec form is preferred so PID 1 receives signals correctly (graceful stop). Pair with `STOPSIGNAL` and a long enough `docker stop -t` grace period when draining requests.
+
+```mermaid
+flowchart TD
+  start["How should the process start?"] --> fixed{"Fixed binary + overridable args?"}
+  fixed -->|Yes| epCmd["ENTRYPOINT app + CMD flags"]
+  fixed -->|No easy override needed| cmdOnly["CMD only"]
+  epCmd --> execForm["Prefer exec-form JSON arrays"]
+  cmdOnly --> execForm
+  execForm --> signals["PID 1 receives STOPSIGNAL cleanly"]
+```
+
+*Figure 04.4: Prefer exec-form `ENTRYPOINT`/`CMD` so overrides stay predictable and signals reach the real process.*
 
 ### In production
 

@@ -26,6 +26,21 @@ Supply-chain security turns "we built this" into a series of testable claims:
 
 No single product answers every question. Docker Scout analyzes content and policy posture. Docker Hardened Images provide a curated base-image option with signed evidence. Cosign and Notation verify signatures and identities. Registries and admission controls enforce decisions before untrusted content reaches production.
 
+```mermaid
+flowchart LR
+  source["Reviewed source"] --> build["Build candidate digest"]
+  build --> evidence["Generate SBOM and provenance"]
+  evidence --> scan["Scan and evaluate policy"]
+  scan --> test["Test immutable digest"]
+  test --> sign["Sign with release identity"]
+  sign --> promote["Promote same digest"]
+  promote --> admit{"Admission verification passes?"}
+  admit -->|Yes| run["Run in production"]
+  admit -->|No| reject["Reject deployment"]
+```
+
+*Figure 26.1: Trust accumulates through build, evidence, scan, test, signature, promotion, and admission gates.*
+
 > 💡 **Tip:** Tags are convenient names; digests are content identities. Evaluate, sign, promote, and deploy by digest whenever the decision must remain stable.
 
 
@@ -163,6 +178,20 @@ A signature binds an identity or key to a digest. Verification asks whether the 
 
 An SBOM says what is inside. Provenance says how a build happened. A signature says an approved identity endorsed particular bytes or a particular statement. These controls complement one another.
 
+```mermaid
+flowchart TB
+  digest["Image digest"]
+  sbom["SBOM: contents"] --> digest
+  provenance["Provenance: source and build"] --> digest
+  signature["Signature: approved identity"] --> digest
+  digest --> policy["Trust policy"]
+  policy --> decision{"Identity, origin, contents, and integrity accepted?"}
+  decision -->|Yes| trusted["Trusted for this environment"]
+  decision -->|No| untrusted["Quarantine or reject"]
+```
+
+*Figure 26.2: SBOM, provenance, and signature answer different questions that policy combines into one decision.*
+
 Cosign is part of Sigstore and supports key-based and keyless signing. Notation is a CNCF Notary Project tool implementing the Notary Project signature model. Both store signatures as OCI-related artifacts in supporting registries, but their trust-policy formats and ecosystems differ.
 
 ### Under the hood
@@ -265,6 +294,26 @@ A robust sequence is:
 6. Verify again at admission or deployment.
 
 Pass the digest between stages as a machine-readable artifact. Do not resolve the tag independently in every stage because a concurrent push can create a time-of-check/time-of-use race.
+
+```mermaid
+sequenceDiagram
+  participant pipeline as Release pipeline
+  participant registry as OCI registry
+  participant scanner as Scanner
+  participant signer as Signing service
+  participant admission as Admission controller
+  pipeline->>registry: Push candidate and attestations
+  registry-->>pipeline: Return immutable digest
+  pipeline->>scanner: Evaluate that digest
+  scanner-->>pipeline: Policy result
+  pipeline->>signer: Sign approved digest
+  signer->>registry: Store signature
+  admission->>registry: Fetch digest evidence
+  admission->>admission: Verify signer and policy
+  admission-->>pipeline: Admit or reject
+```
+
+*Figure 26.3: Every release stage passes the same digest, preventing a mutable tag from changing between review and admission.*
 
 ### In production
 

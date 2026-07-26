@@ -16,6 +16,10 @@
 
 Think of Docker as a restaurant. You (the **client**) place orders with a waiter. The **kitchen** (the **engine/daemon**) prepares dishes according to recipes (**images**) and serves plates (**containers**). Walk-in customers never flip burners themselves; they talk to the waiter API.
 
+![Restaurant kitchen stations representing Docker architecture roles](assets/analogy-restaurant-kitchen.png)
+
+*Figure 02.A: The Docker client is the waiter; the daemon is the kitchen that actually cooks.*
+
 If the kitchen is down, the waiter can still smile—but no food arrives. Beginners often install only a CLI-looking tool or forget to *start* Docker Desktop, then wonder why every command says the daemon is not running. This chapter gets the kitchen open and shows you the floor plan.
 
 ---
@@ -32,6 +36,17 @@ You have two common beginner paths: **Docker Desktop** (Windows, macOS, and many
 | **Docker Engine** on Linux | Servers and Linux workstations | Install engine packages directly; no Desktop required |
 
 This book’s commands assume a working Linux container engine reachable as `docker`. On Desktop, that is automatic once Docker is running.
+
+```mermaid
+flowchart TD
+  start["Need Docker?"] --> platform{"Platform"}
+  platform -->|Windows / macOS| desktop["Docker Desktop<br/>Linux engine in a VM"]
+  platform -->|Linux server / workstation| engine["Docker Engine packages"]
+  desktop --> verify["docker version + hello-world"]
+  engine --> verify
+```
+
+*Figure 02.1: Beginners usually pick Desktop on Windows/macOS or Engine on Linux — both end at the same verify step.*
 
 ### Under the hood
 
@@ -150,7 +165,17 @@ Automate a post-install health check in onboarding docs: `docker version`, `dock
 
 You type `docker …`. A client sends an API request. A long-running engine accepts it, then asks lower-level runtimes to create the actual isolated process. Registries sit on the side for pull and push.
 
-<!-- VISUAL: docker CLI → API (named pipe / unix socket / TCP) → dockerd → containerd → runc → container process; registries on the side for pull/push -->
+```mermaid
+flowchart LR
+  cli["docker CLI"] --> api["API<br/>unix socket / npipe / TCP"]
+  api --> dockerd["dockerd"]
+  dockerd --> containerd["containerd"]
+  containerd --> runc["runc"]
+  runc --> process["Container process"]
+  dockerd <--> registry["Registry<br/>pull / push"]
+```
+
+*Figure 02.2: A `docker` request travels from the CLI through the Engine API, dockerd, containerd, and runc to the container process.*
 
 ### Under the hood
 
@@ -238,6 +263,25 @@ Layered view:
 6. The process prints the hello message and exits.
 7. With `--rm`, Engine deletes the container’s writable layer.
 
+```mermaid
+sequenceDiagram
+  participant Cli as docker CLI
+  participant Eng as dockerd
+  participant Reg as Registry
+  participant Rt as containerd / runc
+  Cli->>Eng: create + start hello-world
+  Eng->>Eng: Image present locally?
+  alt Miss
+    Eng->>Reg: Pull hello-world
+    Reg-->>Eng: Layers
+  end
+  Eng->>Rt: Create and start process
+  Rt-->>Cli: Hello message, then exit
+  Eng->>Eng: Remove writable layer if --rm
+```
+
+*Figure 02.3: The `docker run hello-world` pipeline — pull if needed, start the process, optionally clean up.*
+
 Understanding this pipeline makes later failures diagnosable: pull problems versus create problems versus start problems versus app crashes.
 
 ### In production
@@ -251,6 +295,21 @@ Teach on-call the same pipeline. A failed deploy is often “registry auth,” �
 ### In plain terms
 
 On Mac and Windows, your containers do not run directly on the host kernel. They run inside a Linux environment Desktop manages. That explains resource knobs, file-sharing quirks, and why Client OS and Server OS differ.
+
+```mermaid
+flowchart TB
+  subgraph hostOs["Host OS: macOS or Windows"]
+    hostCli["docker CLI / Client"]
+  end
+  subgraph linuxVm["Desktop-managed Linux VM"]
+    dockerd["dockerd"]
+    containers["Linux containers"]
+    dockerd --> containers
+  end
+  hostCli -->|API| dockerd
+```
+
+*Figure 02.4: On Desktop, the client runs on the host OS while containers run inside a managed Linux engine.*
 
 ### Under the hood
 

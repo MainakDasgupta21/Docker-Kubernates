@@ -66,6 +66,22 @@ Migration behavior and eligibility are version-sensitive. Read the Engine 29.x d
 
 With the containerd image store, image content and snapshots normally live under `/var/lib/containerd`, while volumes and other daemon data remain under `/var/lib/docker`. The daemon's `data-root` setting does not relocate containerd's root; that is configured separately in containerd.
 
+```mermaid
+flowchart TB
+  dockerCli["Docker CLI"] --> dockerd["dockerd"]
+  dockerd --> activeStore{"Active Engine 29 image store"}
+  activeStore -->|Fresh install default| containerdStore["containerd content store"]
+  containerdStore --> snapshotter["overlayfs snapshotter"]
+  containerdStore --> containerdRoot["/var/lib/containerd"]
+  activeStore -->|Upgraded host may retain| classicStore["Classic graph-driver store"]
+  classicStore --> overlayDriver["overlay2 driver"]
+  classicStore --> dockerRoot["/var/lib/docker"]
+  dockerd --> daemonData["Volumes and daemon data"]
+  daemonData --> dockerRoot
+```
+
+*Figure 27.1: Engine 29 can expose either the containerd image store or the legacy overlay2 graph-driver layout while daemon data remains separate.*
+
 ### In production
 
 Inventory each host before migration:
@@ -173,6 +189,19 @@ Changing the daemon default affects newly created containers, not existing ones.
 
 Some remote drivers can block an application when the destination is unavailable. Delivery mode, buffering, back pressure, and loss behavior vary by driver and options. `docker logs` is not available for every driver or configuration.
 
+```mermaid
+flowchart LR
+  application["Container stdout and stderr"] --> loggingDriver["Docker logging driver"]
+  loggingDriver --> localBuffer["Bounded local rotation"]
+  loggingDriver --> remoteSink["Remote log collector"]
+  remoteSink --> available{"Collector available?"}
+  available -->|Yes| centralStore["Central searchable storage"]
+  available -->|No and blocking| backPressure["Application back pressure"]
+  available -->|No and non-blocking| lossRisk["Buffer growth or record loss"]
+```
+
+*Figure 27.2: Logging-driver delivery settings determine whether a collector outage causes back pressure, buffering, or loss.*
+
 ### In production
 
 Prefer structured single-line records with timestamps, severity, service, request identifier, and stable field names. Keep secrets and personal data out of logs before they reach any driver.
@@ -219,6 +248,21 @@ The default creates or uses a `dockremap` identity with subordinate ranges. Expl
 > ⚠️ **Warning:** In Engine 29.x, the containerd image store and `userns-remap` are incompatible. A fresh Engine 29.x installation using the containerd store cannot simply add `userns-remap`; choose a supported classic-store design or use rootless mode where its constraints fit.
 
 Bind mounts need careful ownership. A UID inside the container maps to a different host UID under user namespaces. Blindly applying permissive modes such as `chmod 777` weakens isolation rather than solving the mapping.
+
+```mermaid
+flowchart TB
+  ordinary["Rootful Docker"] --> rootDaemon["Root daemon and remapped or host users"]
+  rootless["Rootless mode"] --> userDaemon["Unprivileged daemon"]
+  userDaemon --> rootlessContainers["Containers in user namespace"]
+  userns["userns-remap"] --> rootDaemon
+  rootDaemon --> remappedContainers["Container root maps to subordinate host UID"]
+  containerdConstraint["Engine 29 containerd image store"] --> supported{"Compatible choice"}
+  supported --> rootless
+  supported --> ordinary
+  supported -.->|Not compatible| userns
+```
+
+*Figure 27.3: Rootless mode removes daemon root privilege, while userns-remap retains a rootful daemon and is incompatible with the Engine 29 containerd image store.*
 
 ### In production
 

@@ -18,6 +18,10 @@
 
 A touring band’s road manager does not seat musicians randomly. Drummers need space near power. Backup singers should not all sit in the same collapsing row. VIPs get a roped-off section. Some seats are broken and marked “do not use.” When the venue is full, lower-priority guests may be asked to leave so headliners can perform.
 
+![Concert seating chart for Kubernetes scheduling placement](assets/analogy-concert-seating.png)
+
+*Figure 20.A: The scheduler assigns seats (nodes) using rules, not random placement.*
+
 The **kube-scheduler** is that road manager for Pods. Every new Pod without a `nodeName` enters the scheduling queue. The scheduler **filters** nodes that cannot run the Pod, **scores** the remaining nodes, and binds the Pod to the winner. **Priority** and **preemption** decide who yields when capacity is tight. Your job is to express constraints clearly—without over-constraining so nothing can schedule.
 
 ---
@@ -48,7 +52,16 @@ Events:
   Warning  FailedScheduling  0/3 nodes are available: 1 node(s) had untolerated taint..., 2 Insufficient cpu.
 ```
 
-<!-- VISUAL: Flowchart Filter → Score → Bind with example constraints under Filter -->
+```mermaid
+flowchart LR
+  pod["Pending Pod"] --> filter["Filter"]
+  filter -->|"enough CPU/memory, selectors, taints, volume zone"| feasible["Feasible nodes"]
+  feasible --> score["Score"]
+  score -->|"load, soft affinity, spread"| winner["Best node"]
+  winner --> bind["Bind nodeName"]
+```
+
+*Figure 20.1: The scheduler filters impossible nodes, scores the rest, then binds the Pod to the winner.*
 
 ### In production
 
@@ -193,6 +206,18 @@ topologySpreadConstraints:
 
 You can stack spreads (zone *and* hostname) for stronger resilience.
 
+```mermaid
+flowchart TB
+  replicas["4 replicas of app=task-api"] --> spread["topologySpread maxSkew 1"]
+  spread --> zoneA["zone A: 2 Pods"]
+  spread --> zoneB["zone B: 2 Pods"]
+  zoneA --> softAnti["soft podAntiAffinity on hostname"]
+  zoneB --> softAnti
+  softAnti --> hosts["Prefer different nodes within each zone"]
+```
+
+*Figure 20.2: Topology spread keeps counts even across zones; soft anti-affinity prefers different hosts without stranding Pending Pods.*
+
 > ⚠️ **Common Pitfall:** Hard Pod anti-affinity with `topologyKey: kubernetes.io/hostname` and more replicas than nodes guarantees Pending Pods.
 
 ### In production
@@ -232,7 +257,15 @@ nodeSelector:
   accelerator: nvidia
 ```
 
-<!-- VISUAL: Node with tainted rope barrier; Pods with matching toleration badges pass -->
+```mermaid
+flowchart LR
+  tainted["GPU node with taint dedicated=gpu:NoSchedule"] --> check{"Pod has matching toleration?"}
+  check -->|"no"| blocked["Repelled / Pending"]
+  check -->|"yes"| pass["May schedule"]
+  pass --> label["Also match nodeSelector or affinity"]
+```
+
+*Figure 20.3: Taints repel ordinary Pods; matching tolerations (plus labels) let prepared workloads onto reserved nodes.*
 
 > 📘 **Deep Dive (optional):** Combine taint + label for defense in depth. Taints reserve capacity without relying on every team remembering a nodeSelector.
 
@@ -305,6 +338,21 @@ Preemption flow (simplified):
 2. Scheduler considers lower-priority victims on candidate nodes
 3. Victims are deleted (gracefully when possible); the high-priority Pod retries scheduling
 
+```mermaid
+sequenceDiagram
+  participant High as highPriorityPod
+  participant Sched as kubeScheduler
+  participant Low as lowPriorityPod
+  participant Api as apiServer
+  High->>Sched: cannot schedule: insufficient CPU
+  Sched->>Low: select victim on candidate node
+  Sched->>Api: delete / preempt low-priority Pod
+  Api-->>High: capacity frees
+  High->>Sched: retry schedule and bind
+```
+
+*Figure 20.4: Preemption removes lower-priority Pods so a higher-priority Pod can bind when the cluster is full.*
+
 ```bash
 $ kubectl get priorityclass
 NAME                      VALUE        GLOBAL-DEFAULT   AGE
@@ -373,6 +421,19 @@ EOF
 | Node-pressure eviction | kubelet | No | Memory/disk/PID pressure |
 | API eviction | drain, autoscaler, operators, `kubectl` | Yes (voluntary) | Maintenance, scale-down |
 | `kubectl delete pod` | User/controller | No | Direct deletion |
+
+```mermaid
+flowchart TB
+  leave["Pod must leave a node"] --> which{"Which mechanism?"}
+  which -->|"drain / Eviction API"| apiEvict["API-initiated eviction"]
+  which -->|"MemoryPressure / DiskPressure"| kubeletEvict["Node-pressure eviction"]
+  which -->|"kubectl delete"| direct["Direct delete"]
+  apiEvict --> pdb["Honors PDB"]
+  kubeletEvict --> noPdb["Ignores PDB"]
+  direct --> noPdb
+```
+
+*Figure 20.5: PDBs restrain voluntary API evictions; kubelet pressure eviction and direct deletes do not.*
 
 > ⚠️ **Common Pitfall:** Believing a PDB will save you from node MemoryPressure. PDBs do not restrain kubelet pressure eviction.
 

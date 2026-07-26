@@ -19,6 +19,10 @@
 
 A container is like a hotel room. Guests (processes) get their own space and cannot casually wander into other rooms. Hotel security still depends on management decisions: Do room keys open maintenance corridors? Is the master key at the front desk? Do you check IDs at check-in?
 
+![Hotel room keycard for least-privilege container security](assets/analogy-hotel-room.png)
+
+*Figure 10.A: Guests get a keycard, not the master key—containers should not run as root by default.*
+
 Namespaces and cgroups are the room walls. This chapter is about management decisions: what powers a guest checks in with, which master keys it can touch, and how you verify the guest is who they claim to be.
 
 The guiding principle is **least privilege**: every permission a container does not have is an attack that fails automatically. Sobering fact: a process running as root *inside* a container is root *as far as the kernel is concerned*. The container boundary is strong but not magical — if it is breached, in-container root becomes host root. So we layer defenses.
@@ -75,6 +79,17 @@ $ docker run -d \
 
 Require `USER` in every Dockerfile your team owns. Gate CI on "runs as non-root." Prefer rootless Engine where the platform supports your workload. Never treat Docker group membership lightly — it is effectively root-equivalent on the host.
 
+```mermaid
+flowchart TD
+  imageRoot["Image defaults to root?"] --> dockerfileUser{"Can you edit Dockerfile?"}
+  dockerfileUser -->|Yes| userInstr["Add USER non-root"]
+  dockerfileUser -->|No| runUser["docker run --user UID:GID"]
+  userInstr --> extras["Optional: --read-only + tmpfs + no-new-privileges"]
+  runUser --> extras
+```
+
+*Figure 10.1: Prefer baking non-root into the image; override at run time when you must consume someone else's image.*
+
 ---
 
 ## 10.3 Capabilities: root, sliced thin
@@ -113,6 +128,17 @@ ping: permission denied (are you root?)
 
 Document every `--cap-add`. Prefer fixing volume ownership or listening on high ports over granting `SYS_ADMIN`. Ban `--privileged` in production policy except for carefully reviewed host tools.
 
+```mermaid
+flowchart TD
+  start["Capability policy"] --> dropAll["--cap-drop ALL"]
+  dropAll --> need{"Justified need?"}
+  need -->|Bind low port| addBind["--cap-add NET_BIND_SERVICE"]
+  need -->|Nothing special| done["Ship with empty add list"]
+  need -->|Tempted by privileged| avoid["Do not use --privileged"]
+```
+
+*Figure 10.2: Drop everything, then add back only capabilities you can document.*
+
 ---
 
 ## 10.4 Seccomp and AppArmor
@@ -147,7 +173,16 @@ $ docker run -d --security-opt apparmor=my-nginx-profile nginx:1.27
 | Docker default | Yes | Yes (`docker-default`, where available) |
 | Custom | `--security-opt seccomp=profile.json` | `--security-opt apparmor=profile-name` |
 
-<!-- VISUAL: Onion of defenses — non-root core, then capabilities, seccomp, AppArmor/SELinux, host/kernel outer ring -->
+```mermaid
+flowchart TD
+  outer["Host / kernel boundary"] --> mac["AppArmor / SELinux"]
+  mac --> seccomp["Seccomp syscall filter"]
+  seccomp --> caps["Dropped capabilities"]
+  caps --> nonRoot["Non-root USER"]
+  nonRoot --> app["Application process"]
+```
+
+*Figure 10.3: Defense in depth — each layer independently shrinks what an attacker can do if an inner boundary fails.*
 
 ### In production
 
@@ -196,6 +231,17 @@ The following checks were performed on each of these signatures:
 Enforce verification in CI and at admission time (Kubernetes admission later in the book). Prefer digest pins (`image@sha256:…`) alongside signatures. For Docker Hub base images and a maintained minimal, signed catalog, see **Docker Hardened Images** and the broader supply-chain story in **Chapter 26** — including provenance, SBOMs, and continuous rebuilds when CVEs land.
 
 > 📘 **Deep Dive (optional):** Chapter 26 covers Hardened Images, SLSA-style provenance, SBOM consumption, and how signing fits a full supply-chain program. This chapter only needs you to stop investing in DCT and start with cosign or Notation.
+
+```mermaid
+flowchart LR
+  build["CI build image"] --> sign["cosign / Notation sign"]
+  sign --> registry["Registry"]
+  registry --> verify["Verify at pull / admission"]
+  verify -->|ok| run["Run digest-pinned image"]
+  verify -->|fail| block["Block deploy"]
+```
+
+*Figure 10.4: Modern signing verifies provenance at promotion time — prefer cosign or Notation over deprecated DCT.*
 
 ---
 
@@ -265,6 +311,16 @@ Act on results:
 ### In production
 
 Scanning once is theater. New CVEs publish against *existing* images daily. Rebuild on a cadence, re-scan continuously, and track base-image freshness as an SLO-ish habit. Pair scanning with signing so you know *which* remediated artifact is allowed to run.
+
+```mermaid
+flowchart LR
+  scan["Scan image"] --> triage["Triage by severity"]
+  triage --> rebuild["Update base / deps and rebuild"]
+  rebuild --> resign["Re-sign and promote"]
+  resign --> scan
+```
+
+*Figure 10.5: Scanning is a loop — remediate, rebuild, re-sign, and scan again as CVEs land.*
 
 ---
 

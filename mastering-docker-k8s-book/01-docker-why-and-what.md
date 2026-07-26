@@ -16,6 +16,10 @@
 
 Alex finishes a feature Friday night. On Alex’s laptop the API returns `200 OK`. Monday, the staging server returns `500`. The logs complain about a missing system library. Ops installs the library. Staging works. Production still fails—same library, different *version*. Someone pins the version. Now a cron job on the host breaks because it needed the old one.
 
+![Shipping containers representing portable software packages](assets/analogy-shipping-containers.png)
+
+*Figure 01.A: Like cargo boxes that move unchanged from truck to ship, container images move apps between machines.*
+
 Nobody was careless. The *unit of deployment* was wrong. The team shipped source code into environments that were each a unique snowflake of OS packages, language runtimes, and side effects.
 
 Containers attack that mismatch: ship the **application plus a known filesystem and process setup**, not “hope the server already has what we need.”
@@ -35,6 +39,15 @@ Traditional deployment often looks like this:
 5. Start the process and pray the next machine matches
 
 Drift between steps 2–4 is inevitable. Containers flip the model: build an **image** that already contains the runtime and app, run that image as a **container** on any host with a compatible engine, and configure only the *differences* (ports, env vars, secrets, volumes) at run time.
+
+```mermaid
+flowchart LR
+  traditional["Traditional: provision<br/>install packages<br/>copy app<br/>hope it matches"] --> drift["Environment drift"]
+  imageModel["Image: app + runtime"] --> containerRun["Container instance"]
+  containerRun --> runtimeCfg["Runtime config only:<br/>ports, env, secrets, volumes"]
+```
+
+*Figure 01.1: Containers move dependency soup into a rebuildable image and leave only environment-specific knobs for runtime.*
 
 ### Under the hood
 
@@ -70,7 +83,20 @@ Treat the image as the unit you promote: build once in CI, scan it, push it to a
 
 A **virtual machine** is like renting an entire apartment: its own kitchen, plumbing, and front door (a full guest operating system). A **container** is like a locked room in a shared building: private space for your stuff, but you share the building’s foundation (the host kernel).
 
-<!-- VISUAL: Side-by-side: Host → Hypervisor → Guest OS → App (VM) versus Host OS/Kernel → Container Engine → App process in isolated namespaces (container) -->
+```mermaid
+flowchart TB
+  subgraph vmSide["Virtual machine"]
+    vmHost["Host hardware"] --> hypervisor["Hypervisor"]
+    hypervisor --> guestOs["Guest OS / kernel"]
+    guestOs --> vmApp["Application"]
+  end
+  subgraph ctrSide["Container"]
+    ctrHost["Host OS / shared kernel"] --> engine["Container engine"]
+    engine --> namespaces["App process in namespaces"]
+  end
+```
+
+*Figure 01.2: A VM stacks a guest OS under each app; a container isolates the process on a shared host kernel.*
 
 | Dimension | Virtual machine | Container |
 |-----------|-----------------|-----------|
@@ -99,6 +125,15 @@ Choose the boundary that matches your threat model. Multi-tenant untrusted workl
 ## 01.4 Core Vocabulary
 
 Learn these four words thoroughly; everything else is elaboration.
+
+```mermaid
+flowchart LR
+  registry["Registry<br/>store and share"] -->|pull / push| engine["Engine<br/>dockerd"]
+  engine -->|materialize| image["Image<br/>immutable template"]
+  image -->|create / start| container["Container<br/>running instance"]
+```
+
+*Figure 01.3: The core vocabulary — registries store images; the engine runs containers created from those images.*
 
 ### Image
 
@@ -177,6 +212,24 @@ A first mental model of `docker run`:
 5. The image’s default process starts as PID 1 inside the container
 6. Flags like `--rm` control cleanup when the process exits
 
+```mermaid
+sequenceDiagram
+  participant Cli as docker CLI
+  participant Eng as Engine
+  participant Reg as Registry
+  participant Ctr as Container
+  Cli->>Eng: docker run
+  Eng->>Eng: Find image locally
+  alt Image missing
+    Eng->>Reg: Pull layers
+    Reg-->>Eng: Image content
+  end
+  Eng->>Ctr: Create writable layer and start PID 1
+  Ctr-->>Cli: Process output / exit
+```
+
+*Figure 01.4: A first mental model of `docker run` — resolve the image, create the instance, start the process.*
+
 ### In production
 
 Docker is packaging and a single-host (or Desktop) runtime. It is **not**:
@@ -197,6 +250,19 @@ Docker is packaging and a single-host (or Desktop) runtime. It is **not**:
 Containers excel when you deploy the same app across environments, need dense packing of many services, want immutable artifacts (build once, promote the image), practice clear process boundaries, or care about reproducible CI.
 
 They are a weaker fit when you need a different kernel than the host provides, depend on highly specialized host devices without container support, only ever run one long-lived pet server with no repeat deploys, or face policies that forbid container runtimes.
+
+```mermaid
+flowchart TD
+  start["Considering containers?"] --> multiEnv{"Multiple environments<br/>or repeat deploys?"}
+  multiEnv -->|No| weak["Weaker fit — fix ops first"]
+  multiEnv -->|Yes| deps{"Dependencies expressible<br/>in an image?"}
+  deps -->|No| weak
+  deps -->|Yes| sameKernel{"Same kernel family<br/>as the host?"}
+  sameKernel -->|No| weak
+  sameKernel -->|Yes| strong["Strong fit — containerize"]
+```
+
+*Figure 01.5: A quick fitness check before containerizing everything — packaging wins when environments repeat and the kernel matches.*
 
 ### Under the hood
 

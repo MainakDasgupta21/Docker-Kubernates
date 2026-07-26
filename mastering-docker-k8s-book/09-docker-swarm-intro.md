@@ -18,6 +18,10 @@
 
 So far you have been a chef in one kitchen. You know every pan (container): start it, watch it, restart it. That works for one kitchen.
 
+![Restaurant chain headquarters and branches for Swarm orchestration](assets/analogy-restaurant-chain.png)
+
+*Figure 09.A: Managers plan; workers cook—the chain keeps serving if one kitchen stalls.*
+
 Opening a restaurant chain means ten kitchens and hundreds of dishes. You need a *head office* that takes declarations like "every location serves the daily special, five stations at all times" and makes it happen — hiring, rebalancing, replacing failures — without you flying out.
 
 That head office is an **orchestrator**. You stop issuing "start this container here" and start declaring **desired state** ("run five replicas of this service somewhere sensible"). The orchestrator continuously compares reality to the declaration and repairs drift.
@@ -56,7 +60,22 @@ b30lbji2z8yq2v9uwvuklk1ig     node-3     Ready     Active                       
 
 A one-node swarm is a perfectly good classroom.
 
-<!-- VISUAL: Three-node swarm — manager with Raft + scheduler; two workers receiving tasks -->
+```mermaid
+flowchart TB
+  subgraph managers["Manager"]
+    raft["Raft log + desired state"]
+    scheduler["Scheduler"]
+    raft --> scheduler
+  end
+  subgraph workers["Workers"]
+    w1["Worker node: tasks"]
+    w2["Worker node: tasks"]
+  end
+  scheduler --> w1
+  scheduler --> w2
+```
+
+*Figure 09.1: Managers store desired state and schedule work; workers run the assigned tasks.*
 
 ### In production
 
@@ -102,6 +121,16 @@ p9r0wl4hd82f   web.3       nginx:1.27   node-3   Running        Running 5 minute
 
 Nobody restarted anything. Reality (2 replicas) no longer matched the declaration (3); the manager fixed it. That **reconciliation loop** is the heart of every orchestrator, including Kubernetes.
 
+```mermaid
+flowchart LR
+  declare["Desired state<br/>3 replicas of web"] --> compare["Manager compares"]
+  reality["Actual state<br/>running tasks"] --> compare
+  compare -->|gap| heal["Create / replace tasks"]
+  heal --> reality
+```
+
+*Figure 09.2: Swarm continuously reconciles declared replica counts with running tasks.*
+
 ```bash
 $ docker service scale web=6
 $ docker service update --image nginx:1.28 --update-parallelism 2 --update-delay 10s web
@@ -131,6 +160,15 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://node-3:8080
 ```
 
 Even if `node-3` runs zero `web` tasks, it answers and forwards.
+
+```mermaid
+flowchart TB
+  client["Client"] --> n3["Node 3<br/>published port open"]
+  n3 -->|"ingress overlay<br/>routing mesh"| t1["Task on Node 1"]
+  n3 --> t2["Task on Node 2"]
+```
+
+*Figure 09.3: The routing mesh opens the published port on every node and forwards to healthy replicas wherever they run.*
 
 | | Single-host `-p` (Chapter 06) | Swarm routing mesh |
 |---|---|---|
@@ -201,6 +239,17 @@ $ docker service create --name edge \
 | Typical consumers | Databases, TLS material | nginx/redis config, app JSON, banners |
 
 Combine them: secrets for keys and passwords, configs for everything else that should not force an image rebuild.
+
+```mermaid
+flowchart LR
+  secretObj["docker secret"] --> raft["Manager Raft store"]
+  configObj["docker config"] --> raft
+  raft --> task["Service task"]
+  task --> secretFile["/run/secrets/..."]
+  task --> configFile["Chosen config path"]
+```
+
+*Figure 09.4: Secrets and configs inject files into tasks without baking content into the image.*
 
 > ⚠️ **Warning:** Do not put passwords in configs because "it's almost like a secret." Use `docker secret` for anything that would hurt if logged or copied casually. Chapter 10 deepens secrets hygiene; Kubernetes ConfigMaps/Secrets (Chapter 17) echo the same split.
 

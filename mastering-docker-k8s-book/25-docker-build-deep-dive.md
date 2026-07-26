@@ -41,6 +41,24 @@ The principal drivers are:
 | `kubernetes` | In Kubernetes Pods | Elastic or shared build capacity |
 | `remote` | At an existing BuildKit endpoint | Centrally operated build service |
 
+```mermaid
+flowchart LR
+  dockerCli["Docker CLI with Buildx"] --> dockerDriver["docker driver"]
+  dockerCli --> containerDriver["docker-container driver"]
+  dockerCli --> kubernetesDriver["kubernetes driver"]
+  dockerCli --> remoteDriver["remote driver"]
+  dockerDriver --> engineWorker["BuildKit in dockerd"]
+  containerDriver --> containerWorker["Dedicated BuildKit container"]
+  kubernetesDriver --> podWorkers["BuildKit worker Pods"]
+  remoteDriver --> remoteWorkers["Remote BuildKit service"]
+  engineWorker --> buildOutput["Image, cache, or registry output"]
+  containerWorker --> buildOutput
+  podWorkers --> buildOutput
+  remoteWorkers --> buildOutput
+```
+
+*Figure 25.1: Buildx dispatches one build definition to workers hosted by four different driver topologies.*
+
 ### Under the hood
 
 List the available builders and inspect the selected one:
@@ -145,6 +163,22 @@ target "task-worker" {
   tags       = ["${REGISTRY}/task-worker:${VERSION}"]
 }
 ```
+
+```mermaid
+flowchart LR
+  bakeFile["docker-bake.hcl"] --> defaultGroup["default group"]
+  commonTarget["_common target"]
+  defaultGroup --> apiTarget["task-api target"]
+  defaultGroup --> workerTarget["task-worker target"]
+  commonTarget -->|inherits| apiTarget
+  commonTarget -->|inherits| workerTarget
+  apiTarget --> apiPlatforms["amd64 and arm64 images"]
+  workerTarget --> workerPlatforms["amd64 and arm64 images"]
+  apiPlatforms --> registry["Registry"]
+  workerPlatforms --> registry
+```
+
+*Figure 25.2: Bake expands shared settings into parallel application targets and publishes their platform variants.*
 
 Preview the fully resolved plan before executing it:
 
@@ -346,6 +380,22 @@ $ docker buildx build \
 ```
 
 `--sbom` is shorthand for `--attest=type=sbom`; `--provenance` is shorthand for `--attest=type=provenance`. BuildKit normally creates minimal provenance by default, but explicit release policy avoids depending on defaults.
+
+```mermaid
+flowchart LR
+  source["Source and locked dependencies"] --> buildKit["BuildKit release build"]
+  buildKit --> imageDigest["Immutable image digest"]
+  buildKit --> sbom["SBOM attestation"]
+  buildKit --> provenance["Provenance attestation"]
+  imageDigest --> imageIndex["OCI image index"]
+  sbom --> imageIndex
+  provenance --> imageIndex
+  imageIndex --> registry["OCI registry"]
+  registry --> verifier["Signature and policy verifier"]
+  verifier --> deployment["Approved deployment"]
+```
+
+*Figure 25.3: A release build publishes image bytes and attestations together so downstream policy can verify one immutable subject.*
 
 Attestations are attached through manifests in the image index. With a classic Engine image store, loading an image locally can lose registry-oriented attestation data. Pushing directly preserves it. The containerd image store available in Engine 29.x can retain multi-platform images and attestations locally, but registry publication remains the normal release path.
 

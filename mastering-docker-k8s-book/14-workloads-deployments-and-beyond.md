@@ -35,6 +35,18 @@ $ kind create cluster --name workloads --image kindest/node:v1.36.0
 
 All of these store desired state in the API and reconcile forever (or until Job completion).
 
+```mermaid
+flowchart TB
+  deploy["Deployment"] --> rs["ReplicaSet"]
+  rs --> pods["Pods"]
+  sts["StatefulSet"] --> orderedPods["Ordered Pods + PVCs"]
+  ds["DaemonSet"] --> perNode["One Pod per eligible node"]
+  job["Job"] --> completions["Completions Pods"]
+  cron["CronJob"] --> job
+```
+
+*Figure 14.1: Controllers own Pods (or Jobs); each workload API keeps a different promise true.*
+
 ### In production
 
 Ban long-lived bare Pods via policy. Every app Pod should have an ownerReference to a controller. Exceptions (debug Pods) must be namespaced and TTL'd.
@@ -134,7 +146,18 @@ $ kubectl get deploy,rs,pods -l app=task-api
 
 Change `image` to `:1.1` and re-apply—the Deployment creates a new ReplicaSet and rolls traffic as readiness passes.
 
-<!-- VISUAL: Deployment owning RS-A and RS-B during rollout; Pods shifting from old to new -->
+```mermaid
+flowchart TB
+  deploy["Deployment task-api"]
+  deploy --> rsA["ReplicaSet A: image 1.0"]
+  deploy --> rsB["ReplicaSet B: image 1.1"]
+  rsA --> old1["Pod old-1"]
+  rsA --> old2["Pod old-2"]
+  rsB --> new1["Pod new-1"]
+  rsB --> new2["Pod new-2"]
+```
+
+*Figure 14.2: During a rollout the Deployment owns both old and new ReplicaSets while Pods shift from old to new.*
 
 ### In production
 
@@ -162,6 +185,16 @@ $ kubectl rollout undo deployment/task-api --to-revision=2
 ```
 
 `maxSurge` allows extra Pods during the update; `maxUnavailable` limits how many may be down. `Recreate` strategy kills all old Pods first—simple but downtime-heavy; use for stubborn singleton locks, not public APIs.
+
+```mermaid
+flowchart LR
+  t0["t0: 3 Pods on v1"] --> t1["t1: surge +1 Pod on v2"]
+  t1 --> t2["t2: old Pod terminates after new Ready"]
+  t2 --> t3["t3: repeat until all on v2"]
+  t3 --> t4["t4: scale down old ReplicaSet"]
+```
+
+*Figure 14.3: A RollingUpdate timeline surges new Pods, waits for readiness, then retires old ones within maxUnavailable.*
 
 ```yaml
 strategy:
@@ -240,6 +273,15 @@ spec:
 ```
 
 DNS: `task-db-0.task-db.default.svc.cluster.local`. Updates and scaling are ordered by default (`OrderedReady`); `Parallel` policy trades safety for speed.
+
+```mermaid
+flowchart LR
+  svc["Headless Service task-db"] --> p0["task-db-0 + PVC"]
+  svc --> p1["task-db-1 + PVC"]
+  svc --> p2["task-db-2 + PVC"]
+```
+
+*Figure 14.4: StatefulSet ordinals get stable DNS via a headless Service and a PVC per Pod from volumeClaimTemplates.*
 
 ### In production
 
@@ -392,6 +434,16 @@ spec:
 ```
 
 Requires metrics-server (or compatible metrics pipeline). Custom and external metrics unlock queue depth and business SLIs.
+
+```mermaid
+flowchart LR
+  metrics["metrics-server / custom metrics"] --> hpa["HorizontalPodAutoscaler"]
+  hpa --> deploy["Deployment replicas"]
+  deploy --> pods["More or fewer Pods"]
+  pods --> metrics
+```
+
+*Figure 14.5: HPA watches metrics and adjusts Deployment replicas so capacity tracks load.*
 
 ```bash
 $ kubectl get hpa task-api -w

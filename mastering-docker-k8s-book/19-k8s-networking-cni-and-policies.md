@@ -18,6 +18,10 @@
 
 Think of your cluster as a city. Every Pod is a building with its own street address (IP). Nodes are neighborhoods. Without a city planning department, buildings would have conflicting addresses and no roads between neighborhoods.
 
+![City street grid for cluster networking and policies](assets/analogy-city-grid.png)
+
+*Figure 19.A: CNI lays the roads; NetworkPolicies are the traffic lights between neighborhoods.*
+
 The **Container Network Interface (CNI)** is that planning department: it assigns Pod IPs, wires virtual interfaces, and ensures packets can leave one node and arrive at another. **Services** ([Chapter 15](15-k8s-services.md)) give stable names on top of those changing IPs. **NetworkPolicies** are the zoning laws—who is allowed to call whom.
 
 By default, Kubernetes assumes a flat, reachable Pod network: any Pod can talk to any other Pod unless you deliberately restrict it. That openness is great for getting started and dangerous for production multi-tenant clusters.
@@ -85,7 +89,19 @@ You usually pick **one** primary CNI per cluster. Flannel is the simple overlay 
 
 > 💡 **Tip:** For learning NetworkPolicy behavior, Calico or Cilium are clearer than Flannel alone, because policy enforcement is a first-class feature.
 
-<!-- VISUAL: Flannel VXLAN overlay vs Calico BGP/routes + policy shield vs Cilium eBPF datapath -->
+```mermaid
+flowchart TB
+  choose["Pick one primary CNI"] --> flannel["Flannel: VXLAN overlay"]
+  choose --> calico["Calico: BGP or overlay plus policy"]
+  choose --> cilium["Cilium: eBPF datapath"]
+  choose --> cloud["Cloud CNI: VPC or ENI native"]
+  flannel --> lab["Labs and simple connectivity"]
+  calico --> policy["Mature NetworkPolicy"]
+  cilium --> obs["Identity policy and Hubble"]
+  cloud --> provider["Follow provider IP and policy docs"]
+```
+
+*Figure 19.1: CNI choice is a trade-off among overlay simplicity, routing plus policy, eBPF performance, and cloud-native wiring.*
 
 ### In production
 
@@ -123,7 +139,21 @@ Pod A (Node 1) → veth/CNI → [overlay or route] → CNI/veth → Pod B (Node 
 
 Services add another hop: clients often target a ClusterIP; **kube-proxy** (iptables, IPVS, or an eBPF replacement) DNAT/load-balances to an EndpointSlice IP. From there, the path is again Pod-to-Pod networking. See [Chapter 15](15-k8s-services.md) for Service types and EndpointSlices.
 
-<!-- VISUAL: Sequence of Pod-to-Pod cross-node flow with encapsulation box between nodes -->
+```mermaid
+sequenceDiagram
+  participant PodA as podA
+  participant Node1 as node1Cni
+  participant Underlay as underlayOrOverlay
+  participant Node2 as node2Cni
+  participant PodB as podB
+  PodA->>Node1: TCP to Pod B IP
+  Node1->>Underlay: encapsulate or route
+  Underlay->>Node2: deliver to peer node
+  Node2->>PodB: decapsulate and forward
+  PodB-->>PodA: return path reverses
+```
+
+*Figure 19.2: Cross-node Pod traffic rides the CNI datapath—often via overlay encapsulation, sometimes via direct routes.*
 
 ### In production
 
@@ -149,6 +179,15 @@ CoreDNS runs as a Deployment in `kube-system` and backs the cluster DNS Service 
 | `task-api.payments` | Service in namespace `payments` |
 | `task-api.payments.svc.cluster.local` | Fully qualified Service name |
 | `10-244-1-10.default.pod.cluster.local` | Pod DNS (when enabled) |
+
+```mermaid
+flowchart LR
+  app["App in Pod"] -->|"nslookup task-api"| coredns["CoreDNS"]
+  coredns -->|"ClusterIP"| svc["Service task-api"]
+  svc -->|"EndpointSlice"| pods["Ready Pod IPs"]
+```
+
+*Figure 19.3: Apps resolve Service DNS names through CoreDNS to a stable ClusterIP, then to changing Pod endpoints.*
 
 ```bash
 $ kubectl run dns-test --rm -it --image=busybox:1.36 --restart=Never -- \
@@ -240,6 +279,17 @@ Important ideas:
 - **Egress** rules control traffic *from* selected Pods
 - Peers can be pod selectors, namespace selectors, or IP blocks
 - Ports are optional but recommended for least privilege
+
+```mermaid
+flowchart TB
+  traffic["Incoming or outgoing packet"] --> selected{"Pod selected by any NetworkPolicy?"}
+  selected -->|"no"| allowAll["Direction unrestricted by policy"]
+  selected -->|"yes"| match{"Matches an allow rule?"}
+  match -->|"yes"| permit["Allow"]
+  match -->|"no"| deny["Deny"]
+```
+
+*Figure 19.4: Once a NetworkPolicy selects a Pod in a direction, unspecified traffic in that direction is denied.*
 
 > 📘 **Deep Dive (optional):** NetworkPolicy implementation is delegated to the CNI. If your plugin does not enforce policy, applying YAML does nothing useful. Verify enforcement.
 
@@ -372,7 +422,18 @@ egress:
 
 For dual-stack clusters, add matching IPv6 `ipBlock` entries when intentional egress on IPv6 is required.
 
-<!-- VISUAL: Namespace with default-deny wall; frontend→task-api and DNS allowed; other arrows blocked -->
+```mermaid
+flowchart LR
+  subgraph ns["Namespace tasks: default-deny wall"]
+    frontend["frontend"] -->|"allowed TCP 8000"| taskApi["task-api"]
+    frontend -->|"allowed DNS 53"| dns["CoreDNS"]
+    taskApi -->|"allowed DNS 53"| dns
+    other["other Pod"] -.->|"blocked"| taskApi
+    frontend -.->|"blocked"| internet["Arbitrary egress"]
+  end
+```
+
+*Figure 19.5: Default-deny locks the namespace; explicit allows open frontend→task-api and DNS—everything else stays blocked.*
 
 ### In production
 

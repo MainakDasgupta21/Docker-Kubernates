@@ -42,7 +42,15 @@ $ kind create cluster --name config --image kindest/node:v1.36.0
 - Never commit production Secrets to git in plain form. Use sealed secrets, ESO, or your cloud secret manager.
 - Size matters: ConfigMaps and Secrets are stored in etcd and are limited (practically about **1 MiB**). Large files belong in object storage or volumes, not ConfigMaps.
 
-<!-- VISUAL: One image feeding three environments, each with its own ConfigMap dial and Secret key. -->
+```mermaid
+flowchart TB
+  image["One image digest: task-api"]
+  image --> dev["dev: ConfigMap dial + Secret key"]
+  image --> staging["staging: ConfigMap dial + Secret key"]
+  image --> prod["prod: ConfigMap dial + Secret key"]
+```
+
+*Figure 17.1: Promote the same image across environments; only ConfigMaps and Secrets change.*
 
 ---
 
@@ -129,6 +137,16 @@ spec:
 
 > 💡 **Tip:** Prefer file mounts for large or structured config. Prefer explicit `env` entries when you need a stable, small set of variables.
 
+```mermaid
+flowchart LR
+  cm["ConfigMap"] --> envInject["env / envFrom"]
+  cm --> fileMount["volumeMount files"]
+  envInject --> container["Container"]
+  fileMount --> container
+```
+
+*Figure 17.2: ConfigMaps inject as environment variables or mounted files without rebuilding the image.*
+
 ### In production
 
 - Updating a ConfigMap does **not** always restart Pods. Env vars are fixed at container start; mounted files can update eventually (kubelet sync), but apps must reload.
@@ -200,6 +218,16 @@ $ kubectl create secret docker-registry regcred \
     --docker-password=TOKEN
 ```
 
+```mermaid
+flowchart LR
+  secret["Secret"] --> envPath["secretKeyRef → env"]
+  secret --> volPath["secret volume → files"]
+  envPath --> app["Application"]
+  volPath --> app
+```
+
+*Figure 17.3: Secrets reach the app as env vars or files; file mounts leak less via process listings.*
+
 ### In production
 
 - RBAC: separate who can `create/update` Secrets from who can only mount them via Pods.
@@ -259,6 +287,17 @@ spec:
 
 Projected volumes are the modern way to get **time-bound service account tokens** into Pods (replacing long-lived auto-mounted Secrets in many clusters).
 
+```mermaid
+flowchart TB
+  cm["ConfigMap"] --> projected["Projected volume"]
+  secret["Secret"] --> projected
+  sat["serviceAccountToken"] --> projected
+  downward["Downward API"] --> projected
+  projected --> mount["Single mount path in Pod"]
+```
+
+*Figure 17.4: A projected volume merges ConfigMap, Secret, SA token, and Downward API sources into one directory.*
+
 ### In production
 
 - Prefer projected SA tokens with short `expirationSeconds` and audience binding when your platform supports it.
@@ -308,6 +347,17 @@ Two common patterns:
 2. **Secrets Store CSI Driver** — mounts secrets directly into Pods as volumes (optionally syncing to a Secret).
 
 Both keep rotation and audit trails in the external system while apps keep using familiar files or env vars.
+
+```mermaid
+flowchart LR
+  vault["External store: Vault / cloud SM"] --> eso["ESO syncs to Secret"]
+  vault --> csi["Secrets Store CSI mounts"]
+  eso --> k8sSecret["Kubernetes Secret"]
+  k8sSecret --> pod["Pod env or volume"]
+  csi --> pod
+```
+
+*Figure 17.5: External managers remain the system of record; ESO syncs Secrets or CSI mounts values straight into Pods.*
 
 ### In production
 

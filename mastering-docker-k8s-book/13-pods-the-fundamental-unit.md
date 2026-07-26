@@ -50,7 +50,20 @@ $ kubectl get pod task-api-single -o wide
 
 Bare Pods are teaching tools. Real apps use controllers (Chapter 14) so deleted Pods come back.
 
-<!-- VISUAL: Pod circle containing app + optional sidecar, one IP, shared volume rectangle -->
+```mermaid
+flowchart TB
+  subgraph pod["Pod: one IP, one fate"]
+    app["app container"]
+    sidecar["optional sidecar"]
+    vol["shared volume"]
+    app --- sidecar
+    app --- vol
+    sidecar --- vol
+  end
+  ip["Pod IP / localhost"] --- pod
+```
+
+*Figure 13.1: Containers in a Pod share one network identity and declared volumes; the Pod is the schedulable unit.*
 
 ### In production
 
@@ -85,6 +98,14 @@ spec:
 ```
 
 If an init container fails, the Pod restarts according to `restartPolicy` (for init, failures keep retrying until success for Always/OnFailure semantics as documented). Init containers can use different images and stricter security contexts than the app.
+
+```mermaid
+flowchart LR
+  init1["Init: wait-for-db"] --> init2["Init: migrate"]
+  init2 --> app["App containers start"]
+```
+
+*Figure 13.2: Init containers run to completion in order before app containers start.*
 
 ### In production
 
@@ -167,6 +188,33 @@ readinessProbe:
 
 Prefer HTTP or gRPC probes for apps that speak them; use `exec` sparingly (fork cost). Distinguish liveness (process wedged) from readiness (dependency down)—do not restart the world because a dependency blipped.
 
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Init: scheduled
+  Init --> Starting: inits succeed
+  Starting --> Running: startupProbe succeeds
+  Starting --> Starting: startupProbe failing
+  Running --> Running: readiness ok in endpoints
+  Running --> NotReady: readinessProbe fails
+  NotReady --> Running: readinessProbe recovers
+  Running --> Restarting: livenessProbe fails
+  Restarting --> Starting: container restarted
+  Running --> Terminating: delete or rollout
+  Terminating --> [*]
+```
+
+*Figure 13.3: Startup gates other probes; readiness controls traffic; liveness triggers restarts; termination drains the Pod.*
+
+Probe mechanisms you can configure:
+
+| Mechanism | How it works | Typical use |
+|-----------|--------------|-------------|
+| **httpGet** | HTTP GET to path/port | Most HTTP APIs |
+| **tcpSocket** | TCP connect succeeds | Non-HTTP listeners |
+| **grpc** | gRPC health check protocol | gRPC services |
+| **exec** | Run a command in the container | Last resort / legacy scripts |
+
 ### In production
 
 1. Always define readiness for Services behind rollouts.
@@ -208,6 +256,18 @@ Burstable
 ```
 
 CPU limits throttle; memory limits OOM-kill. Requests drive bin-packing—under-request and you oversubscribe; over-request and you waste nodes.
+
+```mermaid
+flowchart TB
+  bestEffort["BestEffort: no requests or limits"] --> burstable["Burstable: some requests"]
+  burstable --> guaranteed["Guaranteed: request equals limit"]
+  eviction["Eviction under node pressure"]
+  bestEffort -.->|"first to evict"| eviction
+  burstable -.->|"middle"| eviction
+  guaranteed -.->|"last to evict"| eviction
+```
+
+*Figure 13.4: QoS class follows requests and limits; BestEffort Pods are first to go under pressure.*
 
 ### In production
 
@@ -386,6 +446,16 @@ lifecycle:
 ```
 
 `postStart` runs asynchronously after the container is created—it may race your main process. `preStop` runs before SIGTERM during Pod termination; it counts against termination grace period.
+
+```mermaid
+flowchart LR
+  remove["Remove from endpoints"] --> preStop["preStop hook"]
+  preStop --> sigterm["SIGTERM"]
+  sigterm --> grace["Wait terminationGracePeriodSeconds"]
+  grace --> sigkill["SIGKILL if still alive"]
+```
+
+*Figure 13.5: Termination removes the Pod from traffic, runs preStop, then SIGTERM, then SIGKILL after the grace period.*
 
 Termination sequence (simplified): remove from endpoints → preStop → SIGTERM → wait `terminationGracePeriodSeconds` → SIGKILL.
 

@@ -16,6 +16,10 @@
 
 Think of a container's writable layer as a **whiteboard in a rented meeting room**. You can scribble during the meeting; when the booking ends and the room resets, the board is wiped. Removing a container deletes its writable layer the same way.
 
+![Whiteboard and filing cabinet for ephemeral versus persistent data](assets/analogy-whiteboard-filing.png)
+
+*Figure 07.A: Whiteboards wipe clean; filing cabinets keep records after the meeting ends.*
+
 A **volume** is a filing cabinet that lives *outside* the meeting room. Wheel it in, store documents, wheel it out. Reset the room a hundred times — the cabinet survives.
 
 Containers are disposable on purpose. You want to delete and recreate freely for upgrades and fixes. Data that must outlive any single container therefore needs a mount Docker's lifecycle cannot erase. Choosing the right mount — and understanding what still lives under the image store — is the skill of this chapter.
@@ -44,6 +48,16 @@ cat: can't open '/notes.txt': No such file or directory
 ```
 
 Same image, same name — brand-new writable layer. The file is gone.
+
+```mermaid
+flowchart LR
+  write["Write /notes.txt<br/>in container"] --> stop["docker stop<br/>layer kept"]
+  stop --> start["docker start<br/>file still there"]
+  write --> rm["docker rm<br/>writable layer deleted"]
+  rm --> gone["File gone forever"]
+```
+
+*Figure 07.1: Stopping keeps the writable layer; removing the container deletes it — and any data that lived only there.*
 
 ### In production
 
@@ -161,7 +175,20 @@ tmpfs mounts are Linux-oriented in classic Engine usage and cannot be shared bet
 
 Pair tmpfs with `--read-only` root filesystems (Chapter 10) so temporary paths still work. Size the mount; unbounded tmpfs can pressure host memory under load.
 
-<!-- VISUAL: Host showing named volume under Docker-managed area, bind mount from host path, tmpfs in RAM -->
+```mermaid
+flowchart TB
+  subgraph host["Docker host"]
+    volArea["Docker-managed area<br/>named volume data"]
+    hostPath["Host path<br/>./site or /etc/config"]
+    ram["RAM<br/>tmpfs"]
+    ctr["Container filesystem"]
+    volArea -->|"type=volume"| ctr
+    hostPath -->|"type=bind"| ctr
+    ram -->|"type=tmpfs"| ctr
+  end
+```
+
+*Figure 07.2: Three mount styles — Docker-managed volumes, host bind paths, and RAM-backed tmpfs.*
 
 ---
 
@@ -187,6 +214,19 @@ Volumes hold the data you deliberately persist. Image layers and the container's
 ### In plain terms
 
 Think of image layers as floors of a building and the running container as a temporary rooftop patio. The patio can change; the floors underneath stay shared and read-only until someone rewrites a tile — then Docker copies that tile onto the patio first (**copy-on-write**). Volumes are a separate filing cabinet bolted on from outside the building: they bypass that copy-on-write path for native-speed I/O.
+
+```mermaid
+flowchart TB
+  subgraph imageStore["Image / container store"]
+    layers["Read-only image layers"]
+    cow["Writable layer<br/>copy-on-write"]
+    layers --> cow
+  end
+  volume["Named volume<br/>native I/O path"] --> appData["Database / app state"]
+  cow --> scratch["Ephemeral scratch"]
+```
+
+*Figure 07.3: Persist write-heavy data on volumes — leave copy-on-write for ephemeral container filesystem changes.*
 
 ### Under the hood
 
@@ -280,6 +320,17 @@ $ docker run --rm \
 ```
 
 Then start the application against `app-data-restored` and verify.
+
+```mermaid
+flowchart LR
+  vol["Named volume"] --> helper["Helper container<br/>mount volume + host dir"]
+  helper --> tarOut["tar czf backup.tgz"]
+  tarOut --> hostBackup["Host backups/"]
+  hostBackup --> tarIn["tar xzf into new volume"]
+  tarIn --> restored["Restored volume"]
+```
+
+*Figure 07.4: Backup and restore with a throwaway container — archive the volume to the host, then extract into a fresh volume.*
 
 **Housekeeping:**
 

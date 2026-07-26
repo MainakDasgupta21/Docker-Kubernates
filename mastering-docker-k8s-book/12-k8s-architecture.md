@@ -29,7 +29,34 @@ Kubernetes is built the same way, and the payoff is the same: components can res
 
 Chapter 11 gave you the mental model (declare state, controllers converge). This chapter opens the machine and shows you the parts, because from here on, every debugging session is a question of *which component is unhappy*.
 
-<!-- VISUAL: Airport control tower on the left labeled "Control plane: API server (radio), etcd (flight record), scheduler (gate assignment), controllers (ground specialists)". On the right, three aircraft stands labeled "Nodes: kubelet (ground marshal), container runtime (the aircraft), kube-proxy (taxiway signage)". Arrows all point to and from the tower only. -->
+```mermaid
+flowchart LR
+  subgraph controlPlane["Control plane"]
+    apiServer["API server: radio"]
+    etcdStore["etcd: flight record"]
+    scheduler["Scheduler: gate assignment"]
+    controllers["Controllers: ground specialists"]
+    apiServer --- etcdStore
+    apiServer --- scheduler
+    apiServer --- controllers
+  end
+  subgraph nodes["Nodes"]
+    kubeletA["Kubelet: ground marshal"]
+    runtimeA["Container runtime: aircraft"]
+    proxyA["kube-proxy: taxiway signage"]
+    kubeletB["Kubelet"]
+    runtimeB["Container runtime"]
+    proxyB["kube-proxy"]
+  end
+  kubeletA -->|"watch and report"| apiServer
+  kubeletB -->|"watch and report"| apiServer
+  kubeletA --- runtimeA
+  kubeletA --- proxyA
+  kubeletB --- runtimeB
+  kubeletB --- proxyB
+```
+
+*Figure 12.1: Control plane decides through the API server and etcd; nodes dial out via kubelet, runtime, and kube-proxy.*
 
 ---
 
@@ -46,26 +73,42 @@ A node can be a cloud VM, a bare-metal server, or — in kind — a Docker conta
 
 ### Under the hood
 
-```text
-                     CONTROL PLANE (one or more machines)
-  ┌───────────────────────────────────────────────────────────────────┐
-  │  kube-apiserver ── the only door; validates, authorizes, persists │
-  │        │                                                          │
-  │        ├── etcd ................ the cluster's database           │
-  │        ├── kube-scheduler ...... picks a node for each new Pod    │
-  │        ├── kube-controller-manager ... ~30 built-in control loops │
-  │        └── cloud-controller-manager .. cloud-specific loops       │
-  └───────────────────────────────────────────────────────────────────┘
-                    ▲                        ▲
-                    │  watch + report        │
-  ┌─────────────────┴──────────┐  ┌──────────┴─────────────────┐
-  │ NODE                       │  │ NODE                       │
-  │  kubelet                   │  │  kubelet                   │
-  │  container runtime (CRI)   │  │  container runtime (CRI)    │
-  │  kube-proxy (or CNI proxy) │  │  kube-proxy (or CNI proxy)  │
-  │  your Pods                 │  │  your Pods                  │
-  └────────────────────────────┘  └────────────────────────────┘
+```mermaid
+flowchart TB
+  subgraph cp["CONTROL PLANE"]
+    apiserver["kube-apiserver"]
+    etcd["etcd"]
+    sched["kube-scheduler"]
+    cm["kube-controller-manager"]
+    ccm["cloud-controller-manager"]
+    apiserver --> etcd
+    apiserver --- sched
+    apiserver --- cm
+    apiserver --- ccm
+  end
+  subgraph node1["NODE"]
+    kubelet1["kubelet"]
+    cri1["container runtime via CRI"]
+    proxy1["kube-proxy or CNI proxy"]
+    pods1["your Pods"]
+  end
+  subgraph node2["NODE"]
+    kubelet2["kubelet"]
+    cri2["container runtime via CRI"]
+    proxy2["kube-proxy or CNI proxy"]
+    pods2["your Pods"]
+  end
+  kubelet1 -->|"watch + report"| apiserver
+  kubelet2 -->|"watch + report"| apiserver
+  kubelet1 --- cri1
+  kubelet1 --- proxy1
+  kubelet1 --- pods1
+  kubelet2 --- cri2
+  kubelet2 --- proxy2
+  kubelet2 --- pods2
 ```
+
+*Figure 12.2: Everything goes through the API server; nodes initiate contact and run Pods under the kubelet.*
 
 Two rules explain nearly all cluster behavior:
 
@@ -122,16 +165,17 @@ kube-scheduler-mastering-k8s-control-plane            mastering-k8s-control-plan
 
 Every request walks the same pipeline:
 
-```text
-request
-   │
-   ├─ 1. Authentication .... who are you? (certs, tokens, OIDC)
-   ├─ 2. Authorization ..... may you do this? (RBAC — Chapter 21)
-   ├─ 3. Admission (mutating) .. adjust the object (defaults, sidecars, policies)
-   ├─ 4. Validation ........ is the object well-formed and legal?
-   ├─ 5. Admission (validating) .. final policy gate (may reject)
-   └─ 6. Persist to etcd .... then notify all watchers
+```mermaid
+flowchart TD
+  request["HTTP request"] --> authn["1. Authentication: who are you?"]
+  authn --> authz["2. Authorization: may you do this?"]
+  authz --> mutate["3. Admission mutating: defaults and policies"]
+  mutate --> validate["4. Validation: well-formed and legal?"]
+  validate --> admit["5. Admission validating: final policy gate"]
+  admit --> persist["6. Persist to etcd, notify watchers"]
 ```
+
+*Figure 12.3: Every API request walks authentication, authorization, admission, validation, then etcd.*
 
 Two features you will rely on constantly:
 
@@ -429,13 +473,17 @@ spec:
 
 The important field is `renewTime`. The node lifecycle controller compares it to now:
 
-```text
-kubelet renews the Lease every 10s
-   │
-   ├─ stale for ~40s  → Node condition Ready becomes Unknown
-   ├─ Unknown         → node.kubernetes.io/not-ready:NoExecute taint applied
-   └─ taint tolerated for tolerationSeconds (default 300s) → Pods evicted
+```mermaid
+flowchart TD
+  renew["Kubelet renews Lease every 10s"] --> stale{"Stale for about 40s?"}
+  stale -->|"no"| renew
+  stale -->|"yes"| unknown["Node Ready becomes Unknown"]
+  unknown --> taint["Apply not-ready NoExecute taint"]
+  taint --> wait["Tolerate for tolerationSeconds, default 300s"]
+  wait --> evict["Evict Pods; controllers recreate elsewhere"]
 ```
+
+*Figure 12.4: A dead node's Lease goes stale, then Ready turns Unknown, then Pods evacuate after the taint toleration window.*
 
 That chain is why a hard node failure takes roughly five to six minutes to result in Pods being recreated elsewhere — a timeline that surprises people during their first node outage.
 
@@ -494,26 +542,25 @@ pod/task-api created
 
 Here is what happened, in order:
 
-```text
- 1. kubectl   reads kubeconfig, resolves the API path (/api/v1/namespaces/default/pods),
-              and sends the object with server-side apply field ownership.
- 2. apiserver authenticates you (client cert in kubeconfig).
- 3. apiserver authorizes you via RBAC (create pods in namespace default).
- 4. apiserver runs mutating admission: defaults are filled in
-              (restartPolicy: Always, serviceAccountName: default, imagePullPolicy,
-              the projected service-account token volume, tolerations).
- 5. apiserver validates the object, runs validating admission (for example Pod
-              Security admission checks the namespace's enforce level).
- 6. apiserver persists it to etcd → Pod exists, with spec.nodeName empty.
- 7. scheduler (watching for unassigned Pods) filters and scores nodes, then writes
-              a Binding: spec.nodeName = mastering-k8s-worker.
- 8. kubelet   on that node sees a Pod assigned to it. It asks containerd (CRI) to
-              create a sandbox, CNI assigns a Pod IP, images are pulled, init
-              containers run, then app containers start.
- 9. kubelet   runs probes and PATCHes status: phase Running, containerStatuses ready.
-10. controllers react to the new object: EndpointSlice controller adds the Pod to
-              matching Services once it is Ready; the garbage collector notes owner refs.
+```mermaid
+sequenceDiagram
+  participant kubectl
+  participant apiserver
+  participant etcd
+  participant scheduler
+  participant kubelet
+  participant runtime as containerd
+  kubectl->>apiserver: apply Pod via server-side apply
+  apiserver->>apiserver: authn, authz, admission, validate
+  apiserver->>etcd: persist Pod, nodeName empty
+  scheduler->>apiserver: watch unassigned Pods
+  scheduler->>apiserver: bind Pod to node
+  kubelet->>apiserver: see Pod assigned to me
+  kubelet->>runtime: create sandbox, pull, start
+  kubelet->>apiserver: PATCH status Ready
 ```
+
+*Figure 12.5: A `kubectl apply` walks the API server, etcd, scheduler, kubelet, and runtime before status reports Ready.*
 
 Watch the same story in event form:
 

@@ -67,7 +67,19 @@ Client Pod  ── dst 10.96.40.10:80 ──▶  [node kernel: DNAT via kube-pro
 
 The kernel performs **DNAT** (destination NAT): it rewrites the destination from the VIP to a chosen Pod IP, records the mapping in the conntrack table, and the reply is un-NATed on the way back. The VIP never appears "on the wire" as a source or a real interface — it exists only as these translation rules.
 
-<!-- VISUAL: Packet from Client Pod to ClusterIP VIP; node kernel box shows conntrack + DNAT rewriting to one of three EndpointSlice Pod IPs; reply path shows reverse translation. -->
+```mermaid
+flowchart LR
+  clientPod["Client Pod"] -->|Destination 10.96.40.10:80| nodeKernel["Node kernel"]
+  serviceWatch["kube-proxy watches Service"] --> proxyRules["nftables, IPVS, or iptables rules"]
+  endpointSlices["EndpointSlices list ready Pod IPs"] --> proxyRules
+  proxyRules --> nodeKernel
+  nodeKernel --> conntrack["Conntrack records translation"]
+  conntrack --> dnat["DNAT selects 10.244.2.7:5000"]
+  dnat --> backendPod["Backend Pod"]
+  backendPod -->|Reply| conntrack
+  conntrack -->|Reverse translation from VIP| clientPod
+```
+
 *Figure 32.1: A ClusterIP is a virtual IP realized by kernel DNAT; kube-proxy programs the rules from EndpointSlices.*
 
 Two Service traffic-policy fields change the receptionist's choices:
@@ -141,6 +153,34 @@ CoreDNS is configured by the **Corefile** ConfigMap. A typical cluster Corefile:
 ```
 
 The `kubernetes` plugin answers cluster names; `forward` sends everything else (like `example.com`) to the node's upstream resolver; `cache` holds answers for 30s.
+
+```mermaid
+sequenceDiagram
+  participant application as Application
+  participant resolver as Pod resolver
+  participant kubeDns as kube-dns Service
+  participant coreDns as CoreDNS
+  participant apiServer as Kubernetes API
+  participant upstream as Upstream DNS
+  application->>resolver: Resolve task-api.tasks
+  resolver->>kubeDns: Query with cluster search suffix
+  kubeDns->>coreDns: Forward DNS request
+  coreDns->>apiServer: Read cached Service and Endpoint data
+  apiServer-->>coreDns: Cluster records
+  coreDns-->>kubeDns: Return ClusterIP
+  kubeDns-->>resolver: Return DNS answer
+  resolver-->>application: Return ClusterIP
+  application->>resolver: Resolve example.com
+  resolver->>kubeDns: Query external name
+  kubeDns->>coreDns: Forward DNS request
+  coreDns->>upstream: Forward non-cluster query
+  upstream-->>coreDns: Return external address
+  coreDns-->>kubeDns: Return DNS answer
+  kubeDns-->>resolver: Return DNS answer
+  resolver-->>application: Return external address
+```
+
+*Figure 32.2: CoreDNS answers Kubernetes service names from cluster state and forwards non-cluster names to upstream DNS.*
 
 ### In production
 
@@ -258,6 +298,21 @@ spec:
 ```
 
 Shift the weights (90/10 → 50/50 → 0/100) to progress or roll back a release. No annotations, portable across implementations.
+
+```mermaid
+flowchart LR
+  client["Client request"] --> gateway["Gateway listener"]
+  gatewayClass["GatewayClass and controller"] --> gateway
+  gateway --> route["HTTPRoute match"]
+  route --> stableWeight["Stable backend weight 90"]
+  route --> canaryWeight["Canary backend weight 10"]
+  stableWeight --> stableService["task-api-stable Service"]
+  canaryWeight --> canaryService["task-api-canary Service"]
+  stableService --> stablePods["Stable Pods"]
+  canaryService --> canaryPods["Canary Pods"]
+```
+
+*Figure 32.3: Gateway API separates listener ownership from an HTTPRoute that progressively splits traffic between stable and canary backends.*
 
 **Header- and method-based matching.** Route by request headers, query params, or HTTP method — first-class fields:
 

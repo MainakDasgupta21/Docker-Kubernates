@@ -18,6 +18,10 @@
 
 Alex's phone buzzes at 03:12. The Task API — the small Flask service you packaged back in Chapter 04 — is down. A host rebooted after a kernel update, and the container that was started with `docker run -d` never came back. Alex SSHs in, runs `docker start task-api`, and goes back to bed.
 
+![Shipping port control tower for Kubernetes orchestration](assets/analogy-shipping-port.png)
+
+*Figure 11.A: Kubernetes is the control tower that keeps many cranes moving toward declared desired state.*
+
 At 03:40 the phone buzzes again. Different host. Same story.
 
 Nothing here is a mystery. The container worked. The image was fine. The *operating model* was wrong: a human being was the only component that knew the Task API was supposed to be running. Docker faithfully did what it was told — start this container, once — and nothing more.
@@ -34,7 +38,28 @@ Instead, the port has a **harbor master** who holds a manifest: *"There must alw
 
 Kubernetes is that harbor master. You do not describe the steps; you describe the **desired state** of the port, and Kubernetes works continuously to make the world match your description. That single idea carries the rest of this book.
 
-<!-- VISUAL: Port scene split in two. Left: a person with a clipboard manually directing one crane ("Docker: you run one command, one thing happens"). Right: a manifest document feeding a control tower that dispatches many cranes and replaces a failed cooling unit automatically ("Kubernetes: declare desired state, controllers converge"). -->
+```mermaid
+flowchart TB
+  subgraph dockerSide["Docker: imperative"]
+    human["Operator with clipboard"]
+    cmd["docker run / start"]
+    crane1["One crane, one container"]
+    human --> cmd --> crane1
+  end
+  subgraph k8sSide["Kubernetes: declarative"]
+    manifest["Desired-state manifest"]
+    tower["Control plane / controllers"]
+    craneA["Crane A"]
+    craneB["Crane B"]
+    cooling["Replace failed cooling unit"]
+    manifest --> tower
+    tower --> craneA
+    tower --> craneB
+    tower --> cooling
+  end
+```
+
+*Figure 11.1: Docker runs one command once; Kubernetes declares desired state and controllers converge the port continuously.*
 
 ---
 
@@ -59,12 +84,16 @@ Concretely, an orchestrator answers questions you would otherwise answer by hand
 
 Kubernetes is not one program. It is a small set of cooperating components plus a lot of independent **controllers**, all coordinating through one shared, versioned datastore reached via one HTTP API.
 
-```text
-you ──kubectl──►  API server  ──►  etcd (the only source of truth)
-                    ▲   ▲
-                    │   └── controllers watch objects and act
-                    └────── kubelets on every node report and obey
+```mermaid
+flowchart LR
+  you["You"] --> kubectl["kubectl"]
+  kubectl --> apiServer["API server"]
+  apiServer --> etcd["etcd: source of truth"]
+  controllers["Controllers"] -->|"watch and act"| apiServer
+  kubelets["Kubelets on nodes"] -->|"report and obey"| apiServer
 ```
+
+*Figure 11.2: Every change flows through the API server; etcd holds truth while controllers and kubelets watch and act.*
 
 Three properties fall out of that design and explain most of Kubernetes's behavior:
 
@@ -173,34 +202,30 @@ Every controller runs the same loop:
 4. **Report** what it sees in `status`.
 5. Repeat forever.
 
-```text
-   ┌──────────────────────────────┐
-   │                              │
-   ▼                              │
-observe current state             │
-   │                              │
-   ▼                              │
-compare with desired state ── equal? ── yes ──┘
-   │
-   │ no
-   ▼
-act to converge, update status ───► (loop again)
+```mermaid
+flowchart TD
+  observe["Observe current state"] --> compare["Compare with desired state"]
+  compare --> equal{"Equal?"}
+  equal -->|"yes"| observe
+  equal -->|"no"| act["Act to converge, update status"]
+  act --> observe
 ```
+
+*Figure 11.3: The reconciliation loop observes, compares, and acts until current state matches desired state.*
 
 A concrete trace, in the language of objects:
 
-```text
-Deployment spec: replicas: 3       (what you want)
-ReplicaSet status: replicas: 2     (what exists — one Pod was evicted)
-                    ↓
-ReplicaSet controller creates 1 Pod
-                    ↓
-scheduler assigns it a node
-                    ↓
-kubelet on that node starts the container and reports Ready
-                    ↓
-current state: 3 Ready Pods → loop finds nothing to do
+```mermaid
+flowchart TD
+  desired["Deployment spec: replicas 3"] --> shortfall["ReplicaSet status: replicas 2"]
+  shortfall --> createPod["ReplicaSet controller creates 1 Pod"]
+  createPod --> schedule["Scheduler assigns a node"]
+  schedule --> start["Kubelet starts container, reports Ready"]
+  start --> done["Current state: 3 Ready Pods"]
+  done --> idle["Loop finds nothing to do"]
 ```
+
+*Figure 11.4: Self-healing is reconciliation: a shortfall becomes one new Pod without a human restart command.*
 
 Nobody issued a "restart" command. One controller noticed a shortfall and wrote one object. This is why Kubernetes appears to heal itself: self-healing is just reconciliation you were not watching.
 
@@ -254,6 +279,18 @@ spec:                 # DESIRED state — you write this
 ```
 
 Learn to read that shape and you can read any manifest, including ones for resources that do not exist yet: custom resources added by operators follow exactly the same grammar.
+
+```mermaid
+flowchart TB
+  object["Kubernetes object"]
+  object --> apiVersion["apiVersion"]
+  object --> kind["kind"]
+  object --> metadata["metadata: name, labels"]
+  object --> spec["spec: desired state — you write"]
+  object --> status["status: observed state — cluster writes"]
+```
+
+*Figure 11.5: Every object shares the same grammar: identity in metadata, intent in spec, observation in status.*
 
 `kubectl explain` is the built-in reference, generated from the API your cluster actually serves:
 

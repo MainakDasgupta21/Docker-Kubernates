@@ -91,7 +91,18 @@ In Kubernetes, you measure SLIs from metrics (Chapter 22). A Prometheus availabi
 
 The `14.4` multiplier is the classic "consume 2% of a 30-day budget in 1 hour" fast-burn threshold; pairing a short and a long window suppresses flapping. Slow-burn alerts (lower multiplier, longer windows) page less urgently.
 
-<!-- VISUAL: An error-budget burndown chart over 30 days: budget line descending, actual consumption tracking below it, a steep "fast burn" segment triggering a page, and a "budget exhausted → feature freeze" marker. -->
+```mermaid
+flowchart LR
+  windowStart["Day 0: full error budget"] --> normalBurn["Normal burn: actual consumption below budget path"]
+  normalBurn --> fastBurn["Fast-burn segment: steep consumption slope"]
+  fastBurn --> page["Multi-window burn-rate page"]
+  page --> mitigate{"Mitigation restores SLI?"}
+  mitigate -->|Yes| remaining["Continue with remaining budget"]
+  mitigate -->|No| exhausted["Budget exhausted before day 30"]
+  exhausted --> freeze["Feature freeze and reliability work"]
+  remaining --> windowEnd["Day 30: reset rolling-window evaluation"]
+```
+
 *Figure 33.1: The error budget is spent over the window; burn-rate alerts fire on the slope, not just the level.*
 
 ### In production
@@ -159,6 +170,27 @@ spec:
 ```
 
 The scheduler, the DRA driver, and the kubelet cooperate: the driver publishes a `ResourceSlice` per node describing available devices; the scheduler picks a node whose devices satisfy the claim; the driver allocates the specific device and prepares it; the kubelet injects it into the container.
+
+```mermaid
+sequenceDiagram
+  participant driver as DRA driver
+  participant apiServer as Kubernetes API
+  participant pod as Pod and ResourceClaim
+  participant scheduler as Scheduler
+  participant kubelet as Kubelet
+  participant device as Selected device
+  driver->>apiServer: Publish ResourceSlices
+  pod->>apiServer: Create claim-backed workload
+  apiServer->>scheduler: Present pending Pod and claim
+  scheduler->>apiServer: Select node and allocate matching device
+  apiServer->>driver: Prepare allocated device
+  driver->>device: Configure access
+  apiServer->>kubelet: Bind Pod to selected node
+  kubelet->>device: Inject device into container
+  kubelet-->>apiServer: Report Pod running
+```
+
+*Figure 33.2: DRA carries a ResourceClaim from advertised capacity through scheduling, driver preparation, and device injection.*
 
 **Admin access (GA in 1.36).** Operators sometimes need to reach a device that a tenant's workload is *already using* — to check health, read telemetry, or run maintenance — without disrupting it. DRA admin access provides exactly this, guarded so tenants cannot abuse it:
 
@@ -335,6 +367,18 @@ Choosing targets:
 | Frequent snapshots + PV snapshots | ~1 h | Minutes–1 h | Medium |
 | Warm standby cluster (GitOps + replicated data) | Minutes | Seconds–minutes | High |
 | Active-active multi-region | ~0 | ~0 | Highest |
+
+```mermaid
+flowchart LR
+  lastRecoveryPoint["Last recoverable copy"] -->|RPO: acceptable data-loss interval| disaster["Disaster occurs"]
+  disaster --> detection["Detect and declare disaster"]
+  detection --> restore["Restore cluster state and application data"]
+  restore --> validation["Validate workloads and data"]
+  validation --> recovered["Service recovered"]
+  disaster -->|RTO: maximum recovery interval| recovered
+```
+
+*Figure 33.3: RPO measures backward from the disaster to the last recoverable data, while RTO measures forward to restored service.*
 
 ### In production
 

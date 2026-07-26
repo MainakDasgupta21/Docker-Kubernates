@@ -17,6 +17,10 @@
 
 IKEA does not send a fully assembled kitchen for every apartment layout. They send a **box of parts**, an instruction booklet, and options (which handles, which finish). You assemble the kitchen to fit *your* space.
 
+![Flat-pack furniture assembly for Helm charts and values](assets/analogy-flatpack-furniture.png)
+
+*Figure 23.A: Charts are flat-pack kits; values.yaml chooses the finish before assembly.*
+
 **Helm** is the package manager for Kubernetes. A **chart** is the flat-pack: templated YAML for Deployments, Services, ConfigMaps, and more. **Values** choose the finish. A **release** is one installed instance of a chart in a cluster—your assembled kitchen.
 
 Without Helm (or similar tooling), you drown in duplicated manifests across environments. With Helm, you still need to understand the rendered YAML—Helm does not replace Kubernetes knowledge; it packages it.
@@ -45,6 +49,17 @@ version.BuildInfo{Version:"v3.16.x", GitCommit:"...", ...}
 ```
 
 This book assumes **Helm 3** (no Tiller). Releases are stored as Secrets or ConfigMaps in the cluster.
+
+```mermaid
+flowchart LR
+  chart["Chart package"] --> install["helm install"]
+  install --> release["Named release"]
+  release --> upgrade["helm upgrade"]
+  upgrade --> rollback["helm rollback"]
+  release --> uninstall["helm uninstall"]
+```
+
+*Figure 23.1: A release is a versioned installation of a chart—install, upgrade, roll back, or uninstall as a unit.*
 
 ### In production
 
@@ -174,6 +189,16 @@ serviceAccount:
   create: true
   name: ""
 ```
+
+```mermaid
+flowchart TB
+  chartYaml["Chart.yaml metadata"] --> chartDir["Chart directory"]
+  valuesYaml["values.yaml defaults"] --> chartDir
+  templates["templates/*.yaml + helpers"] --> chartDir
+  chartDir --> package["helm package / install"]
+```
+
+*Figure 23.2: A chart bundles metadata, default values, and Go templates that render into Kubernetes manifests.*
 
 ### In production
 
@@ -344,7 +369,15 @@ metadata:
 {{- end }}
 ```
 
-<!-- VISUAL: Pipeline values.yaml + templates → helm template/install → Kubernetes objects -->
+```mermaid
+flowchart LR
+  values["values.yaml + -f overrides"] --> helm["helm template / install"]
+  templates["templates/"] --> helm
+  helm --> objects["Deployment / Service / ConfigMap / ..."]
+  objects --> cluster["Kubernetes API"]
+```
+
+*Figure 23.3: Helm merges values with templates, renders Kubernetes objects, then installs or upgrades them as one release.*
 
 ### In production
 
@@ -430,6 +463,17 @@ $ helm upgrade --install task-api ./task-api -n tasks -f values-prod.yaml
 
 Later values files override earlier ones when you pass multiple `-f` flags.
 
+```mermaid
+flowchart LR
+  defaults["Chart values.yaml"] --> merge["Merge order"]
+  dev["values-dev.yaml"] --> merge
+  prod["values-prod.yaml"] --> merge
+  setFlags["--set flags last"] --> merge
+  merge --> rendered["Rendered manifests"]
+```
+
+*Figure 23.4: Later `-f` files and `--set` flags override earlier defaults—keep environment knobs in values files, not templates.*
+
 ### In production
 
 1. Add PDB, HPA, securityContext, and NetworkPolicy templates as the chart matures (Chapters 20–24).
@@ -441,6 +485,16 @@ Later values files override earlier ones when you pass multiple `-f` flags.
 ## 23.7 Hooks and dependencies (briefly)
 
 Charts may declare **dependencies** in `Chart.yaml` (for example, a Redis subchart) and fetch them with `helm dependency update`. **Hooks** run Jobs annotated to execute before/after install or upgrade. Use hooks sparingly—they complicate GitOps and rollbacks.
+
+```mermaid
+flowchart TB
+  parent["Parent chart"] --> deps["Chart.yaml dependencies"]
+  deps --> update["helm dependency update"]
+  update --> chartsDir["charts/ subchart tgz"]
+  hooks["Hook Jobs"] -->|"pre/post install or upgrade"| lifecycle["Release lifecycle"]
+```
+
+*Figure 23.5: Subcharts are fetched as dependencies; hooks attach Jobs to install/upgrade phases—use both sparingly in GitOps flows.*
 
 > 📘 **Deep Dive (optional):** Helm is not the only packager—Kustomize, Jsonnet, and GitOps tools also manage manifests. Many teams render Helm in CI and apply the output, or use Helm inside Argo CD / Flux.
 

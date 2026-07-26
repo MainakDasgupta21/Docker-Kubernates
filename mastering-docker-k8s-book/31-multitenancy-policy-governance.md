@@ -64,7 +64,16 @@ For stronger isolation without one-cluster-per-tenant, three techniques stack up
 | Sandboxed runtimes (gVisor, Kata Containers via `RuntimeClass`) | Container escape is contained by a user-space kernel or micro-VM | Some performance overhead |
 | Virtual control planes (e.g. the vCluster pattern) | Each tenant gets an apparent API server and CRDs | Extra moving parts to operate |
 
-<!-- VISUAL: A spectrum from "namespaces (soft)" on the left to "separate clusters (hard)" on the right, with node isolation, sandboxed runtimes, and virtual clusters plotted in between by isolation strength vs cost. -->
+```mermaid
+flowchart LR
+  namespaces["Namespaces, quotas, RBAC, and policy"] --> nodeIsolation["Dedicated nodes per tenant"]
+  nodeIsolation --> sandboxedRuntime["Sandboxed runtime or micro-VM"]
+  sandboxedRuntime --> virtualClusters["Virtual control planes"]
+  virtualClusters --> separateClusters["Separate clusters"]
+  softBoundary["Softer boundary and lower cost"] --> namespaces
+  separateClusters --> hardBoundary["Harder boundary and higher cost"]
+```
+
 *Figure 31.1: Tenancy is a spectrum of isolation strength, not a binary choice.*
 
 ### In production
@@ -292,6 +301,19 @@ spec:
 
 > 📘 **Deep Dive (optional):** For rules beyond PSS, use a validating/mutating policy engine — **Kyverno** or **OPA Gatekeeper** — or the built-in **ValidatingAdmissionPolicy** (CEL-based, GA since 1.30) and **MutatingAdmissionPolicy** (advancing in 1.36). In-tree CEL policies avoid running a separate webhook and are attractive for simple org-wide rules; Kyverno/Gatekeeper offer richer libraries and reporting.
 
+```mermaid
+flowchart TB
+  workload["Tenant workload request"] --> rbac["RBAC authorizes caller"]
+  rbac --> psa["Pod Security Admission checks Pod shape"]
+  psa --> orgPolicy["Organization admission policy"]
+  orgPolicy --> quota["ResourceQuota and LimitRange"]
+  quota --> networkPolicy["Default-deny NetworkPolicy"]
+  networkPolicy --> runtime["Node and RuntimeClass isolation"]
+  runtime --> admitted["Admitted tenant workload"]
+```
+
+*Figure 31.2: Multitenancy relies on layered authorization, admission, resource, network, and runtime controls rather than namespaces alone.*
+
 ---
 
 ## 31.6 RBAC good practices
@@ -392,6 +414,20 @@ global-default    Limited   20                         128      40d
 ```
 
 When a priority level is saturated, excess requests are **queued** (up to a limit) and then rejected with **HTTP 429 (Too Many Requests)** and a `Retry-After`. Well-behaved clients back off and retry. You can see rejections and waits in the API server's `apiserver_flowcontrol_*` metrics.
+
+```mermaid
+flowchart LR
+  request["API request"] --> flowSchema["FlowSchema matching"]
+  flowSchema --> priorityLevel["Priority level"]
+  priorityLevel --> capacity{"Concurrency available?"}
+  capacity -->|Yes| execute["Execute request"]
+  capacity -->|No| queue{"Queue has capacity?"}
+  queue -->|Yes| wait["Wait in fair queue"]
+  wait --> capacity
+  queue -->|No| reject["HTTP 429 with Retry-After"]
+```
+
+*Figure 31.3: API Priority and Fairness classifies requests, protects concurrency, and rejects only after the matching queue fills.*
 
 A custom `FlowSchema` is useful to *isolate* a badly behaved integration into its own low-priority level so it cannot harm anyone else:
 

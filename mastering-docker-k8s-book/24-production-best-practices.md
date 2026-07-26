@@ -18,6 +18,10 @@
 
 A weekend lab cluster is like a bicycle: if it breaks, you walk. A production cluster is like an airline: schedules, redundancy, maintenance windows, black boxes, and checklists. The Kubernetes API is the same; the **operational discipline** is not.
 
+![Airline operations center for production cluster operations](assets/analogy-airline-ops.png)
+
+*Figure 24.A: Production ops look more like a control room than a laptop demo.*
+
 This chapter gathers the controls you reach for when real users depend on you: quotas, disruption budgets, autoscaling, garbage collection, leases, cloud integration, backups, upgrades, and HA. None of these replace good application design—but without them, even great apps fail messily.
 
 ---
@@ -83,6 +87,16 @@ spec:
 
 > 💡 **Tip:** Quotas that enforce `requests.cpu`/`requests.memory` only work well if every container specifies requests—LimitRange defaults help enforce that culture.
 
+```mermaid
+flowchart LR
+  ns["Namespace tasks"] --> quota["ResourceQuota: aggregate caps"]
+  ns --> lr["LimitRange: per-container defaults and max"]
+  quota --> admit["Admission may reject over-budget creates"]
+  lr --> inject["Missing requests/limits get defaults"]
+```
+
+*Figure 24.1: ResourceQuota caps the namespace total; LimitRange sets per-container defaults and bounds so nothing arrives “unlimited.”*
+
 ### In production
 
 1. Align HPA `maxReplicas` with namespace quotas so scale-up does not fail mysteriously.
@@ -122,6 +136,16 @@ task-api   2               N/A               1                     10s
 ```
 
 > ⚠️ **Common Pitfall:** A PDB does **not** protect against **involuntary** disruptions. You still need replicas across failure domains ([Chapter 20](20-scheduling-and-advanced-placement.md)) and application retries. If `ALLOWED DISRUPTIONS` is 0, drains may block until you scale up or temporarily adjust the PDB—by design.
+
+```mermaid
+flowchart TB
+  disrupt["Pod leaving"] --> kind{"Voluntary or involuntary?"}
+  kind -->|"drain / API eviction"| voluntary["PDB applies"]
+  kind -->|"node crash / delete pod"| involuntary["PDB does not apply"]
+  voluntary --> budget["Respect minAvailable / maxUnavailable"]
+```
+
+*Figure 24.2: PDBs gate voluntary evictions such as drains; crashes and direct deletes ignore the budget.*
 
 ### In production
 
@@ -172,7 +196,15 @@ task-api   Deployment/task-api   22%/70%     2         10        2
 
 **VPA** is typically installed separately (community components or cloud add-ons). Modes commonly discussed: Off (recommendations only), Initial, Auto (often via recreate). Prefer HPA for replica scaling on custom metrics while VPA rightsizes requests—or use one dimension carefully. Read current VPA docs before combining.
 
-<!-- VISUAL: Graph of CPU rising → HPA increasing replicas → CPU per Pod falling -->
+```mermaid
+flowchart LR
+  load["CPU utilization rises"] --> hpa["HPA reacts"]
+  hpa --> replicas["Increase Deployment replicas"]
+  replicas --> share["CPU per Pod falls toward target"]
+  share --> steady["Utilization near averageUtilization"]
+```
+
+*Figure 24.3: When load rises, HPA adds replicas so average CPU utilization drops back toward the target.*
 
 ### In production
 
@@ -343,6 +375,15 @@ node/worker-2 uncordoned
 
 Never reboot nodes under load without drain unless you accept involuntary-style disruption.
 
+```mermaid
+flowchart LR
+  cordon["cordon: unschedulable"] --> drain["drain: PDB-aware eviction"]
+  drain --> work["Patch / reboot / hardware"]
+  work --> uncordon["uncordon: accept Pods again"]
+```
+
+*Figure 24.4: Safe node maintenance is cordon → drain → work → uncordon so new Pods do not land mid-change.*
+
 ---
 
 ## 24.9 etcd backup and restore
@@ -394,7 +435,15 @@ $ kubectl version
 $ kubectl get nodes
 ```
 
-<!-- VISUAL: Timeline control plane upgrade → worker wave 1 → worker wave 2 with PDB-aware drains -->
+```mermaid
+flowchart LR
+  backup["Backup etcd / verify provider backup"] --> cp["Upgrade control plane"]
+  cp --> w1["Worker wave 1: drain with PDBs"]
+  w1 --> w2["Worker wave 2: drain with PDBs"]
+  w2 --> verify["Verify workloads and APIs"]
+```
+
+*Figure 24.5: Upgrade control plane first, then drain workers in waves so PDBs and capacity keep apps available.*
 
 ---
 

@@ -17,6 +17,10 @@
 
 Imagine you check into a hotel. The room itself is temporary—housekeeping resets it for the next guest. The mini-bar, though, is stocked from a shared inventory in the basement. Guests do not own the basement; they *request* snacks, and the hotel allocates them from stock.
 
+![Hotel mini-bar and basement inventory for persistent storage](assets/analogy-hotel-minibar.png)
+
+*Figure 18.A: Rooms reset; the basement inventory (PVs) outlives any single guest (Pod).*
+
 Kubernetes Pods are like hotel rooms: they come and go. Local container filesystems disappear when a Pod is replaced. Databases, uploaded files, and shared caches need something more durable—storage that outlives any single Pod. That durable layer is **PersistentVolume** (PV) storage, requested through **PersistentVolumeClaims** (PVCs), and often provisioned automatically via a **StorageClass** and a **CSI** driver.
 
 If you only use the container writable layer, you will lose data the first time a node drains, a Deployment rolls, or a Pod restarts on another machine. Ephemeral volumes are still valuable—just for the right jobs.
@@ -105,7 +109,21 @@ hi
 
 Delete the Pod and that file is gone—by design.
 
-<!-- VISUAL: Pod with emptyDir and Memory emptyDir vanishing when Pod is deleted; contrast with PVC→PV surviving recreate -->
+```mermaid
+flowchart TB
+  subgraph ephemeral["Ephemeral path"]
+    podA["Pod A"] --> emptyDir["emptyDir / Memory emptyDir"]
+    deletePod["Delete Pod A"] --> gone["Scratch data gone"]
+  end
+  subgraph durable["Durable path"]
+    podB["Pod B"] --> pvc["PVC"]
+    pvc --> pv["PV / CSI volume"]
+    recreate["Recreate Pod B"] --> pvc
+    recreate --> survives["Data survives"]
+  end
+```
+
+*Figure 18.1: `emptyDir` vanishes with the Pod; a PVC-backed volume survives recreate because the claim stays bound to the PV.*
 
 ### In production
 
@@ -131,6 +149,15 @@ App (Pod) ──mounts──► PVC (request) ──bound to──► PV (actual
                               │
                               └── StorageClass (how to create PVs on demand)
 ```
+
+```mermaid
+flowchart LR
+  pod["Pod"] -->|"mounts"| pvc["PVC request"]
+  pvc -->|"bound to"| pv["PV volume"]
+  sc["StorageClass"] -->|"provisions on demand"| pv
+```
+
+*Figure 18.2: Pods mount claims; claims bind to volumes; StorageClasses drive dynamic provisioning.*
 
 **Access modes** describe how nodes may mount the volume—not Unix file modes:
 
@@ -243,7 +270,25 @@ CSI (Container Storage Interface) is the plug that lets Kubernetes talk to Amazo
 
 ### Under the hood
 
-<!-- VISUAL: PVC created → external-provisioner → CSI CreateVolume → PV bound → kubelet NodeStage/NodePublish -->
+```mermaid
+sequenceDiagram
+  participant User
+  participant ApiServer as apiServer
+  participant Provisioner as externalProvisioner
+  participant Csi as csiDriver
+  participant Kubelet as kubelet
+  User->>ApiServer: create PVC
+  ApiServer->>Provisioner: watch unbound PVC
+  Provisioner->>Csi: CreateVolume
+  Csi-->>Provisioner: volume ready
+  Provisioner->>ApiServer: create PV and bind PVC
+  ApiServer->>Kubelet: Pod scheduled with claim
+  Kubelet->>Csi: NodeStageVolume
+  Kubelet->>Csi: NodePublishVolume
+  Kubelet-->>User: volume mounted in Pod
+```
+
+*Figure 18.3: Dynamic provisioning: PVC creation triggers CSI CreateVolume, PV bind, then kubelet NodeStage/NodePublish.*
 
 ```bash
 $ kubectl get storageclass
@@ -326,6 +371,19 @@ volumeClaimTemplates:
 ```
 
 Kubernetes creates PVCs named like `data-task-db-0`, `data-task-db-1`.
+
+```mermaid
+flowchart TB
+  deploy["Deployment + one RWO PVC"] -->|"scale to N"| pending["Extra replicas Pending"]
+  sts["StatefulSet volumeClaimTemplates"] --> pvc0["data-app-0"]
+  sts --> pvc1["data-app-1"]
+  sts --> pvc2["data-app-2"]
+  pvc0 --> replica0["Pod app-0"]
+  pvc1 --> replica1["Pod app-1"]
+  pvc2 --> replica2["Pod app-2"]
+```
+
+*Figure 18.4: One shared RWO PVC strands Deployment replicas; StatefulSet templates give each ordinal its own claim.*
 
 ```bash
 $ kubectl exec deploy/task-api -- sh -c 'echo hello > /data/uploads/note.txt && cat /data/uploads/note.txt'
@@ -420,6 +478,16 @@ spec:
 ```
 
 Label every PVC that must participate, then create the VolumeGroupSnapshot. The controller creates member VolumeSnapshots under the group for restore workflows.
+
+```mermaid
+flowchart LR
+  srcPvc["Source PVC"] --> snap["VolumeSnapshot"]
+  snap --> content["VolumeSnapshotContent"]
+  snap --> newPvc["Restored PVC via dataSource"]
+  newPvc --> newPod["New Pod mounts restored data"]
+```
+
+*Figure 18.5: Snapshot a PVC, then restore into a new claim with `dataSource` pointing at the VolumeSnapshot.*
 
 ```bash
 $ kubectl get volumesnapshot,volumegroupsnapshot -n tasks

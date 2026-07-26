@@ -16,6 +16,10 @@
 
 In 1956, Malcolm McLean’s first container ship did not invent cargo—it reinvented *packaging*. Before standardized containers, loading a ship meant custom labor for every crate size and fragility. After containers, the same metal box could move from truck to crane to ship without anyone unpacking the contents.
 
+![Shipping container yard with crane and stacked containers](assets/analogy-shipping-containers.png)
+
+*Figure 00.A: Containers standardize packaging the way shipping containers standardized cargo.*
+
 Software had the same problem for decades. An app that “worked on my machine” failed on a teammate’s laptop, then again on staging, then again in production—different OS packages, different library versions, different environment variables. Containers are the shipping containers of software: a standard way to package an application *and* the runtime it needs so it can move from laptop to cloud with far fewer surprises.
 
 This book teaches you that packaging system—**Docker**—and the modern yard that schedules thousands of those containers—**Kubernetes**—from first principles to production habits.
@@ -65,6 +69,16 @@ Chapter 04 introduces a small **Task API** (Python Flask) that recurs as a runni
 
 **Keep versions in mind.** This book assumes **Docker Engine 29.x** (Compose V2, BuildKit and buildx by default) and **Kubernetes 1.36**. If a command fails oddly, check `docker version` and `kubectl version` before assuming the book is wrong.
 
+```mermaid
+flowchart TD
+  why["Why: motivation and mental model"] --> how["How: commands, YAML, and flags"]
+  how --> practice["Practice: type the commands"]
+  practice --> depth["Depth tiers: plain / hood / production"]
+  depth --> versions["Confirm Engine 29.x and Kubernetes 1.36"]
+```
+
+*Figure 00.1: A durable learning loop — understand why, practice how, then treat production checklists as the bar you ship against.*
+
 ---
 
 ## What “Production” Means Here
@@ -80,6 +94,17 @@ Chapter 04 introduces a small **Task API** (Python Flask) that recurs as a runni
 
 You will meet these ideas gradually. Early chapters prioritize clarity over perfection; later chapters tighten the screws.
 
+```mermaid
+flowchart TD
+  reproducible["Reproducible images<br/>prefer digests"] --> nonRoot["Non-root processes"]
+  nonRoot --> limits["Resource limits<br/>intentional restarts"]
+  limits --> secrets["Injected config and secrets"]
+  secrets --> observable["Observable and reversible changes"]
+  observable --> automated["Automated enough for 2 a.m."]
+```
+
+*Figure 00.2: “Production” in this curriculum is a stack of operational habits, not a cloud vendor badge.*
+
 ---
 
 ## Parts of the Book
@@ -92,7 +117,24 @@ You will meet these ideas gradually. Early chapters prioritize clarity over perf
 | **IV — Advanced Ops & SRE** (Ch. 25–33) | Build/supply chain, Engine ops, kubeadm, extensions, governance, day-2 SRE | Platform and SRE readiness |
 | **Appendices A–G** | Cheatsheets, resources, answers, glossary, docs map, version migration | Fast lookup while you work |
 
-<!-- VISUAL: Book roadmap diagram showing Part I (Docker) → Part II (Kubernetes) → Part III (Production) → Part IV (Advanced/SRE), with the Task API example threading through Chapters 04, 08, 14, and 24 -->
+```mermaid
+flowchart LR
+  partI["Part I: Docker Foundations<br/>Ch. 01–10"] --> partII["Part II: Kubernetes Foundations<br/>Ch. 11–17"]
+  partII --> partIII["Part III: Toward Production<br/>Ch. 18–24"]
+  partIII --> partIV["Part IV: Advanced Ops and SRE<br/>Ch. 25–33"]
+  partIV --> appendices["Appendices A–G"]
+```
+
+*Figure 00.3: The book roadmap moves from Docker foundations through Kubernetes, production patterns, and advanced SRE topics.*
+
+```mermaid
+flowchart LR
+  ch04["Ch. 04: Dockerfile<br/>Task API image"] --> ch08["Ch. 08: Compose<br/>API + Postgres"]
+  ch08 --> ch14["Ch. 14: Kubernetes<br/>Deployment"]
+  ch14 --> ch24["Ch. 24: Production<br/>patterns"]
+```
+
+*Figure 00.4: The Task API running example threads through Chapters 04, 08, 14, and 24 so the same app deepens with each part.*
 
 ---
 

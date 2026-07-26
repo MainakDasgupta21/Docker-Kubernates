@@ -63,10 +63,57 @@ Do **not** claim "Docker 27+" or "Kubernetes 1.32+" as the book baseline. Histor
 Every **major concept** (not every tiny flag) must include:
 
 1. **`### In plain terms`** — analogy or everyday language; zero unexplained jargon.
-2. **`### Under the hood`** — mechanism, CLI flags, YAML fields, realistic sample output, diagrams via `<!-- VISUAL: … -->` placeholders when helpful.
+2. **`### Under the hood`** — mechanism, CLI flags, YAML fields, realistic sample output, and **rendered diagrams** (never leave `<!-- VISUAL -->` placeholders).
 3. **`### In production`** — DevOps/SRE guidance: failure modes, SLOs, security, operational checklist items.
 
 Short transitional sections (pitfalls, exercises, takeaways) do **not** need all three tiers.
+
+### Visuals: diagrams, flowcharts, and illustrations
+
+Prefer **Mermaid** for every technical diagram (topology, sequence, state, decision). Prefer **Markdown tables** for comparisons. Prefer **PNG illustrations** only for chapter-opening analogies and the book cover (exact text does not matter there).
+
+**Figure numbering and captions**
+
+- Number figures as `Figure NN.M` where `NN` is the chapter number and `M` is the figure order within that chapter.
+- Place an italic caption on the line immediately after the diagram or image.
+- Example pattern (fences shown with four backticks so this guide stays valid):
+
+````markdown
+```mermaid
+flowchart LR
+  cli["docker CLI"] --> daemon["dockerd"]
+  daemon --> containerd
+  containerd --> runc
+  runc --> container["Running container"]
+```
+
+*Figure 02.1: A `docker run` request travels from the CLI through the daemon and containerd to runc.*
+````
+
+**Mermaid conventions** (GitHub-safe)
+
+- Fence language: `mermaid`.
+- Node IDs: camelCase, no spaces (`apiServer`, not `API Server`).
+- Labels with parentheses, commas, or colons: wrap in double quotes (`apiServer["API server (kube-apiserver)"]`).
+- Do **not** set explicit fill colors or themes — the default theme works in light and dark mode.
+- Prefer `flowchart` for topology and decisions, `sequenceDiagram` for request flows, `stateDiagram-v2` for lifecycles.
+
+**Illustration embeds**
+
+- From chapter files at the book root: `![Alt text](assets/name.png)`
+- From `appendices/`: `![Alt text](../assets/name.png)`
+- Always include a descriptive alt text and a `*Figure NN.M: …*` caption.
+
+**Choosing the right visual**
+
+| Need | Prefer |
+|------|--------|
+| Topology / architecture | `flowchart` |
+| Request or call order | `sequenceDiagram` |
+| Lifecycle / state machine | `stateDiagram-v2` |
+| Decision tree | `flowchart` with decision diamonds |
+| Side-by-side trade-offs | Markdown table |
+| Opening analogy / cover | PNG in `assets/` |
 
 ### Callouts
 

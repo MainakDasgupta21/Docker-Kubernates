@@ -18,6 +18,10 @@
 
 A modern office building does not hand every contractor a master key. Receptionists get lobby access. Electricians get badge access to utility floors. Fire codes dictate where walls and sprinklers must exist—rules that apply even if someone has a badge. Security cameras record who walked where, so incidents are reconstructable.
 
+![Keys and badges for RBAC and cluster access control](assets/analogy-keys-badges.png)
+
+*Figure 21.A: Who you are (subject) plus your badge (RoleBinding) decides which doors open.*
+
 Kubernetes security works the same way:
 
 - **RBAC** is the badge system (who may call which API verbs on which resources)
@@ -69,6 +73,20 @@ task-api   0         5s
 > 💡 **Tip:** Create a dedicated ServiceAccount per app (or per permission set). Never grant broad rights to `default`.
 
 > ⚠️ **Common Pitfall:** Assuming “no API calls in my app” means the ServiceAccount does not matter. Sidecars, operators, and opportunistic tooling still inherit that identity.
+
+```mermaid
+sequenceDiagram
+  participant Pod as workloadPod
+  participant Kubelet as kubelet
+  participant Api as apiServer
+  Kubelet->>Pod: mount projected SA token
+  Pod->>Api: authenticated API request
+  Api->>Api: authenticate as ServiceAccount
+  Api->>Api: authorize via RBAC
+  Api-->>Pod: allow or deny
+```
+
+*Figure 21.1: The kubelet mounts a projected ServiceAccount token; the API server authenticates the Pod, then RBAC decides authorization.*
 
 ### In production
 
@@ -142,7 +160,14 @@ rules:
     verbs: ["get", "list"]
 ```
 
-<!-- VISUAL: Subject → RoleBinding → Role → rules on apiGroups/resources/verbs -->
+```mermaid
+flowchart LR
+  subject["Subject: User / Group / ServiceAccount"] --> binding["RoleBinding or ClusterRoleBinding"]
+  binding --> role["Role or ClusterRole"]
+  role --> rules["rules: apiGroups / resources / verbs"]
+```
+
+*Figure 21.2: Subjects receive permissions through bindings that reference Roles; Roles list the API groups, resources, and verbs allowed.*
 
 ### In production
 
@@ -221,6 +246,17 @@ spec:
 | `capabilities.drop: ["ALL"]` | Remove Linux capabilities; add back only if required |
 | `seccompProfile: RuntimeDefault` | Apply default syscall filter |
 
+```mermaid
+flowchart TB
+  podSc["Pod securityContext"] --> nonRoot["runAsNonRoot / runAsUser"]
+  podSc --> seccomp["seccompProfile RuntimeDefault"]
+  ctrSc["Container securityContext"] --> noEsc["allowPrivilegeEscalation false"]
+  ctrSc --> roRoot["readOnlyRootFilesystem"]
+  ctrSc --> dropCaps["capabilities.drop ALL"]
+```
+
+*Figure 21.3: Pod- and container-level security contexts constrain identity, privileges, filesystem writability, and capabilities.*
+
 > 💡 **Tip:** Images must be built to support non-root (file ownership, listening on non-privileged ports). The Task API should listen on 8000 as a non-root user.
 
 ### In production
@@ -257,6 +293,15 @@ $ kubectl label namespace tasks \
 ```
 
 Roll out carefully: `warn`/`audit` first, fix workloads, then raise `enforce`.
+
+```mermaid
+flowchart LR
+  privileged["privileged: unrestricted"] --> baseline["baseline: block known escalations"]
+  baseline --> restricted["restricted: hardened defaults"]
+  modes["Modes: warn then audit then enforce"] --> rollout["Raise namespace labels gradually"]
+```
+
+*Figure 21.4: Pod Security Standards tighten from privileged to restricted; roll out with warn/audit before enforce.*
 
 > 📘 **Deep Dive (optional):** PSA replaced PodSecurityPolicy (removed since Kubernetes 1.25). On 1.36, PSA is the built-in path; Kyverno or OPA Gatekeeper add richer custom rules on top.
 
@@ -389,6 +434,20 @@ RBAC does not stop Pod A from TCP-connecting to Pod B. Pair this chapter with Ch
 3. Keep ServiceAccounts from needing network paths they should not use
 
 Defense in depth: stolen token + open network is worse than either alone.
+
+```mermaid
+flowchart TB
+  attack["Compromised workload"] --> rbac["RBAC least privilege"]
+  attack --> psa["PSA / securityContext"]
+  attack --> netpol["NetworkPolicy"]
+  attack --> audit["Audit logging"]
+  rbac --> limited["Limited API blast radius"]
+  psa --> harder["Harder container escape"]
+  netpol --> contained["Limited lateral movement"]
+  audit --> visible["Actions are reconstructable"]
+```
+
+*Figure 21.5: Layer RBAC, admission, NetworkPolicy, and audits—no single control contains every failure mode.*
 
 ---
 

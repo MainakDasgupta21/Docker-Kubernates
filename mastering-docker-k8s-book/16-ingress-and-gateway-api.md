@@ -30,7 +30,18 @@ You keep Services as ClusterIP and attach HTTP routing rules at the edge. One ex
 $ kind create cluster --name edge --image kindest/node:v1.36.0
 ```
 
-<!-- VISUAL: Single external VIP fan-out by Host/Path to Service A/B/C -->
+```mermaid
+flowchart TB
+  vip["Single external VIP"] --> hostPath{"Host / Path"}
+  hostPath -->|"api.example.com /api"| svcA["Service A"]
+  hostPath -->|"shop.example.com /"| svcB["Service B"]
+  hostPath -->|"admin.example.com /"| svcC["Service C"]
+  svcA --> podsA["Pods A"]
+  svcB --> podsB["Pods B"]
+  svcC --> podsC["Pods C"]
+```
+
+*Figure 16.1: One edge VIP fans out by Host and Path to many ClusterIP Services and their Pods.*
 
 ### In production
 
@@ -76,6 +87,16 @@ $ kubectl get ingress task-api
 ```
 
 `IngressClass` names which controller should honor the object when several coexist.
+
+```mermaid
+flowchart LR
+  ingressObj["Ingress object: wish list"] --> class["IngressClass"]
+  class --> controller["Ingress controller"]
+  controller --> proxy["Proxy: NGINX / Traefik / ..."]
+  proxy --> services["ClusterIP Services"]
+```
+
+*Figure 16.2: An Ingress object does nothing until a matching IngressClass controller programs a proxy.*
 
 ### In production
 
@@ -181,6 +202,16 @@ spec:
 
 cert-manager (ecosystem) can automate issuance into TLS Secrets. Redirect HTTP→HTTPS via controller settings.
 
+```mermaid
+flowchart LR
+  browser["Browser HTTPS"] --> edge["Ingress / Gateway terminates TLS"]
+  secret["TLS Secret"] --> edge
+  edge -->|"HTTP inside cluster"| svc["ClusterIP Service"]
+  svc --> pods["Pods"]
+```
+
+*Figure 16.3: TLS terminates at the edge using a Secret; backends often see plain HTTP on ClusterIP Services.*
+
 ### In production
 
 Prefer short-lived automated certs. Restrict who can read TLS Secrets (RBAC). Decide where you terminate TLS (edge only vs re-encrypt to Pods) and document trust boundaries.
@@ -258,7 +289,15 @@ $ kubectl get gatewayclass,gateway,httproute -A
 
 Gateway API is **not** "Ingress with new names"—attachment, weighting, header matching, and cross-namespace grants are first-class.
 
-<!-- VISUAL: Platform GatewayClass → Gateway listeners; App HTTPRoutes attach; ReferenceGrant bridging namespaces -->
+```mermaid
+flowchart TB
+  gclass["GatewayClass: platform controller"] --> gateway["Gateway: listeners, ports, TLS"]
+  route["HTTPRoute: app team"] -->|"parentRefs attach"| gateway
+  route --> backend["backendRefs → Service"]
+  grant["ReferenceGrant"] -.->|"cross-namespace allow"| route
+```
+
+*Figure 16.4: Platform owns GatewayClass and Gateway listeners; apps attach HTTPRoutes, with ReferenceGrant bridging namespaces when needed.*
 
 ### In production
 
@@ -290,6 +329,15 @@ Ingress is the older, flatter API everyone knows. Gateway API is the modern, rol
 ### In production
 
 Freeze net-new Ingress for greenfield if Gateway is ready. Do not rewrite working Ingress on Friday before a holiday. Train app teams on `HTTPRoute` ownership and promotion rules.
+
+```mermaid
+flowchart LR
+  internet["Internet"] --> edge["Ingress or Gateway"]
+  edge --> clusterIp["ClusterIP task-api"]
+  clusterIp --> deploy["Deployment Pods"]
+```
+
+*Figure 16.5: Whether you use Ingress or Gateway API, the Task API still sits behind the same ClusterIP Service.*
 
 ---
 

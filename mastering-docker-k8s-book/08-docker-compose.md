@@ -18,6 +18,10 @@
 
 By now you can run a container the way a musician plays an instrument. A real application is an orchestra: a web API, a database, a cache, maybe a worker — each needing the right networks, volumes, ports, and environment, started in a sensible order.
 
+![Orchestra conductor coordinating multi-service applications](assets/analogy-orchestra.png)
+
+*Figure 08.A: Compose is the conductor that starts each section when the score (compose.yaml) says so.*
+
 You *could* conduct by shouting individual `docker run` lines every time. Or you could hand everyone a **score**: one document that describes each player and how they fit together.
 
 Docker Compose is that score. You describe the application in YAML; `docker compose up` performs it. The file is *declarative and versionable* — it lives in Git, documents architecture, and makes "works on my machine" mean "works on every machine with Docker."
@@ -59,6 +63,18 @@ $ docker compose down
 ```
 
 Compose created a dedicated user-defined network for the project (so services can find each other by name, as in Chapter 06) and named resources after the project (directory name by default).
+
+```mermaid
+flowchart LR
+  yaml["compose.yaml"] --> up["docker compose up"]
+  up --> net["Project network"]
+  up --> svc["Service containers"]
+  up --> vols["Named volumes"]
+  down["docker compose down"] --> cleanup["Remove containers + network"]
+  cleanup -.->|optional -v| dropVols["Also remove volumes"]
+```
+
+*Figure 08.1: Compose turns one declarative file into networks, services, and volumes — and tears them down as a unit.*
 
 ### Clearing up "version 3": an important correction
 
@@ -124,7 +140,15 @@ volumes:
 
 The hostname `db` in the connection string works because Compose networks are user-defined networks with embedded DNS.
 
-<!-- VISUAL: api and db on backend network; db-data volume on db; port 8000 from api to host -->
+```mermaid
+flowchart TB
+  host["Host"] -->|"publish 8000:8000"| api["api service"]
+  api --- backend["backend network"]
+  db["db service"] --- backend
+  dbVol["db-data volume"] --- db
+```
+
+*Figure 08.2: A minimal Compose topology — API and database on a private network, volume on the database, published API port only.*
 
 ### In production
 
@@ -235,6 +259,18 @@ services:
 
 `start_period` gives Postgres a grace window before failures count against `retries`.
 
+```mermaid
+flowchart LR
+  composeUp["compose up"] --> startDb["Start db container"]
+  startDb --> health["healthcheck: pg_isready"]
+  health -->|unhealthy| wait["Wait / retry"]
+  wait --> health
+  health -->|healthy| startApi["Start api<br/>depends_on condition"]
+  startApi --> ready["Stack ready"]
+```
+
+*Figure 08.3: Health-aware dependency ordering — the API waits until Postgres is healthy, not merely started.*
+
 > 📘 **Deep Dive (optional):** `depends_on.condition` existed in the old Compose file v2 format, was removed in classic "v3," and returned in the Compose Specification — a concrete reason the merged spec beats the old v3 framing.
 
 ### In production
@@ -292,6 +328,19 @@ $ docker compose watch
 ```
 
 Typical pattern for the Task API: **sync** Python source for instant edits; **rebuild** when dependency files change; **sync+restart** when process config changes.
+
+```mermaid
+flowchart TD
+  edit["Local file change"] --> path{"Which path?"}
+  path -->|app source| sync["action: sync"]
+  path -->|requirements.txt| rebuild["action: rebuild"]
+  path -->|process config| syncRestart["action: sync+restart"]
+  sync --> running["Container updated"]
+  rebuild --> recreate["Image rebuild + recreate"]
+  syncRestart --> restart["Sync then restart"]
+```
+
+*Figure 08.4: Compose Watch maps path changes to sync, rebuild, or restart actions for a fast local loop.*
 
 > 💡 **Tip:** Watch does not replace a proper image build for CI or production. It is a developer velocity tool. Keep `Dockerfile` and `compose.yaml` as the source of truth for how the service *ships*.
 

@@ -73,6 +73,23 @@ metadata:
 
 Status is owned by controllers; spec fields you applied are owned by your manager name (often `kubectl` or a custom `--field-manager`).
 
+```mermaid
+flowchart TB
+  manifest["Desired Deployment object"] --> apiServer["API server SSA merge"]
+  gitOps["platform-gitops manager"] --> labels["Owns labels, image, and Pod template"]
+  autoscaler["horizontal-pod-autoscaler manager"] --> replicas["Owns replicas"]
+  controller["kube-controller-manager"] --> status["Owns status fields"]
+  labels --> apiServer
+  replicas --> apiServer
+  status --> apiServer
+  apiServer --> managedFields["metadata.managedFields"]
+  apiServer --> conflict{"Overlapping field ownership?"}
+  conflict -->|No| mergedObject["Persist merged object"]
+  conflict -->|Yes| reject["Report conflict until ownership is resolved"]
+```
+
+*Figure 30.1: Server-side apply records field-level ownership so GitOps, autoscalers, and controllers can share an object without silent overwrites.*
+
 Force ownership when you intentionally take over a field:
 
 ```bash
@@ -216,6 +233,18 @@ namespace/tasks-staging configured
 deployment.apps/task-api configured
 service/task-api configured
 ```
+
+```mermaid
+flowchart LR
+  base["Reusable base resources"] --> renderer["Kustomize renderer"]
+  overlay["Staging overlay patches and image tag"] --> renderer
+  renderer --> rendered["Complete Kubernetes objects"]
+  rendered --> review["CI diff and server dry-run"]
+  review --> apply["Server-side apply"]
+  apply --> cluster["Managed live objects"]
+```
+
+*Figure 30.2: Kustomize combines a reusable base with environment overlays before review and server-side apply.*
 
 Useful Kustomize features for day-two ops:
 
@@ -484,7 +513,20 @@ A realistic change flow for the task-api:
 4. If a Pod misbehaves, `kubectl debug` with an ephemeral busybox—do not bake `curl` into the production image “just in case.”
 5. Keep personal kubectl aliases in **kuberc**, not in shared kubeconfig checked into a team vault.
 
-<!-- VISUAL: Flow diagram from Kustomize overlay → SSA apply → JSONPath verify → optional kubectl debug -->
+```mermaid
+flowchart LR
+  edit["Edit base and overlay"] --> render["Render with Kustomize"]
+  render --> serverDryRun["Server dry-run and review"]
+  serverDryRun --> ssa["Apply with SSA field manager"]
+  ssa --> verify["Verify image and status with JSONPath"]
+  verify --> healthy{"Workload healthy?"}
+  healthy -->|Yes| complete["Change complete"]
+  healthy -->|No| debug["Attach ephemeral container with kubectl debug"]
+  debug --> diagnose["Diagnose and feed fix back to Git"]
+  diagnose --> edit
+```
+
+*Figure 30.3: The object-management loop renders an overlay, applies it with SSA, verifies the result, and enters a controlled debug path only when needed.*
 
 ---
 

@@ -26,7 +26,20 @@ You already built `task-api:0.1.0` in Chapter 04. This chapter uses it (or `ngin
 
 A container is born (created), can run, pause, stop, restart, and eventually be removed. `docker run` is a convenience that creates and starts in one step.
 
-<!-- VISUAL: State diagram: created → running ⇄ paused; running → stopped → removed; running → dead/exited; restart policy arrows from exited back to running -->
+```mermaid
+stateDiagram-v2
+  [*] --> created: docker create
+  created --> running: docker start / run
+  running --> paused: docker pause
+  paused --> running: docker unpause
+  running --> exited: process exit / docker stop
+  exited --> running: docker start / restart policy
+  exited --> removed: docker rm
+  running --> removed: docker rm -f
+  removed --> [*]
+```
+
+*Figure 05.1: Container lifecycle states — create, run, pause, exit, restart, and remove.*
 
 | State (simplified) | Meaning |
 |--------------------|---------|
@@ -185,6 +198,15 @@ Daemon defaults (Linux example `/etc/docker/daemon.json`; on Desktop use Setting
 ```
 
 > ⚠️ **Warning:** Unlimited `json-file` logs can fill the disk. Always set rotation (`max-size` / `max-file`) on busy hosts.
+
+```mermaid
+flowchart LR
+  app["App stdout / stderr"] --> driver["Logging driver"]
+  driver --> jsonFile["json-file / local<br/>docker logs works"]
+  driver --> remote["journald / fluentd / cloud<br/>platform UI"]
+```
+
+*Figure 05.2: Applications should log to stdout/stderr; the driver decides whether `docker logs` or an external platform is the reader.*
 
 If an app only writes to an internal file, you will not see it with `docker logs` unless you mount/copy that file—an anti-pattern for containers.
 
@@ -367,6 +389,21 @@ Pair restarts with healthy images and attention to `RestartCount`. Prefer orches
 
 > ⚠️ **Warning:** `always` on a container that crashes instantly creates a restart storm—CPU churn and log spam. Stop it explicitly, fix the image, then bring it back.
 
+```mermaid
+flowchart TD
+  exit["Container exits"] --> policy{"Restart policy"}
+  policy -->|no| stayDown["Stay stopped"]
+  policy -->|on-failure| checkCode{"Non-zero exit?"}
+  checkCode -->|Yes| restart["Engine restarts"]
+  checkCode -->|No| stayDown
+  policy -->|always / unless-stopped| restart
+  restart --> healthy{"App healthy?"}
+  healthy -->|No| storm["Risk: restart storm"]
+  healthy -->|Yes| running["Running again"]
+```
+
+*Figure 05.3: Restart policies close the gap after exit — pair them with healthy images so you do not automate a crash loop.*
+
 ---
 
 ## 05.9 Stopping Gracefully vs Forcing
@@ -442,6 +479,17 @@ Follow a fixed order so you do not thrash: status → logs → inspect → exec/
 ### Under the hood
 
 When a container misbehaves:
+
+```mermaid
+flowchart TD
+  status["1. docker ps -a<br/>status and exit code"] --> logs["2. docker logs"]
+  logs --> inspect["3. docker inspect<br/>OOM, mounts, ports"]
+  inspect --> execDebug["4. exec or docker debug"]
+  execDebug --> reproduce["5. Reproduce with entrypoint override"]
+  reproduce --> fix["6. Fix image or runtime flags"]
+```
+
+*Figure 05.4: A fixed debugging order prevents thrashing — status, logs, inspect, then controlled reproduce.*
 
 1. **`docker ps -a`** — Is it running, restarting, or exited? Exit code?
 2. **`docker logs`** — App error, missing module, bind failure? (Confirm logging driver supports this.)

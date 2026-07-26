@@ -17,6 +17,10 @@
 
 Imagine a skyscraper assembled from prefabricated floors. The foundation floor is a slim Linux userspace. The next floor adds a language runtime. The next copies your application. Upper floors can differ without rebuilding the foundation—as long as lower floors stay identical.
 
+![Skyscraper cutaway showing stacked floors like image layers](assets/analogy-skyscraper-layers.png)
+
+*Figure 03.A: Image layers stack like floors of a building—shared below, unique on top.*
+
 Docker **images** work the same way. Each change during a build usually creates a **layer**. Containers started from the same image share those read-only layers on disk, saving space and pull time. When you finally understand layers, image size, build speed, and security scanning all become less mysterious.
 
 ---
@@ -37,7 +41,19 @@ An image includes:
 
 When a container starts, Docker adds a thin **writable layer** on top. Changes inside the running container live there (unless you mount volumes). The underlying image layers stay immutable.
 
-<!-- VISUAL: Read-only layers (base → deps → app) with a dashed writable container layer on top; multiple containers sharing the same lower layers -->
+```mermaid
+flowchart TB
+  writable["Writable container layer<br/>dashed / per container"]
+  appLayer["App layer"]
+  depsLayer["Dependencies layer"]
+  baseLayer["Base OS layer"]
+  writable --> appLayer --> depsLayer --> baseLayer
+  ctrA["Container A"] --> writable
+  ctrB["Container B"] --> writableB["Writable layer B"]
+  writableB --> appLayer
+```
+
+*Figure 03.1: Read-only image layers stack under a thin writable container layer; multiple containers can share the same lower layers.*
 
 Inspect config fields after you pull an image:
 
@@ -95,6 +111,21 @@ $ docker inspect nginx:alpine --format '{{json .RepoDigests}}'
 #### The `latest` trap
 
 `nginx` means `nginx:latest`. **latest** is only a convention—it is not guaranteed to be the newest stable, and it moves. Fine for quick demos; risky as your only production pin.
+
+| Pointer | Mutable? | Best for |
+|---------|----------|----------|
+| Tag (`1.4.2`, `alpine`) | Yes — can be moved | Human-friendly names |
+| Digest (`sha256:…`) | No — content identity | Promotion and audit |
+| `latest` | Yes — and ambiguous | Demos only |
+
+```mermaid
+flowchart LR
+  tag["Tag: myapp:1.4.2<br/>sticky note humans move"] --> digestA["sha256:aaa…"]
+  tag -.->|retagged later| digestB["sha256:bbb…"]
+  pin["Deploy pin"] --> digestA
+```
+
+*Figure 03.2: Tags are movable pointers; digests identify exact bytes you promote.*
 
 ### In production
 
@@ -212,6 +243,18 @@ Builders try to **reuse layers** when inputs have not changed (Chapter 04 goes d
 2. Copy dependency manifests before full source so dependency layers cache across code edits.
 3. Expect any changed file in a `COPY` to invalidate that step *and* all following steps.
 
+```mermaid
+flowchart TD
+  base["FROM base — usually cached"] --> pkgs["Install OS packages"]
+  pkgs --> deps["COPY requirements + pip install"]
+  deps --> src["COPY app source"]
+  src --> later["Later steps"]
+  codeEdit["Edit app.py only"] -.->|busts cache from here| src
+  reqEdit["Edit requirements.txt"] -.->|busts cache from here| deps
+```
+
+*Figure 03.3: Put stable work early — a source edit should not rebuild dependency layers.*
+
 Shared base layers across images also mean ten services `FROM python:3.12-slim` do not store ten full copies of the base on the daemon—storage is content-addressed.
 
 ### In production
@@ -280,7 +323,15 @@ Notes that save hours:
 - Emulation (QEMU) can build foreign architectures slowly; cross-compilation in multi-stage Dockerfiles is often faster when your language supports it (Chapter 04).
 - Automatic platform build-args such as `BUILDPLATFORM` and `TARGETPLATFORM` help write portable Dockerfiles.
 
-<!-- VISUAL: Manifest list (index) pointing to amd64 and arm64 image manifests, each with their own layers -->
+```mermaid
+flowchart TB
+  index["Manifest list / index<br/>nginx:1.27-alpine"] --> amd64["Image manifest<br/>linux/amd64"]
+  index --> arm64["Image manifest<br/>linux/arm64"]
+  amd64 --> amdLayers["Architecture-specific layers"]
+  arm64 --> armLayers["Architecture-specific layers"]
+```
+
+*Figure 03.4: A multi-platform tag is an index that points at per-architecture manifests and their layers.*
 
 ### In production
 

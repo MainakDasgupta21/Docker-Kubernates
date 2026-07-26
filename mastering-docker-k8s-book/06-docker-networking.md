@@ -16,6 +16,10 @@
 
 Imagine a large apartment building. Every apartment (container) has its own door, its own internal wiring, and its own private phone extension. Residents can call each other through the building's internal switchboard without dialing an outside line. If someone from the street wants apartment 4B, the front desk (the Docker host) must explicitly forward that call.
 
+![Apartment building analogy for Docker networking isolation](assets/analogy-apartment-building.png)
+
+*Figure 06.A: Each apartment (container) has private wiring; the front desk publishes only chosen doors.*
+
 Docker networking works the same way:
 
 - Each container gets its own **network namespace** — private interfaces, routes, and firewall rules.
@@ -54,7 +58,20 @@ $ docker inspect web --format '{{.NetworkSettings.IPAddress}}'
 172.17.0.2
 ```
 
-<!-- VISUAL: Docker host with docker0 bridge, two containers linked by veth pairs, host eth0 toward the outside network -->
+```mermaid
+flowchart TB
+  subgraph host["Docker host"]
+    eth0["eth0 / outward interface"]
+    docker0["docker0 bridge"]
+    eth0 --- docker0
+    veth1["veth pair"] --- docker0
+    veth2["veth pair"] --- docker0
+    ctr1["Container A eth0"] --- veth1
+    ctr2["Container B eth0"] --- veth2
+  end
+```
+
+*Figure 06.1: On the default bridge, containers connect through veth pairs to `docker0`; outbound traffic NATs via the host.*
 
 ### In production
 
@@ -110,6 +127,22 @@ Useful for batch jobs that only touch local files, or for workloads where zero n
 | `none` | Single host | Total | Offline jobs, lockdown | Not applicable |
 
 Prefer bridge plus published ports for ordinary services. Reserve host networking for measured need; document the lost isolation. Use `none` when the threat model says "this process must not talk to the network."
+
+```mermaid
+flowchart TD
+  need["Choose a network driver"] --> multiHost{"Must span multiple hosts?"}
+  multiHost -->|Yes| overlay["overlay<br/>requires Swarm"]
+  multiHost -->|No| underlay{"Must appear on physical LAN?"}
+  underlay -->|Yes| macChoice{"Unique MAC per container?"}
+  macChoice -->|Yes| macvlan["macvlan"]
+  macChoice -->|No| ipvlan["ipvlan"]
+  underlay -->|No| isolate{"Need network isolation?"}
+  isolate -->|No network at all| noneDrv["none"]
+  isolate -->|Share host stack| hostDrv["host"]
+  isolate -->|Yes default| bridgeDrv["bridge / user-defined bridge"]
+```
+
+*Figure 06.2: A driver decision path — start from multi-host and underlay needs, then fall back to bridge, host, or none.*
 
 > ⚠️ **Warning:** Two host-networked containers cannot both bind the same host port. Treat the host port namespace as shared scarce resource.
 
@@ -219,7 +252,26 @@ User-defined networks also give you:
 - **Live attach/detach** — `docker network connect` / `disconnect` on running containers.
 - **Custom subnets** — `docker network create --subnet 10.5.0.0/24 mynet` when addressing must be predictable.
 
-<!-- VISUAL: frontend and backend user-defined networks; API attached to both; DB only on backend -->
+```mermaid
+flowchart TB
+  subgraph frontendNet["frontend network"]
+    web["web"]
+    apiFront["api"]
+  end
+  subgraph backendNet["backend network"]
+    apiBack["api"]
+    db["db"]
+  end
+  apiFront -.->|same container<br/>attached to both| apiBack
+```
+
+*Figure 06.3: Dual-network attachment — the API bridges trust zones while the database stays on the backend network only.*
+
+| Need | Prefer |
+|------|--------|
+| Multi-container DNS by name | User-defined bridge |
+| Default catch-all for lonely containers | Built-in `bridge` |
+| Attach one service to two zones | `docker network connect` (API on frontend + backend) |
 
 ### Legacy links
 
@@ -277,6 +329,16 @@ $ docker port web2
 | `-P` | Random per `EXPOSE` | Throwaway tests, parallel CI |
 
 > ⚠️ **Common Pitfall:** `EXPOSE` in a Dockerfile does **not** publish anything. It is documentation (and a hint for `-P`). Only `-p` / `-P` at run time open a host port.
+
+```mermaid
+flowchart LR
+  client["Host / laptop client"] -->|"published port<br/>-p 8080:80"| hostPort["Host port 8080"]
+  hostPort --> nat["NAT / port proxy"]
+  nat --> ctrPort["Container port 80"]
+  expose["EXPOSE 80"] -.->|documents only| ctrPort
+```
+
+*Figure 06.4: Publishing opens a host door; `EXPOSE` alone documents intent and does not forward traffic.*
 
 ### In production
 

@@ -1,19 +1,39 @@
 # Assets
 
-This book was generated without bundled diagram files. Chapters use HTML comment placeholders of the form:
+PNG illustrations for chapter-opening analogies and the book cover. Technical architecture and flow diagrams are **Mermaid** blocks inside the Markdown chapters (they render on GitHub).
 
-```html
-<!-- VISUAL: short description of the intended diagram -->
-```
+## Inventory
 
-When you add figures later:
+| File | Used for |
+|------|----------|
+| `cover-mastering-docker-k8s.png` | Book cover (README) |
+| `analogy-shipping-containers.png` | Preface, Chapter 01 |
+| `analogy-restaurant-kitchen.png` | Chapter 02 |
+| `analogy-skyscraper-layers.png` | Chapter 03 |
+| `analogy-apartment-building.png` | Chapter 06 |
+| `analogy-whiteboard-filing.png` | Chapter 07 |
+| `analogy-orchestra.png` | Chapter 08 |
+| `analogy-restaurant-chain.png` | Chapter 09 |
+| `analogy-hotel-room.png` | Chapter 10 |
+| `analogy-shipping-port.png` | Chapter 11 |
+| `analogy-hotel-minibar.png` | Chapter 18 |
+| `analogy-city-grid.png` | Chapter 19 |
+| `analogy-concert-seating.png` | Chapter 20 |
+| `analogy-keys-badges.png` | Chapter 21 |
+| `analogy-instrument-panel.png` | Chapter 22 |
+| `analogy-flatpack-furniture.png` | Chapter 23 |
+| `analogy-airline-ops.png` | Chapter 24 |
 
-1. Place image files in this directory (PNG or SVG preferred).
-2. Replace the matching HTML comment with Markdown image syntax, for example:
+## Embedding
+
+From chapter files at the book root:
 
 ```markdown
-![Docker client, daemon, and registry](../assets/docker-architecture.png)
-*Figure 2.1: The Docker client talks to the daemon, which pulls images from a registry.*
+![Alt text](assets/filename.png)
+
+*Figure NN.A: Caption.*
 ```
 
-From chapter files at the book root, asset paths are `assets/...`. From files under `appendices/`, use `../assets/...`.
+From `appendices/`, use `../assets/filename.png`.
+
+See [Appendix H — Figure Index](../appendices/h-figure-index.md) for the full list of Mermaid figures and illustrations.
