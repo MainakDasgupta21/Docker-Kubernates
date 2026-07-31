@@ -9,6 +9,10 @@
 
 A self-contained textbook that takes you from first principles of containers to production-ready Kubernetes and day-2 operations. Every major concept is taught in **three tiers**—plain English, technical detail, and production DevOps guidance—grounded in the official [Docker](https://docs.docker.com/) and [Kubernetes](https://kubernetes.io/docs/home/) documentation.
 
+**Interactive edition:** open the VitePress reader for brand typography, progress tracking, and focus mode — see [`../book-site/README.md`](../book-site/README.md) (`cd book-site && npm install && npm run dev`).
+
+**Read in Cursor:** open this chapter (or any `.md`) and press **Ctrl+Shift+V** (macOS: **Cmd+Shift+V**) to preview with workspace fonts from [`../.vscode/markdown-preview.css`](../.vscode/markdown-preview.css). GitHub.com still uses its own fonts.
+
 **How to read each concept:** start with **In plain terms** for intuition, then **Under the hood** for the exact mechanism, then **In production** for how an MNC platform team would own, detect, and operate it. Look for **Before you leave this section** checklists and occasional `Production floor` callouts for blast-radius and change-safety rules.
 
 **Assumed versions:** Docker Engine **29.x** · Kubernetes **1.36** (supported window often discussed as 1.33–1.36)  

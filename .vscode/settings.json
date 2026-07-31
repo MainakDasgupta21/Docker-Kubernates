@@ -1,0 +1,10 @@
+{
+  "markdown.styles": [".vscode/markdown-preview.css"],
+  "[markdown]": {
+    "editor.fontFamily": "'Source Serif 4', Georgia, 'Times New Roman', serif",
+    "editor.fontLigatures": false,
+    "editor.lineHeight": 1.7,
+    "editor.fontSize": 15
+  },
+  "editor.fontFamily": "'IBM Plex Mono', Consolas, 'Courier New', monospace"
+}
