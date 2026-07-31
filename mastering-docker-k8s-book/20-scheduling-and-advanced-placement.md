@@ -32,6 +32,10 @@ The **kube-scheduler** is that road manager for Pods. Every new Pod without a `n
 
 Scheduling is a matchmaking problem: find a node that *can* run this Pod, then pick the *best* among those that can. If nobody qualifies, the Pod stays **Pending** and Events explain why.
 
+The scheduler exists so humans do not pin every Pod by hand and so capacity, taints, and volume topology are considered consistently. You might think Pending means “the cluster is broken”—usually it means your constraints eliminated every node. Read Events before adding more affinity.
+
+> ⚠️ **Common Pitfall:** You might think omitting resource requests “lets the Pod start faster.” Without requests the filter cannot place fairly, and under pressure your Pod becomes an easy eviction victim.
+
 ### Under the hood
 
 1. **Filtering (predicates):** Enough CPU/memory? Match selectors? Tolerate taints? Volume zone OK? Priority preemption candidates?
@@ -63,11 +67,27 @@ flowchart LR
 
 *Figure 20.1: The scheduler filters impossible nodes, scores the rest, then binds the Pod to the winner.*
 
+*Figure 20.1: The scheduler filters impossible nodes, scores the rest, then binds the Pod to the winner.*
+
+What breaks if every node fails a hard filter: the Pod stays Pending indefinitely—capacity autoscaling will not help if affinity/taints are the real blockers.
+
 ### In production
 
-1. Always set resource **requests**—without them, the filter stage cannot place fairly.
-2. Read Pending Events before adding more affinity rules.
-3. Keep a little spare capacity so drains and preemptions have somewhere to land.
+**Ownership:** Platform owns scheduler health and node capacity headroom; app teams own requests and placement constraints. Incident evidence: `kubectl describe pod` Events, node allocatable vs requests, taints list.
+
+**Failure mode:** Over-constraint → Pending during incidents when you need scale-out most. Detect with Pending age alerts. Mitigate by preferring soft rules and keeping spare capacity for drains/preemption.
+
+| Do | Don't |
+|----|-------|
+| Always set resource requests | Add more required affinity before reading Events |
+| Keep spare capacity for drains | Pin every Pod with required rules |
+| Treat Pending Events as source of truth | Assume Pending means “buy more nodes” only |
+
+**Before you leave this section**
+
+- **Understand:** Filter → score → bind; Pending Events name the failing predicates.
+- **Try:** Describe a Pending Pod and map each message to a constraint.
+- **Watch in prod:** Pending spikes after node pool or taint changes.
 
 ---
 
@@ -76,6 +96,10 @@ flowchart LR
 ### In plain terms
 
 Nodes wear nametags (`disktype=ssd`, `topology.kubernetes.io/zone=us-east-1a`). Pods say which nametags they require or prefer. `nodeSelector` is the simple hard pin; **node affinity** adds operators and soft preferences.
+
+Labels are a shared contract between platform (what exists on nodes) and apps (what they require). You might think a typo in a label key is “obvious”—it silently Pendings Pods. Soft preferences keep partial outages schedulable; hard pins do not.
+
+> ⚠️ **Common Pitfall:** You might think changing affinity moves running Pods. Scheduling rules apply at schedule time; roll the Deployment to reshuffle.
 
 ### Under the hood
 
@@ -143,11 +167,25 @@ affinity:
 
 > 💡 **Tip:** Start with `nodeSelector` for simple “must run on X” rules. Graduate to affinity when you need operators or soft preferences.
 
+> 💡 **Tip:** Start with `nodeSelector` for simple “must run on X” rules. Graduate to affinity when you need operators or soft preferences.
+
+What breaks if a node pool loses the `disktype=ssd` label during a rebuild: every hard-pinned Pod goes Pending until labels are restored.
+
 ### In production
 
-1. Prefer soft preferences for non-critical hardware affinity so partial outages stay schedulable.
-2. Standardize label taxonomies across node pools; typos silently Pending Pods.
-3. Remember affinity changes need a rolling restart to reshuffle already-running Pods.
+**Ownership:** Platform owns label taxonomy on node pools; app teams consume documented keys only. Detect with Pending failed predicates naming label mismatches. Mitigate with soft preferences for non-critical hardware affinity.
+
+| Do | Don't |
+|----|-------|
+| Standardize label taxonomies | Invent one-off label keys per team |
+| Prefer soft affinity when possible | Typo labels without CI validation |
+| Roll Deployments after affinity changes | Expect running Pods to move themselves |
+
+**Before you leave this section**
+
+- **Understand:** `nodeSelector` is hard; affinity adds operators and soft preferences.
+- **Try:** Label a node and pin a Deployment with `nodeSelector`.
+- **Watch in prod:** Node pool rebuilds that drop required labels.
 
 ---
 
@@ -156,6 +194,10 @@ affinity:
 ### In plain terms
 
 Sometimes placement depends on **other Pods**: keep a cache near the API, or keep replicas off the same host and spread across zones. **Topology spread** is the modern, expressive way to keep counts even across failure domains.
+
+Blast radius shrinks when replicas do not share a host or zone—but hard anti-affinity with more replicas than domains guarantees Pending. You might think hard rules are “more HA”; soft spread plus PDBs usually survive partial failures better.
+
+> ⚠️ **Common Pitfall:** Hard Pod anti-affinity with `topologyKey: kubernetes.io/hostname` and more replicas than nodes guarantees Pending Pods.
 
 ### Under the hood
 
@@ -218,13 +260,25 @@ flowchart TB
 
 *Figure 20.2: Topology spread keeps counts even across zones; soft anti-affinity prefers different hosts without stranding Pending Pods.*
 
-> ⚠️ **Common Pitfall:** Hard Pod anti-affinity with `topologyKey: kubernetes.io/hostname` and more replicas than nodes guarantees Pending Pods.
+*Figure 20.2: Topology spread keeps counts even across zones; soft anti-affinity prefers different hosts without stranding Pending Pods.*
+
+What breaks if `whenUnsatisfiable: DoNotSchedule` meets a single-zone outage: new Pods Pending even though other zones have capacity—prefer `ScheduleAnyway` for many web apps.
 
 ### In production
 
-1. Prefer topology spread + soft anti-affinity for general web apps.
-2. Reserve hard anti-affinity for true single-instance-per-node requirements.
-3. Combine with PDBs ([Chapter 24](24-production-best-practices.md)) so voluntary drains respect availability.
+**Ownership:** App teams own spread/anti-affinity for their SLOs; platform owns zone labels and node counts per failure domain. Detect with skew metrics and Pending during zone loss. Mitigate with soft spread + PDB ([Chapter 24](24-production-best-practices.md)).
+
+| Do | Don't |
+|----|-------|
+| Prefer topology spread + soft anti-affinity | Hard anti-affinity for every web app |
+| Combine with PDBs for drains | Set replicas higher than hard topology domains |
+| Stack zone *and* hostname spreads carefully | Ignore zone label correctness |
+
+**Before you leave this section**
+
+- **Understand:** Soft anti-affinity and topology spread reduce blast radius without stranding Pending Pods.
+- **Try:** Apply `maxSkew: 1` and observe distribution across labeled domains.
+- **Watch in prod:** Hard rules that prevent scale-out during incidents.
 
 ---
 
@@ -233,6 +287,10 @@ flowchart TB
 ### In plain terms
 
 **Taints** mark nodes so ordinary Pods are *repelled* unless they **tolerate** the taint. Control-plane nodes typically wear `node-role.kubernetes.io/control-plane:NoSchedule`. GPU pools often use a dedicated taint so only prepared workloads land there.
+
+Taints protect reserved capacity; tolerations are the explicit opt-in. You might think sprinkling tolerations on all Deployments is harmless—that defeats reservation and lets batch jobs steal GPU nodes.
+
+> ⚠️ **Common Pitfall:** Applying `NoExecute` to a busy node without a drain plan can evict production Pods immediately.
 
 ### Under the hood
 
@@ -269,11 +327,25 @@ flowchart LR
 
 > 📘 **Deep Dive (optional):** Combine taint + label for defense in depth. Taints reserve capacity without relying on every team remembering a nodeSelector.
 
+> 📘 **Deep Dive (optional):** Combine taint + label for defense in depth. Taints reserve capacity without relying on every team remembering a nodeSelector.
+
+What breaks if you remove a GPU taint “temporarily”: general workloads schedule onto expensive nodes and starve GPU jobs.
+
 ### In production
 
-1. Document every custom taint in the platform runbook.
-2. Use `NoExecute` with care—it can evict production Pods when applied to busy nodes.
-3. Do not sprinkle tolerations on all workloads “just in case”; that defeats reservation.
+**Ownership:** Platform owns custom taints on node pools; app teams add matching tolerations only for intended pools. Detect with unexpected Pods on reserved nodes and Pending GPU jobs. Mitigate with admission policies that block broad tolerations.
+
+| Do | Don't |
+|----|-------|
+| Document every custom taint | Sprinkle tolerations on all workloads |
+| Pair taint + label | Apply `NoExecute` casually on busy nodes |
+| Review tolerations in PR | Remove taints without a capacity plan |
+
+**Before you leave this section**
+
+- **Understand:** Taints repel; tolerations opt in; `NoExecute` can evict.
+- **Try:** Taint a lab node, show Pending, add toleration, watch schedule.
+- **Watch in prod:** Untolerated taints after node upgrades; overly broad tolerations.
 
 ---
 
@@ -282,6 +354,10 @@ flowchart LR
 ### In plain terms
 
 When the venue is full, who gets a seat? A **PriorityClass** assigns an integer priority to Pods. Higher-priority Pods can **preempt** (evict) lower-priority Pods so they can schedule—like asking standby guests to leave for the headliner. Without priorities, everyone competes equally and critical control-plane-adjacent workloads can starve.
+
+Preemption is controlled blast radius: you choose who yields under contention. You might think making every Deployment “high” is safe—then nothing yields and critical work still Pending.
+
+> ⚠️ **Common Pitfall:** Reusing `system-cluster-critical` for ordinary apps. Those classes protect essential components—do not dilute them.
 
 ### Under the hood
 
@@ -362,12 +438,32 @@ task-api-high             100000       false            5m
 batch-low                 1000         false            5m
 ```
 
+```bash
+$ kubectl get priorityclass
+NAME                      VALUE        GLOBAL-DEFAULT   AGE
+system-cluster-critical   2000000000   false            30d
+system-node-critical      2000001000   false            30d
+task-api-high             100000       false            5m
+batch-low                 1000         false            5m
+```
+
+What breaks if victims have PDBs that block eviction while you use mechanisms that honor them: preemption paths differ from drain—know which API you are using during an incident.
+
 ### In production
 
-1. Define a small, documented priority ladder (platform critical → user-facing → batch)—not dozens of one-off values.
-2. Expect preemption to interact with PDBs and graceful shutdown; victims still get termination grace when possible.
-3. Never make every workload “high”—preemption only helps when priorities differ.
-4. Test starvation scenarios in staging: fill the cluster with low-priority Jobs, then schedule a high-priority Deployment.
+**Ownership:** Platform owns the priority ladder catalog; app teams request a class from that ladder, not invent values. Detect starvation with Pending high-priority Pods while low-priority Jobs consume the cluster. Mitigate with a small ladder and staging contention tests.
+
+| Do | Don't |
+|----|-------|
+| Keep a small documented ladder | Make every workload “high” |
+| Test preemption in staging | Reuse system-critical classes for apps |
+| Expect interaction with graceful shutdown | Rely on preemption instead of capacity planning |
+
+**Before you leave this section**
+
+- **Understand:** Higher priority can preempt lower; priorities only help when they differ.
+- **Try:** Fill a lab node with low-priority Pods, schedule a high-priority Pod, observe preemption.
+- **Watch in prod:** Priority inflation and batch Jobs starving user-facing apps.
 
 ---
 
@@ -376,6 +472,10 @@ batch-low                 1000         false            5m
 ### In plain terms
 
 Two different “please leave” mechanisms exist. **Node-pressure eviction** is the kubelet acting as a firefighter when the node is out of memory or disk—it may kill Pods based on QoS and consumption to save the node. **API-initiated eviction** is a polite request through the Eviction API (what `kubectl drain` and many autoscalers use)—it respects PodDisruptionBudgets. Confusing them leads to false confidence in PDBs during OOM storms.
+
+Change safety for maintenance depends on voluntary eviction + PDB. Node pressure is a capacity incident, not a maintenance workflow. You might think a PDB means “this Pod never dies”—PDBs do not restrain kubelet pressure eviction or `kubectl delete pod`.
+
+> ⚠️ **Common Pitfall:** Believing a PDB will save you from node MemoryPressure. PDBs do not restrain kubelet pressure eviction.
 
 ### Under the hood
 
@@ -435,14 +535,27 @@ flowchart TB
 
 *Figure 20.5: PDBs restrain voluntary API evictions; kubelet pressure eviction and direct deletes do not.*
 
-> ⚠️ **Common Pitfall:** Believing a PDB will save you from node MemoryPressure. PDBs do not restrain kubelet pressure eviction.
+*Figure 20.5: PDBs restrain voluntary API evictions; kubelet pressure eviction and direct deletes do not.*
+
+What breaks if `minAvailable` is too high during drain: the drain stalls forever—by design—until you fix capacity or carefully adjust the PDB under change control.
 
 ### In production
 
-1. Set requests/limits so Guaranteed or well-sized Burstable Pods are less likely victims under pressure.
-2. Alert on `MemoryPressure` / `DiskPressure` node conditions—evictions are a symptom, not the root cause.
-3. Use drain + PDB for planned maintenance; treat pressure eviction as a capacity and hygiene problem.
-4. Cross-link with Chapter 24 for PDB design and Chapter 22 for saturation signals (including PSI on cgroup v2).
+**Ownership:** Platform owns drain procedures and node-pressure alerts; app teams own PDB design for their Deployments. Detect pressure via node conditions; detect blocked drains via drain job timeouts and PDB status.
+
+| Do | Don't |
+|----|-------|
+| Use drain + PDB for planned maintenance | Expect PDBs to stop MemoryPressure kills |
+| Alert on MemoryPressure / DiskPressure | Force OOM to “test” PDBs on shared hardware |
+| Size requests so QoS is intentional | Confuse `kubectl delete` with Eviction API |
+
+> 🏭 **Production floor:** **Drain + PDB** is the voluntary disruption SOP. Before drain: confirm PDB (`kubectl get pdb -n <ns>`), replica count, and that replacement capacity exists in other zones. Run `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data` from a change window; if drain blocks, paste PDB name, `ALLOWED DISRUPTIONS`, and describe output into the ticket—do not `kubectl delete pod` to “hurry,” that bypasses the budget. After drain: uncordon only when ready to accept work. Treat MemoryPressure eviction as a **capacity incident** (detect→mitigate: free disk/memory, cordon if needed, page owning team)—not as a substitute for drain.
+
+**Before you leave this section**
+
+- **Understand:** API eviction honors PDB; kubelet pressure and delete do not.
+- **Try:** Drain a lab node with a PDB in place and observe blocking vs progress.
+- **Watch in prod:** Blocked drains; pressure evictions misattributed to “bad PDB.”
 
 ---
 

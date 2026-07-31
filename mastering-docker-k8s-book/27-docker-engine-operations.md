@@ -29,6 +29,10 @@ The image store keeps pulled and built image content plus writable container sna
 
 Older Engine installations commonly use a classic graph driver such as `overlay2`. Upgrading the Engine package does not automatically mean the host changed stores. This preserves compatibility, but it makes inspection essential.
 
+Modern Docker Engine uses containerd’s image store; understand where images live and how GC works. You might think `docker system prune` is harmless on a shared builder—know blast radius for cached layers.
+
+> ⚠️ **Common Pitfall:** Filling the disk with images until kubelet/docker disk pressure kills workloads.
+
 ### Under the hood
 
 Inspect the active backend:
@@ -84,18 +88,21 @@ flowchart TB
 
 ### In production
 
-Inventory each host before migration:
+**Ownership:** Platform owns engine disk SLOs on nodes/builders; developers avoid unbounded local tag sprawl.
 
-- Active store or driver
-- Running and stopped containers
-- Images that exist only locally
-- Free space in both Docker and containerd filesystems
-- Backup or recreation path for volumes
-- Compatibility with security features and plugins
+**Failure mode:** Disk full → node pressure. Detect with disk metrics and prune jobs. Mitigate with scheduled GC and image retention policy.
 
-The containerd store supports multi-platform images and attestations locally, which aligns with the build workflows in Chapters 25 and 26. However, it is **not available with `userns-remap`** in Engine 29.x. That incompatibility is a design choice you must resolve before migration, not a warning to ignore.
+| Do | Don't |
+|----|-------|
+| Monitor image filesystem usage | Uncontrolled prune on prod nodes mid-incident |
+| Retention policy for builders | Leave dangling images forever |
 
-Canary the change on a non-critical host. Verify pull, build, restart, log, volume, backup, monitoring, and cleanup behavior. Measure both `/var/lib/docker` and `/var/lib/containerd`; old hidden data can consume substantial disk after the switch.
+**Before you leave this section**
+
+- **Understand:** containerd image store needs disk governance.
+- **Try:** Run `docker system df` and interpret image vs build cache.
+- **Watch in prod:** DiskPressure from image sprawl.
+
 
 ## 27.3 Storage Backends and Writable Data
 
@@ -104,6 +111,10 @@ Canary the change on a non-critical host. Verify pull, build, restart, log, volu
 Container images are stacks of read-only layers plus a writable layer for each container. A storage backend decides how those layers are represented and combined.
 
 The writable layer is designed for ephemeral container changes. Databases and durable application state belong in volumes or external storage, regardless of the active image store.
+
+Graph drivers and volumes decide performance and durability for engine-local data. Prefer volumes for writable state. You might think container writable layers are fine for databases—layer IO and lifecycle say otherwise.
+
+> ⚠️ **Common Pitfall:** Binding critical data to a container’s writable layer on Docker 29.x hosts.
 
 ### Under the hood
 
@@ -132,18 +143,21 @@ Removing a container does not automatically remove a named volume. Conversely, `
 
 ### In production
 
-Match filesystems and kernels to the supported backend. Monitor inode usage as well as bytes; a host can fail image extraction with free gigabytes but no free inodes.
+**Ownership:** Platform owns storage driver choice; app teams use named volumes or external stores.
 
-Set alerts for:
+**Failure mode:** Driver issues → container start failures. Detect with dockerd logs and volume plugin health. Mitigate with tested drivers and backups for volume data.
 
-- Image and snapshot filesystem capacity
-- Volume filesystem capacity
-- Inode exhaustion
-- Abnormal pull or unpack latency
-- Build cache growth
-- Repeated snapshot or mount errors
+| Do | Don't |
+|----|-------|
+| Named volumes for state | Critical data in writable layer |
+| Document storage driver per OS | Change drivers without migration plan |
 
-Keep mutable application data out of the container writable layer. Writable layers complicate backups, are coupled to container deletion, and may have performance characteristics unsuitable for databases.
+**Before you leave this section**
+
+- **Understand:** Engine storage backends affect performance and data safety.
+- **Try:** Inspect `docker info` storage driver and list volumes.
+- **Watch in prod:** Data loss from writable-layer assumptions.
+
 
 ## 27.4 Logging Drivers
 
@@ -152,6 +166,10 @@ Keep mutable application data out of the container writable layer. Writable laye
 A logging driver decides where a container's standard output and standard error go. Docker can keep logs in local files or forward them to systems such as journald, syslog, Fluentd, GELF, or cloud logging services.
 
 Logging is a capacity decision. An application that emits unlimited logs can fill the host and stop unrelated workloads.
+
+Logging drivers ship container logs to json-file, journald, syslog, vendors. On Kubernetes nodes, prefer the cluster log pipeline; on pure Docker hosts, choose deliberately. You might think json-file without rotation is fine—disks fill.
+
+> ⚠️ **Common Pitfall:** Unlimited json-file logs on production Docker hosts.
 
 ### Under the hood
 
@@ -204,11 +222,21 @@ flowchart LR
 
 ### In production
 
-Prefer structured single-line records with timestamps, severity, service, request identifier, and stable field names. Keep secrets and personal data out of logs before they reach any driver.
+**Ownership:** Platform owns default logging driver and rotation; app teams avoid logging secrets.
 
-Define retention at both host and aggregation layers. Host rotation protects node availability; central retention supports investigations and compliance. Neither substitutes for the other.
+**Failure mode:** Log disk fill → host failure. Detect with disk alerts. Mitigate with max-size/max-file or central drivers.
 
-Exercise the failure path: disconnect the log destination under controlled load and observe application latency, dropped records, daemon memory, and disk usage. Document the accepted tradeoff between blocking and loss.
+| Do | Don't |
+|----|-------|
+| Always set rotation | Debug logs at full verbosity forever |
+| Centralize when possible | Different drivers per container without docs |
+
+**Before you leave this section**
+
+- **Understand:** Logging drivers need rotation and a destination strategy.
+- **Try:** Inspect daemon default log driver and rotation options.
+- **Watch in prod:** Host disk full from container logs.
+
 
 ## 27.5 Rootless Mode and User Namespace Remapping
 
@@ -222,6 +250,10 @@ They reduce risk in different places:
 - **`userns-remap`** reduces the host privilege represented by users inside containers.
 
 Neither makes an untrusted container harmless, and both have host-kernel and feature constraints.
+
+Rootless and userns-remap reduce blast radius of container breakout toward host root. Not every workload fits. You might think rootless equals “secure enough for multi-tenant prod”—still combine with other controls.
+
+> ⚠️ **Common Pitfall:** Enabling userns-remap on an existing daemon without migrating volumes/permissions.
 
 ### Under the hood
 
@@ -266,11 +298,21 @@ flowchart TB
 
 ### In production
 
-Choose based on threat model and workload requirements. Rootless is strong for developer systems, isolated build workers, and services that do not require privileged networking or device access. Validate low ports, cgroup delegation, storage, networking throughput, and startup integration on the target distribution.
+**Ownership:** Platform decides rootless/userns for Docker hosts; document unsupported features.
 
-Use `userns-remap` only after checking the containerd-store incompatibility, bind-mount ownership, volume plugins, backup tooling, and operational access. Some workloads require `--userns=host`, which creates an exception that policy should track.
+**Failure mode:** Permission broken volumes after remap. Detect in staging migration. Mitigate with rebuild of volume permissions and feature matrix.
 
-Even with either mode, enforce non-root application users, drop capabilities, use read-only filesystems where feasible, and avoid privileged containers. Defense in depth remains necessary.
+| Do | Don't |
+|----|-------|
+| Prefer rootless where supported | Flip userns on prod without rehearsal |
+| Document feature gaps | Assume Kubernetes node behavior equals desktop rootless |
+
+**Before you leave this section**
+
+- **Understand:** Rootless/userns shrink host blast radius with trade-offs.
+- **Try:** Read `docker info` for rootless/userns status on a lab engine.
+- **Watch in prod:** Broken volume perms after remap.
+
 
 ## 27.6 Docker Contexts and Remote Access
 
@@ -279,6 +321,10 @@ Even with either mode, enforce non-root application users, drop capabilities, us
 A Docker context is a named connection profile. It tells the CLI which daemon endpoint, TLS material, and orchestrator settings to use.
 
 Contexts are safer and clearer than repeatedly exporting `DOCKER_HOST`, but they introduce a human-factor risk: a command can target production while the operator thinks it targets a laptop.
+
+Contexts point the CLI at remote engines. Convenient and dangerous—wrong context deploys to prod. You might think context is “just a shortcut”—treat it like kubeconfig.
+
+> ⚠️ **Common Pitfall:** Leaving a prod context as default on a shared laptop.
 
 ### Under the hood
 
@@ -315,11 +361,23 @@ Do not expose the unauthenticated Engine API on a TCP socket. Anyone who can con
 
 ### In production
 
-Use SSH or mutually authenticated TLS, least-privilege host accounts, network restrictions, and audited access. Docker Engine does not provide a rich multi-tenant authorization model by default.
+**Ownership:** Humans own careful context switching; platform may forbid direct remote engine access in favor of CI.
 
-Give contexts unmistakable names and require explicit `--context` in automation. Add environment banners or shell prompts, but do not rely on visual cues as the only protection. Production mutations still need change controls and immutable deployment inputs.
+**Failure mode:** Wrong-context deploy → prod incident. Detect with context name in CI logs and CLI prompts. Mitigate with explicit `-c` and no default prod context.
 
-Rotate client credentials and remove stale contexts. Context metadata can reference sensitive key material even though the context listing itself does not print private keys.
+> 🏭 **Production floor:** Prod engines are not a laptop context. Prefer CI/CD for production applies; if a human must touch an engine, require an explicit named context—never a silent default.
+
+| Do | Don't |
+|----|-------|
+| Name contexts clearly; never default prod | Share docker.sock over the network casually |
+| Prefer CI for prod applies | TLS-less remote API |
+
+**Before you leave this section**
+
+- **Understand:** Contexts select engines; wrong context is a blast-radius incident.
+- **Try:** Create a named context and always pass it explicitly.
+- **Watch in prod:** Accidental prod deploys from local Docker contexts.
+
 
 ## 27.7 Engine API and SDKs
 
@@ -328,6 +386,10 @@ Rotate client credentials and remove stale contexts. Context metadata can refere
 The Docker CLI is one Engine API client. Applications can call the same versioned HTTP API directly or through an SDK.
 
 This enables operators to build inventory collectors, controlled automation, test harnesses, and platform services. It also means API credentials carry powerful host permissions.
+
+Everything CLI does goes through the Engine API. SDKs automate—also widen access if the socket is exposed. You might think mounting docker.sock into random containers is normal—it's root-equivalent on many setups.
+
+> ⚠️ **Common Pitfall:** Mounting `docker.sock` into build/test containers on shared hosts.
 
 ### Under the hood
 
@@ -359,11 +421,21 @@ Handle timeouts, partial failures, pagination where applicable, and event-stream
 
 ### In production
 
-Prefer a narrow service that performs approved operations over distributing the Docker socket to many containers. Mounting `/var/run/docker.sock` into a container grants control over the host daemon and is not a harmless monitoring technique.
+**Ownership:** Platform forbids casual docker.sock mounts in prod; CI uses least-privilege builders.
 
-For remote API access, require TLS authentication and firewall restrictions. Never bind plaintext Docker API access to `0.0.0.0`.
+**Failure mode:** Socket mount → host takeover. Detect with admission policies / runtime scans. Mitigate with rootless, nested builders, or remote BuildKit without sock.
 
-Build idempotent automation. Before creating or deleting an object, inspect its labels and desired state. Record who requested an action and the digest involved. Use the event stream for observation, not as the sole source of durable truth.
+| Do | Don't |
+|----|-------|
+| Avoid docker.sock mounts | Expose API without authn/z |
+| Audit who can talk to the API | SDK scripts with hard-coded prod endpoints |
+
+**Before you leave this section**
+
+- **Understand:** Engine API is powerful; protect the socket like root.
+- **Try:** List API versions via `docker version` and note client/server.
+- **Watch in prod:** Containers with docker.sock in prod.
+
 
 ## 27.8 Managing `daemon.json`
 
@@ -372,6 +444,10 @@ Build idempotent automation. Before creating or deleting an object, inspect its 
 `daemon.json` is the preferred persistent configuration file for Docker Engine. On a regular Linux installation it is normally `/etc/docker/daemon.json`; rootless and Windows installations use different paths.
 
 A daemon restart can interrupt container connectivity or change behavior, even when containers have restart policies. Treat configuration as a reviewed rollout.
+
+daemon.json is the engine’s change-controlled config (log driver, cgroup, features). Treat edits like sysctl changes. You might think live tweaks without restart are always enough—many options need restart and soak.
+
+> ⚠️ **Common Pitfall:** Editing daemon.json on every node by hand without config management.
 
 ### Under the hood
 
@@ -416,19 +492,31 @@ Do not configure the same option both as a daemon startup flag and in `daemon.js
 
 ### In production
 
-Manage daemon configuration as code. Validate it in CI, canary on one host, drain or relocate critical workloads, restart, run health checks, and then continue in bounded waves.
+**Ownership:** Platform owns daemon.json via config management; changes need soak and rollback.
 
-Keep an out-of-band recovery path. A malformed configuration can prevent the daemon from starting, which also prevents containerized management tools on that host from helping.
+**Failure mode:** Bad config → dockerd won’t start. Detect with fleet config drift checks. Mitigate with canary nodes and validated JSON.
 
-Capture before-and-after `docker info`, daemon logs, network checks, storage checks, and a known container start. Roll back the configuration only through a controlled, understood change; do not delete daemon data to solve a startup error.
+| Do | Don't |
+|----|-------|
+| Config-manage daemon.json | Snowflake edits per node |
+| Canary restart + soak | Change log driver fleet-wide mid-incident |
+
+**Before you leave this section**
+
+- **Understand:** daemon.json is fleet config; change-manage it.
+- **Try:** Validate a daemon.json change on one lab host and restart safely.
+- **Watch in prod:** Fleet drift in engine flags.
+
 
 ## 27.9 Experimental nftables Firewall Backend
 
 ### In plain terms
 
-Docker normally programs host firewall rules to implement bridge networking, port publishing, and forwarding. Engine 29.0 introduced an experimental nftables backend as an alternative to iptables.
+Docker normally programs host firewall rules to implement bridge networking, port publishing, and forwarding. Engine **29.0** introduced an experimental **nftables** backend as an alternative to iptables.
 
-Experimental means the behavior and configuration may change. It is an evaluation target, not an automatic production upgrade.
+Experimental means the behavior and configuration may change. It is an evaluation target, not an automatic production upgrade. You might think flipping the backend is a drop-in swap—custom `DOCKER-USER` rules and host firewall managers often break until rewritten.
+
+> ⚠️ **Common Pitfall:** Migrating `DOCKER-USER` assumptions directly to nftables. Rebuild custom policy with nftables hooks and priorities.
 
 ### Under the hood
 
@@ -446,23 +534,27 @@ The nftables backend creates Docker-owned tables and chains. Operators should ad
 
 The iptables `DOCKER-USER` chain does not have a direct nftables equivalent. Rules placed there may no longer execute after migration unless an old iptables jump remains temporarily. Recreate policy as native nftables base chains with intentional hooks and priorities.
 
-IP forwarding also differs operationally. Confirm IPv4 and IPv6 forwarding plus forwarding policy before switching. Engine 29.x documentation identifies limitations, including Swarm-mode considerations; check the exact patch release before any trial.
+IP forwarding also differs operationally. Confirm IPv4 and IPv6 forwarding plus forwarding policy before switching. Engine 29.x documentation identifies limitations, including Swarm-mode considerations; check the exact patch release before any trial. What breaks if you cut remote admin access with a bad ruleset: you need out-of-band console—test rollback on a disposable host first.
 
 ### In production
 
-Test on a disposable or canary host with the same firewall manager used in production. Verify:
+**Ownership:** Platform owns firewall-backend choice on Docker hosts; security owns host policy equivalence tests. Treat backend switches as network blast-radius changes.
 
-- Published ports from allowed and denied sources
-- Container-to-container communication
-- Outbound masquerading
-- IPv4 and IPv6 behavior
-- Host firewall persistence after reboot
-- Interaction with firewalld, ufw, or custom rules
-- Rollback to the iptables backend
+**Failure mode:** Broken publish/NAT or accidental exposure after migration. Detect with connectivity matrices and unexpected open ports. Mitigate with canary hosts, exported rulesets, and documented rollback to iptables.
 
-Export the current ruleset and preserve console access before changing backends. A firewall mistake can remove remote administrative access or expose services unintentionally.
+| Do | Don't |
+|----|-------|
+| Canary + full connectivity matrix | Fleet-wide flip on day one |
+| Preserve console/out-of-band access | Assume DOCKER-USER still applies |
+| Validate then restart via config management | Disable Docker firewall programming casually |
 
-Do not disable Docker firewall programming and assume ordinary container networking remains secure. If `"iptables": false` or `"ip6tables": false` is used, the operator accepts responsibility for implementing equivalent isolation, NAT, and forwarding rules.
+**Before you leave this section**
+
+- **Understand:** nftables backend in Engine 29.x is experimental and needs policy rewrite.
+- **Try:** On a disposable host, capture baseline, switch, retest, roll back.
+- **Watch in prod:** Custom host firewall rules silently skipped after migration.
+
+---
 
 ## 27.10 Common Pitfalls
 

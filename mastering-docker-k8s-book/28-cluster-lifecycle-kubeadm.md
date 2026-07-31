@@ -29,6 +29,10 @@ Imagine you are handed the keys to a small city. On day one you pour foundations
 
 kubeadm is a **certified installer and lifecycle helper**, not a full platform product. It gets you a conformant control plane and a clean join path for nodes. You still choose the OS, container runtime, CNI plugin, load balancer, and how you patch hosts.
 
+kubeadm bootstraps clusters to best-practice defaults; it is not a full day-2 fleet manager. You might think kubeadm replaces Terraform/Cluster API for lifecycle—many teams compose them.
+
+> ⚠️ **Common Pitfall:** Treating kubeadm init as a one-way irreversible snowflake with no documented config.
+
 ### Under the hood
 
 kubeadm’s main verbs:
@@ -111,12 +115,21 @@ $ sudo kubeadm init --config=kubeadm-config.yaml --upload-certs
 
 ### In production
 
-1. **Pin versions** of kubeadm, kubelet, and kubectl on each node; they must stay compatible (same minor for kubelet/kubeadm during upgrades).
-2. **Use a stable `controlPlaneEndpoint`** (DNS or VIP) from day one—even for a single control plane—so HA joins later do not require certificate re-issuance gymnastics.
-3. **Document the CNI, runtime, and OS image** as part of the cluster’s bill of materials.
-4. **Do not treat `admin.conf` as a personal laptop credential forever.** Prefer short-lived user certs or OIDC; keep a break-glass admin kubeconfig in a vault.
+**Ownership:** Platform owns kubeadm config and upgrades; keep ClusterConfiguration in Git.
 
-> ⚠️ **Warning:** `kubeadm reset` removes local control-plane state and can leave etcd membership inconsistent if you reset a live HA member carelessly. Drain first; remove the member from etcd when retiring a control-plane node.
+**Failure mode:** Snowflake clusters → unrepeatable restores. Detect with config drift checks. Mitigate with checked-in kubeadm configs and rebuild drills.
+
+| Do | Don't |
+|----|-------|
+| Version-control kubeadm config | Undocumented manual tweaks on masters |
+| Know what kubeadm does not manage | Expect kubeadm to manage app addons forever alone |
+
+**Before you leave this section**
+
+- **Understand:** kubeadm bootstraps; you still own day-2 operations.
+- **Try:** Read a kubeadm ClusterConfiguration and note version fields.
+- **Watch in prod:** Undocumented control-plane snowflakes.
+
 
 ---
 
@@ -125,6 +138,10 @@ $ sudo kubeadm init --config=kubeadm-config.yaml --upload-certs
 ### In plain terms
 
 Building a cluster is a checklist: prepare machines → init first control plane → install networking → join workers → verify. Skip a step and the city has houses with no roads.
+
+Init control plane, join workers, install CNI—order matters. You might think Pods will schedule before CNI—they will not become Ready.
+
+> ⚠️ **Common Pitfall:** Forgetting CNI and debugging apps for hours.
 
 ### Under the hood
 
@@ -196,9 +213,21 @@ sequenceDiagram
 
 ### In production
 
-- Bake a **golden node image** (runtime + kube packages + sysctl/modules) so joins are boring.
-- Store join credentials in a secrets manager; prefer short-lived tokens or bootstrap with automation (Cluster API wraps these ideas).
-- Smoke-test with a Deployment, a Service, and a DNS lookup from a debug Pod before declaring the cluster open for business.
+**Ownership:** Platform owns bootstrap automation and checklist; record versions (Kubernetes 1.36 baseline here).
+
+**Failure mode:** Partial bootstrap → NotReady nodes. Detect with node conditions and core pods. Mitigate with idempotent bootstrap scripts and smoke tests.
+
+| Do | Don't |
+|----|-------|
+| CNI before app workloads | Skip version pinning on container runtime |
+| Smoke test DNS and a Deployment | Hand-join without join-token hygiene |
+
+**Before you leave this section**
+
+- **Understand:** Bootstrap order: control plane → CNI → workers → smoke tests.
+- **Try:** Sketch your bootstrap checklist with version pins.
+- **Watch in prod:** Clusters left without CNI or with expired join tokens.
+
 
 ---
 
@@ -207,6 +236,10 @@ sequenceDiagram
 ### In plain terms
 
 One control-plane node is a single brain. If city hall burns down, the workers keep running existing Pods for a while, but you cannot schedule, scale, or recover cleanly. HA means **multiple brains behind one address**, with etcd quorum so the deed registry stays consistent.
+
+Stacked vs external etcd, load-balanced API servers, odd etcd member counts. You might think two etcd members are “HA”—quorum math disagrees.
+
+> ⚠️ **Common Pitfall:** Even-sized etcd clusters that cannot form quorum cleanly.
 
 ### Under the hood
 
@@ -268,12 +301,21 @@ Odd numbers for etcd members (3 or 5). Quorum is `(n/2)+1`. Two of three members
 
 ### In production
 
-1. Place control-plane (and external etcd) members in **separate failure domains** (racks, AZs).
-2. Health-check the LB on the API readiness endpoints; do not balance only on TCP accept.
-3. Keep **worker count** independent of control-plane HA—HA for the API does not replace PodDisruptionBudgets for apps.
-4. Test failure: stop one apiserver, confirm `kubectl` still works through the endpoint; stop a second in a 3-member etcd and confirm the cluster becomes read-only or unavailable as expected—then restore.
+**Ownership:** Platform owns HA topology and LB for API server.
 
-> ⚠️ **Common Pitfall:** Standing up three control-plane VMs but pointing kubeconfigs at a single node IP. You have redundancy on disk, not in the client path. Always use the shared endpoint.
+**Failure mode:** Lost quorum → API read-only/down. Detect with etcd health endpoints. Mitigate with 3/5 members in distinct failure domains.
+
+| Do | Don't |
+|----|-------|
+| Odd etcd member count | Two-node “HA” etcd |
+| LB + healthy API backends | Clients pinned to one API IP |
+
+**Before you leave this section**
+
+- **Understand:** HA topology follows quorum and failure domains.
+- **Try:** Diagram your API LB and etcd members.
+- **Watch in prod:** Quorum loss from co-located etcd members.
+
 
 ---
 
@@ -282,6 +324,10 @@ Odd numbers for etcd members (3 or 5). Quorum is `(n/2)+1`. Two of three members
 ### In plain terms
 
 Every serious conversation in the cluster is authenticated with certificates: apiserver identity, kubelet identity, etcd peer trust, and admin clients. kubeadm generates a small private PKI under `/etc/kubernetes/pki`. If certificates expire, the city still has buildings—but nobody can prove who they are at the gate.
+
+kubeadm PKI trusts the cluster. Expiry takes APIs down. You might think cloud-managed certs mean you can ignore kubeadm certs—on kubeadm clusters you own rotation.
+
+> ⚠️ **Common Pitfall:** Discovering cert expiry only when kubectl starts failing.
 
 ### Under the hood
 
@@ -339,12 +385,21 @@ apiServer:
 
 ### In production
 
-1. **Alert on residual time** (for example, warn at 60 days, page at 14).
-2. Back up `/etc/kubernetes/pki` (especially `ca.key`) into a hardware-backed or offline vault—loss of the CA key means painful trust re-establishment.
-3. Prefer **external identity** (OIDC) for humans so you are not minting long-lived client certs for every engineer.
-4. After renewing, update any copied kubeconfigs (CI runners, jump hosts) that still hold old client certificates.
+**Ownership:** Platform owns cert rotation schedule (`kubeadm certs check-expiration`).
 
-> 📘 **Deep Dive (optional):** Certificate rotation for kubelet serving certificates can be handled by the certificates API (`kubernetes.io/kube-apiserver-client-kubelet` and related signers). kubeadm’s static PKI and the in-cluster CSR flow solve different layers of the same trust problem.
+**Failure mode:** Expired certs → auth failures cluster-wide. Detect with expiry monitors >30 days. Mitigate with scheduled rotation and calendar reminders.
+
+| Do | Don't |
+|----|-------|
+| Monitor cert expiry | Manual copy of pki without backup |
+| Rotate before expiry | Disable TLS to “fix” prod |
+
+**Before you leave this section**
+
+- **Understand:** PKI expiry is a predictable outage—monitor and rotate.
+- **Try:** Run cert expiration check in a lab kubeadm cluster.
+- **Watch in prod:** Silent certs nearing expiry.
+
 
 ---
 
@@ -353,6 +408,10 @@ apiServer:
 ### In plain terms
 
 Upgrading is changing the city’s operating system one floor at a time: first the control plane, then each worker, never skipping a minor version. Kubernetes supports an **N−3** minor window for kubelet skew relative to the apiserver in modern releases; for cluster upgrades you still move **one minor at a time** (1.34 → 1.35 → 1.36).
+
+Plan → control plane → nodes, respecting skew. Drain workers with PDBs. You might think `kubectl` upgrade alone upgrades nodes—kubeadm node workflow matters.
+
+> ⚠️ **Common Pitfall:** Upgrading kubelet past supported skew relative to API server.
 
 ### Under the hood
 
@@ -417,13 +476,21 @@ flowchart LR
 
 ### In production
 
-1. **Stage in a clone or lower environment** with the same CNI, CSI, and admission webhooks.
-2. Budget time for **API removals**—controllers and Helm charts that still speak deleted versions fail loudly after the upgrade.
-3. Hold package versions (`apt-mark hold` / equivalent) so unattended upgrades do not surprise you mid-flight.
-4. Watch `kubectl get nodes`, control-plane Pods, etcd health, and admission webhook latency during the window.
-5. Keep a tested **rollback story**: for kubeadm, rollback is often “restore etcd + control-plane manifests from backup,” not a one-click downgrade. Prefer forward fixes when possible.
+**Ownership:** Platform owns kubeadm upgrade runbooks; rehearse on staging clones.
 
-> ⚠️ **Warning:** Skipping a minor version (for example, 1.34 → 1.36) is unsupported. Intermediate hops exist so API deprecations and data migrations run in order.
+**Failure mode:** Skew violation → unsupported weirdness. Detect with version matrix dashboards. Mitigate with waved upgrades and pauses.
+
+| Do | Don't |
+|----|-------|
+| Follow skew policy (1.33–1.36 window) | Skip staging upgrade rehearsal |
+| Drain with PDB | Upgrade kubelet before API server carelessly |
+
+**Before you leave this section**
+
+- **Understand:** kubeadm upgrades are waved and skew-aware.
+- **Try:** Read the upgrade plan output on a lab cluster.
+- **Watch in prod:** Skew violations after partial upgrades.
+
 
 ---
 
@@ -432,6 +499,10 @@ flowchart LR
 ### In plain terms
 
 Before you reboot or replace a node, tell the scheduler to stop placing new Pods there (**cordon**), then politely evict workloads (**drain**) so replicas move elsewhere. Skipping drain is like demolishing a building while people are still inside.
+
+Cordon/drain/retire nodes safely—same SOP as Chapter 20/24. You might think deleting a VM in the cloud console is equivalent—volumes and PDBs disagree.
+
+> ⚠️ **Common Pitfall:** Force-deleting pods to speed drain during production upgrades.
 
 ### Under the hood
 
@@ -480,12 +551,23 @@ For control-plane members, also remove the etcd member before or as you decommis
 
 ### In production
 
-1. Enforce **PodDisruptionBudgets** so drain cannot violate availability targets (Chapter 24).
-2. Automate the loop in a node-upgrade Job or Cluster API rolling strategy—humans fat-finger drain flags under pressure.
-3. Separate **voluntary** disruption (drain, cluster autoscaler) from **involuntary** (node crash); PDBs only gate voluntary eviction.
-4. Confirm replacements are `Ready` and Pods rescheduled before the next node in a rolling upgrade.
+**Ownership:** Platform owns node retirement automation; respect PDBs.
 
-> ⚠️ **Common Pitfall:** `kubectl drain` blocked by a PDB with `minAvailable: 100%` on a singleton Pod. That is the PDB doing its job. Fix the workload topology (multiple replicas across nodes) or use a planned exception—not `--force` as a habit.
+**Failure mode:** Unsafe retirement → multi-service outage. Detect with error budget during maintenance. Mitigate with capacity and one-domain-at-a-time drains.
+
+| Do | Don't |
+|----|-------|
+| Cordon → drain → delete | Console-terminate without drain |
+| Verify replacements Ready | Drain all zones at once |
+
+**Before you leave this section**
+
+- **Understand:** Node retirement uses drain+PDB discipline.
+- **Try:** Retire a lab worker with cordon/drain.
+- **Watch in prod:** Console deletions skipping drain.
+
+> 🏭 **Production floor:** On kubeadm fleets, **drain + PDB** before every node upgrade/retire. Ticket must show PDB status, drain transcript, and post-join kubelet version.
+
 
 ---
 
@@ -494,6 +576,10 @@ For control-plane members, also remove the etcd member before or as you decommis
 ### In plain terms
 
 etcd is the deed registry and minute book for the entire cluster. Back it up on a schedule. Practice restore on a sacrificial cluster. Everything else in Kubernetes can be redeployed; etcd contents usually cannot be reinvented from memory.
+
+Backup, restore, defrag, and member replace are control-plane surgery. Practice on copies. You might think disk snapshots alone equal etcd backup—verify consistency and encryption keys.
+
+> ⚠️ **Common Pitfall:** Running defrag on all members simultaneously.
 
 ### Under the hood
 
@@ -539,13 +625,23 @@ Encrypted secrets at rest, large clusters, and defrag (`etcdctl defrag`) are adv
 
 ### In production
 
-1. **Automate snapshots** off-box (object storage) with checksums and retention.
-2. Test restore **quarterly**; an untested backup is a rumor.
-3. Monitor etcd latency, leader changes, DB size, and WAL growth.
-4. Size disks with headroom; etcd is latency-sensitive—local SSD beats networked block storage when you have the choice.
-5. Restrict who can read etcd certs or snapshots: they contain every Secret plaintext unless encryption-at-rest is configured on the API server.
+**Ownership:** Platform owns etcd ops with two-person change control for restore.
 
-> 💡 **Tip:** Pair etcd snapshots with a documented “break glass” kubeconfig and the matching CA. A snapshot without trust material is harder to use under stress.
+**Failure mode:** Bad restore → history loss. Detect with restore drill metrics. Mitigate with object-lock backups and documented member-replace SOP.
+
+| Do | Don't |
+|----|-------|
+| Tested backup/restore | Defrag all members at once |
+| Quorum-aware member replace | etcdctl from untrusted networks |
+
+**Before you leave this section**
+
+- **Understand:** etcd ops require rehearsed backup/restore and quorum care.
+- **Try:** Perform a backup in lab and restore to a scratch member set.
+- **Watch in prod:** Untested backups; simultaneous defrag.
+
+> 🏭 **Production floor:** **etcd backup tested restores**—schedule drills, record RTO, never declare DR ready on backup job green alone.
+
 
 ---
 

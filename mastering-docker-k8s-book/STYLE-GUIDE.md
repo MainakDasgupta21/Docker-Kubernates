@@ -68,6 +68,36 @@ Every **major concept** (not every tiny flag) must include:
 
 Short transitional sections (pitfalls, exercises, takeaways) do **not** need all three tiers.
 
+**Minimum depth (non-negotiable for major concepts)**
+
+| Tier | Must include |
+|------|----------------|
+| **In plain terms** | At least two substantial paragraphs; the problem this solves; one explicit misconception (`> ⚠️ **Common Pitfall:**` or a clear “you might think…”) |
+| **Under the hood** | Mechanism explanation; at least one realistic command or YAML path; sample output or field walkthrough; one “what breaks if X” note |
+| **In production** | Ownership (who owns this); failure mode + how you detect it; mitigation; a concrete do / don’t decision |
+
+After each major concept’s three tiers, add a short micro-checklist:
+
+```markdown
+**Before you leave this section**
+
+- **Understand:** …
+- **Try:** …
+- **Watch in prod:** …
+```
+
+**MNC DevOps voice**
+
+Write like a patient platform engineer mentoring a junior on a production team: calm, precise, ownership-aware, blast-radius-aware. Prefer evidence (`kubectl describe`, digests, revision history) over folklore.
+
+Use this callout sparingly for change-management, on-call, compliance, and blast-radius rules (not for basic tips):
+
+```markdown
+> 🏭 **Production floor:** …
+```
+
+Weave these ideas into **In production** blocks where they fit: who owns the image vs the Deployment vs the cluster; what one bad change can take down; which signal fires first; PR → CI scan → digest promote → rollout → rollback; what you paste into an incident ticket.
+
 ### Visuals: diagrams, flowcharts, and illustrations
 
 Prefer **Mermaid** for every technical diagram (topology, sequence, state, decision). Prefer **Markdown tables** for comparisons. Prefer **PNG illustrations** only for chapter-opening analogies and the book cover (exact text does not matter there).
@@ -124,6 +154,7 @@ Use emoji-prefixed blockquotes (never GitHub `> [!NOTE]` alerts):
 > ⚠️ **Warning:** …
 > ⚠️ **Common Pitfall:** …
 > 📘 **Deep Dive (optional):** …
+> 🏭 **Production floor:** …
 ```
 
 ### Check Your Understanding

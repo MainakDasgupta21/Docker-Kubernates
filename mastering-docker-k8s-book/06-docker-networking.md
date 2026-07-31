@@ -36,6 +36,10 @@ Isolation is the default so one noisy or compromised container cannot see traffi
 
 Starting a container is like assigning a new apartment: Docker wires a private phone, plugs it into a floor switchboard (a network), and hands out an extension number (an IP). Until you ask the front desk to publish a port, outsiders cannot ring that apartment.
 
+The problem this solves is *safe multi-tenancy on one machine*. You might run ten containers on a laptop or a hundred on a build server, and you do not want them all sharing one flat, promiscuous network where any process can sniff or spoof any other. So Docker gives each container its own **network namespace** — a private copy of the interfaces, routing table, and firewall rules — and then connects that namespace to a virtual switch. The container thinks it has a whole network stack to itself, because from the kernel's point of view it does.
+
+> ⚠️ **Common Pitfall:** You might think a container's IP (say `172.17.0.2`) is something you can hand to a colleague or hard-code into config. It is not stable. That address is assigned from the bridge's subnet at start time and can change on the next `docker run`. Containers should find each other by **name** on a user-defined network (Section 06.6), never by scraped IP.
+
 ### Under the hood
 
 When you run a container, Docker:
@@ -43,6 +47,8 @@ When you run a container, Docker:
 1. Creates a network namespace for it.
 2. Attaches it to a network — by default, the built-in bridge named `bridge`.
 3. Assigns a private IP from that network's subnet (for example, `172.17.0.2`).
+
+Mechanically, the daemon creates a **veth pair** — a virtual Ethernet cable with two ends. One end lands inside the container's namespace as `eth0`; the other end plugs into the `docker0` bridge on the host. The bridge behaves like a small unmanaged switch: frames from one container reach the bridge, and the host's iptables/nftables rules decide what may leave via NAT. Outbound packets are source-NATed to the host's IP, which is why a container can reach the internet even though nothing on the internet can reach it back unprivileged.
 
 ```bash
 $ docker network ls
@@ -73,9 +79,28 @@ flowchart TB
 
 *Figure 06.1: On the default bridge, containers connect through veth pairs to `docker0`; outbound traffic NATs via the host.*
 
+You can watch this happen. `docker inspect` shows the assigned address, and `ip addr` on the host lists the transient `veth…` interface that appears when the container starts and disappears when it stops:
+
+```bash
+$ docker inspect web --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}}{{end}}'
+bridge=172.17.0.2
+```
+
+**What breaks if you ignore this:** a container that lands on the default `bridge` cannot resolve another container by name (the default bridge has no embedded DNS), so an app configured with `db` as its database host fails with a name-resolution error even though both containers are healthy and on the "same" bridge.
+
 ### In production
 
 Know which network a workload lands on. Unintentional attachment to the default `bridge` is a common source of broken DNS and overly shared blast radius. Prefer explicit `--network` (or Compose networks) for every multi-container app.
+
+**Who owns this:** the platform team owns the network topology (which named networks exist, their subnets, and their trust boundaries); the app team owns *which* network each service attaches to, declared in Compose or the run command. When those two drift — for example, a service silently defaulting to `bridge` because someone dropped the `--network` flag — you get an app that works in one environment and mysteriously cannot reach its database in another.
+
+**Failure mode and detection:** the first signal is usually a connection-refused or DNS-resolution error in application logs, not a Docker error, because Docker did exactly what you asked. Confirm placement with `docker inspect <ctr> --format '{{json .NetworkSettings.Networks}}'` before assuming the app is broken. **Do** make the network explicit in every long-lived definition; **don't** rely on the default bridge for anything beyond a throwaway `docker run` at the keyboard.
+
+**Before you leave this section**
+
+- **Understand:** each container gets its own network namespace and a NATed private IP; that IP is not stable and is not a service address.
+- **Try:** run a container, read its IP with `docker inspect`, stop and restart it, and confirm the address may change.
+- **Watch in prod:** connection or DNS failures that trace back to a workload silently landing on the default `bridge` instead of its intended network.
 
 ---
 
@@ -83,9 +108,15 @@ Know which network a workload lands on. Unintentional attachment to the default 
 
 ### In plain terms
 
+These three are the built-in, single-host drivers you meet on day one. They sit on a spectrum from "fully isolated" to "no isolation at all," and picking the wrong end of that spectrum is one of the most common early mistakes.
+
 - **Bridge** — a private virtual switch on one machine; the usual default for apps that talk to each other and occasionally to the outside world via published ports.
 - **Host** — the container shares the host's network stack: no private IP, no NAT, maximum speed, zero network isolation.
 - **None** — only loopback; the container is deliberately unplugged.
+
+Think of it as choosing how an apartment connects to the world. Bridge is the normal apartment with a private line through the building switchboard. Host is knocking down the wall between the apartment and the building's own phone system — fast and direct, but now the guest answers the landlord's phone. None is an apartment with the phone jack removed entirely.
+
+> ⚠️ **Common Pitfall:** You might reach for `--network host` because "it's simpler — no port mapping to think about." That convenience is exactly the trap: you also inherit every port conflict on the host and lose the isolation boundary that makes containers safe to co-locate. Host networking is a deliberate performance/compatibility choice, not a shortcut around learning `-p`.
 
 ### Under the hood
 
@@ -118,6 +149,8 @@ $ docker run --rm --network none alpine:3.20 ip addr
 
 Useful for batch jobs that only touch local files, or for workloads where zero network access is a security requirement.
 
+**What breaks if X:** if a host-networked container listens on port 80 and the host — or another host-networked container — already owns port 80, the second process fails to bind with `address already in use`. There is no NAT layer to remap it, because with host networking the container *is* using the host's real port. This is the failure that most surprises people migrating a `-p 80:80` service to `--network host`.
+
 ### In production
 
 | Driver | Scope | Isolation | Typical use | Port publishing |
@@ -127,6 +160,18 @@ Useful for batch jobs that only touch local files, or for workloads where zero n
 | `none` | Single host | Total | Offline jobs, lockdown | Not applicable |
 
 Prefer bridge plus published ports for ordinary services. Reserve host networking for measured need; document the lost isolation. Use `none` when the threat model says "this process must not talk to the network."
+
+**Who owns this:** whoever approves the run configuration owns the isolation trade-off. Host networking should never be a silent default buried in a script — it is a security-relevant decision that belongs in a review, because a compromised host-networked container can reach loopback-bound services (databases, metrics endpoints, the Docker socket proxy) that the operator assumed were unreachable from containers.
+
+**Failure mode and detection:** the classic host-networking incident is a port collision that only appears under scale-out (two replicas of the same host-networked service scheduled on one node). Detect it early by never assuming host ports are free; check with `ss -ltnp` on the host. **Do** keep latency-sensitive or interface-scanning tools (some monitoring agents, VPN clients) on host networking with an explicit note; **don't** put an internet-facing application there just to skip a `-p` flag.
+
+> 🏭 **Production floor:** Host networking removes the container's network isolation entirely — one process now shares the host's ports, loopback, and interface list. Treat switching a service to `--network host` as a change-managed decision: record *why*, confirm no port collisions with `ss -ltnp`, and note the expanded blast radius (a container escape now starts with full visibility of host-local services). Never flip an internet-facing service to host mode to "fix" a port mapping problem.
+
+**Before you leave this section**
+
+- **Understand:** bridge isolates with NAT, host shares the whole stack with zero isolation, none removes networking; the right choice is a trade-off, not a preference.
+- **Try:** run the same image on `bridge`, `host`, and `none`; compare `docker inspect` output and whether the app is reachable.
+- **Watch in prod:** host-networked services colliding on a shared host port, and host mode quietly widening a container's blast radius.
 
 ```mermaid
 flowchart TD
@@ -154,6 +199,10 @@ flowchart TD
 
 An **overlay** network is a virtual switch that stretches across *multiple* Docker hosts. Containers on different machines behave as if they were plugged into the same LAN. The traffic is tunneled (typically VXLAN) between hosts.
 
+The problem overlay solves is that a bridge lives on exactly one machine. The moment your application outgrows a single host — three web replicas on one server, a database on another — a bridge cannot reach across the gap. Overlay builds a software-defined network *on top of* whatever physical network already connects your hosts, so containers on `node-1` and `node-2` share a subnet and talk by name as if the underlying machines did not exist. That is why every real orchestrator has something overlay-shaped underneath it.
+
+> ⚠️ **Common Pitfall:** You might think overlay is "just another driver you pick with `--driver overlay`" on any Docker install. It is not available on a standalone daemon: overlay needs a control plane to distribute network state and encryption keys to every participating host, and on Docker that control plane is Swarm mode.
+
 ### Under the hood
 
 Overlay networks require **Swarm mode** (Chapter 09). On a standalone daemon:
@@ -165,9 +214,19 @@ Error response from daemon: This node is not a swarm manager. Use "docker swarm 
 
 That error is expected — and useful. After `docker swarm init`, you create overlay networks for multi-host services; Swarm's routing mesh (Chapter 09) publishes service ports across the cluster.
 
+Under the covers, each host encapsulates container traffic in **VXLAN** frames (UDP port 4789) and sends them to the peer host that hosts the destination container. Swarm distributes the mapping of "which container IP lives behind which host" through its Raft-backed control plane, and can encrypt the data plane with IPsec when you pass `--opt encrypted`. **What breaks if X:** if a firewall between your hosts blocks the VXLAN port (4789/udp) or the Swarm control ports (2377/tcp, 7946/tcp+udp), the network is created successfully but cross-host traffic silently black-holes — containers on the same host talk fine, cross-host calls time out. That asymmetry is the tell.
+
 ### In production
 
 Use overlay when services must span nodes under Swarm. For Kubernetes (Part II), CNI plugins play the analogous multi-host role — do not expect Docker overlay alone to wire a Kubernetes cluster.
+
+**Who owns this:** the platform/network team owns the firewall rules and MTU budget that make overlay work; the app team only owns which services attach to which overlay. **Failure mode and detection:** the signature symptom is "works within a node, times out across nodes," which points at blocked VXLAN/control ports or an MTU mismatch (VXLAN adds ~50 bytes of overhead, so a path that only passes 1500-byte frames can drop the encapsulated packets). Detect with a cross-node `ping`/`curl` between tasks and by checking `docker network inspect` on each node. **Do** open 2377/tcp, 7946/tcp+udp, and 4789/udp between nodes and consider `--opt encrypted` for untrusted links; **don't** assume overlay alone secures traffic — plaintext VXLAN is readable by anyone on the underlay.
+
+**Before you leave this section**
+
+- **Understand:** overlay stretches one virtual L2 network across many hosts using VXLAN, and it requires Swarm's control plane to exist.
+- **Try:** run `docker network create --driver overlay …` on a non-Swarm daemon and read the error; then re-run after `docker swarm init`.
+- **Watch in prod:** cross-node connectivity that breaks when VXLAN/control ports are firewalled or the path MTU is too small for encapsulated frames.
 
 ---
 
@@ -227,6 +286,14 @@ Checklist:
 3. Document that Desktop/rootless learners cannot reproduce this lab as-is.
 4. For Swarm-scoped macvlan, node-specific `--config-only` networks are often required so each node uses a non-overlapping `--ip-range` — IPAM is not centrally coordinated the way overlay is.
 
+**Who owns this:** because macvlan/ipvlan put containers directly on the physical LAN, they cross into the network team's territory — IP ranges, VLAN IDs, and switch port security are now shared with Docker's IPAM. The single worst failure here is an **IP collision**: Docker hands a container an address that a static host or DHCP lease already uses, and both endpoints start dropping traffic intermittently. Detect it with duplicate-address complaints in switch logs or `arping` on the parent subnet. **Do** carve out a dedicated, documented range that DHCP will never lease; **don't** let two hosts' macvlan IPAM overlap.
+
+**Before you leave this section**
+
+- **Understand:** macvlan gives each container its own MAC on the LAN; ipvlan shares the parent MAC and leans on IP (and L2/L3 mode) instead.
+- **Try:** on a Linux host with a spare subnet, create a macvlan network and confirm whether the host can reach the container without a shim.
+- **Watch in prod:** IP collisions with existing DHCP/static hosts, and MAC-count limits on cloud NICs or security-locked switch ports.
+
 ---
 
 ## 06.6 User-defined networks and embedded DNS
@@ -234,6 +301,10 @@ Checklist:
 ### In plain terms
 
 Do not leave multi-container apps on the default `bridge`. Create your own network. On a **user-defined** bridge, Docker's embedded DNS lets containers find each other **by name** — `db`, `api`, `cache` — instead of brittle IPs.
+
+The problem this solves is the one you met in Section 06.2: container IPs are unstable and the default bridge has no name resolution, so any app that references a peer by IP breaks the moment that peer restarts with a new address. A user-defined bridge fixes this at the root. Docker runs a tiny embedded DNS resolver at `127.0.0.11` inside every container on the network; it resolves container and service names to whatever IP they currently hold. You write `db` in your connection string once and never touch it again, even as containers are recreated a hundred times.
+
+> ⚠️ **Common Pitfall:** You might assume the built-in `bridge` network gives you name resolution "because it's still a bridge." It does not — automatic DNS between containers is a feature of *user-defined* networks specifically. This single difference is why so many first Compose-less multi-container setups fail with "could not resolve host db."
 
 ### Under the hood
 
@@ -283,9 +354,21 @@ $ docker run -d --name api --link db:database my-api:1.0
 
 **`--link` is legacy and deprecated.** It only works on the default bridge, injects brittle `/etc/hosts` and env vars, and does not survive recreation cleanly. Replace it with a user-defined network and DNS names.
 
+**What breaks if X:** if two containers on the same user-defined network share a `--network-alias`, Docker's embedded DNS returns *all* matching IPs and round-robins between them. That is a feature for simple load balancing, but it surprises people who assumed a name maps to exactly one container — a stale replica still holding the alias will receive a share of traffic until it is removed.
+
 ### In production
 
 Segment by trust boundary: put databases on a backend network, frontends on a frontend network, and attach the API to both. Publish only the ports that must leave the host. Compose (Chapter 08) makes this pattern the default.
+
+**Who owns this:** the app team owns the network segmentation because it encodes the application's trust model — which components are allowed to talk to the datastore at all. A flat single network where everything can reach everything is the networking equivalent of running every process as root: convenient until one compromised frontend can open a socket straight to the database.
+
+**Failure mode and detection:** the quiet failure is *over-connection* — a service that works fine but is reachable by more peers than it should be, widening blast radius without ever throwing an error. Audit with `docker network inspect <net>` to list attached containers, and treat any datastore attached to a frontend-facing network as a finding. **Do** keep databases on a backend-only network and bridge just the API across zones; **don't** attach everything to one network for convenience.
+
+**Before you leave this section**
+
+- **Understand:** user-defined bridges add embedded DNS (`127.0.0.11`) so containers resolve each other by name; the default bridge does not.
+- **Try:** create a network, start `db` and `api` on it, and `docker exec api getent hosts db` to see name resolution work; repeat on the default bridge and watch it fail.
+- **Watch in prod:** datastores that end up attached to frontend-facing networks, silently widening the trust boundary.
 
 ---
 
@@ -294,6 +377,10 @@ Segment by trust boundary: put databases on a backend network, frontends on a fr
 ### In plain terms
 
 Bridge-network containers can talk to peers, but your laptop browser cannot reach them until you **publish** a port — the front desk forwarding an outside call to apartment 4B.
+
+Publishing is where the *isolation* you have been building meets the *exposure* you actually need. A container is unreachable from outside by design; publishing punches a deliberate hole through the host's firewall to forward one host port to one container port. That is exactly what you want for the one API a service should expose — and exactly what you do *not* want for the database, the admin UI, or the metrics endpoint sitting behind it. Every published port is a door you are choosing to leave unlocked to whatever can reach the host's address.
+
+> ⚠️ **Common Pitfall:** You might read `-p 8080:80` and think the numbers are interchangeable or that the container port comes first. The order is always **`HOST:CONTAINER`**. Reversing it (`-p 80:8080`) silently "works" — it just opens the wrong host port and forwards to a container port nothing is listening on, so you get connection-refused and blame the app.
 
 ### Under the hood
 
@@ -340,9 +427,23 @@ flowchart LR
 
 *Figure 06.4: Publishing opens a host door; `EXPOSE` alone documents intent and does not forward traffic.*
 
+**What breaks if X:** the most dangerous default is `-p 5432:5432` (or any bare `-p HOST:CONTAINER`). Docker binds to `0.0.0.0` — *all* host interfaces — not just loopback. On a cloud VM with a public IP, that publishes your database to the entire internet, and Docker's rule insertion can bypass a `ufw`/`firewalld` policy you thought was protecting it, because Docker programs its own iptables/nftables chains ahead of many host firewall rules. Bind explicitly to `127.0.0.1:5432:5432` when only host-local tools need it.
+
 ### In production
 
 Bind management ports to `127.0.0.1` or protect them with a reverse proxy and firewall. Prefer explicit `-p` over `-P` for anything humans bookmark. On Docker Desktop, remember published ports land on the VM/host forwarding path — firewall and VPN clients can still block you.
+
+**Who owns this:** publishing a port is a shared decision between the app team (what needs to be reachable) and the platform/security team (what the host's firewall and network expose). The person who adds `-p` owns the consequence: a published port on an internet-facing host is an internet-facing service, full stop.
+
+**Failure mode and detection:** the classic incident is a "dev only" database or dashboard published with a bare `-p` on a public VM and discovered by internet-wide scanners within hours. Detect exposure from the host with `ss -ltnp` (what is listening) and from outside with an external port scan or your cloud provider's security-group view — never trust that a host firewall alone hides a Docker-published port. **Do** bind management and datastore ports to `127.0.0.1` and front real traffic with a reverse proxy; **don't** leave `0.0.0.0` publishes on anything with a public address.
+
+> 🏭 **Production floor:** A published port is the single largest blast-radius decision in single-host Docker. `-p 5432:5432` on a public host can expose a database to the whole internet and can sit *in front of* a host firewall you assumed was blocking it, because Docker writes its own packet-filter rules. Change-manage every new publish: justify it, bind to `127.0.0.1` unless external traffic is truly required, verify from outside the host with a real port scan, and prefer a reviewed reverse proxy over ad-hoc `-p` for anything internet-facing. When in doubt, publish nothing and reach the service over its user-defined network instead.
+
+**Before you leave this section**
+
+- **Understand:** `-p HOST:CONTAINER` opens a real host door bound to `0.0.0.0` by default; `-P` randomizes host ports for `EXPOSE`d ports; `EXPOSE` itself publishes nothing.
+- **Try:** publish nginx with `-p 127.0.0.1:8080:80`, confirm `curl` works locally, then confirm another host on the network cannot reach it.
+- **Watch in prod:** bare `0.0.0.0` publishes on public hosts, Docker's rules bypassing the host firewall, and databases/admin UIs exposed by habit.
 
 ---
 

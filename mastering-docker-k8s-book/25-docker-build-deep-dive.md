@@ -59,6 +59,10 @@ flowchart LR
 
 *Figure 25.1: Buildx dispatches one build definition to workers hosted by four different driver topologies.*
 
+Buildx runs BuildKit builds via builders (docker, docker-container, kubernetes, remote). Choose drivers for cache and multi-platform needs. You might think the default docker driver is enough for multi-arch—often you need a container driver or remote builders.
+
+> ⚠️ **Common Pitfall:** Mixing builder instances without documenting which CI job uses which—cache misses and “works on my machine.”
+
 ### Under the hood
 
 List the available builders and inspect the selected one:
@@ -103,18 +107,21 @@ $ docker buildx build --push -t registry.example.com/team/task-api:1.0 .
 
 ### In production
 
-Treat builders as infrastructure. Pin or intentionally upgrade BuildKit versions, restrict access to builder endpoints, monitor disk use, and separate untrusted pull-request builds from release builds that hold registry credentials.
+**Ownership:** Platform/CI owns shared builders and their security; app teams use approved builders.
 
-Use `docker-container` when a CI runner needs predictable BuildKit configuration and full exporter support. Use `kubernetes` when build concurrency and worker lifecycle justify operating shared capacity. Use `remote` only with authenticated, encrypted connectivity and an ownership model for upgrades and incident response.
+**Failure mode:** Builder outage → red pipelines. Detect with builder health checks. Mitigate with redundant builders and pinned BuildKit versions.
 
-Record builder diagnostics in failed CI jobs:
+| Do | Don't |
+|----|-------|
+| Document builder per pipeline | Ad-hoc builders with host mounts in CI |
+| Pin BuildKit versions | Privileged builders without need |
 
-```bash
-$ docker buildx inspect
-$ docker buildx du
-```
+**Before you leave this section**
 
-Do not place unrelated security domains in one long-lived builder cache. Build contexts, secret mounts, and cache metadata cross job boundaries more easily than teams expect. Ephemeral builders or carefully partitioned caches reduce that risk.
+- **Understand:** Buildx builders/drivers decide cache and platform capability.
+- **Try:** Run `docker buildx ls` and inspect the current builder.
+- **Watch in prod:** CI cache misses from builder churn.
+
 
 ## 25.3 Coordinating Builds with Bake
 
@@ -123,6 +130,10 @@ Do not place unrelated security domains in one long-lived builder cache. Build c
 Bake is a build orchestrator included with Buildx. Instead of repeating a long command for every image, you describe targets and shared settings in a file. Bake resolves dependencies, deduplicates common work, and can run independent targets in parallel.
 
 It plays a role similar to a build-system file: the Dockerfile still defines image construction, while Bake defines the build matrix.
+
+Bake files declare multiple targets (images, matrices) as one build graph—like a Makefile for BuildKit. You might think bash loops are equivalent—Bake shares cache and provenance more cleanly.
+
+> ⚠️ **Common Pitfall:** Duplicating tags across Bake targets so one target overwrites another’s tag.
 
 ### Under the hood
 
@@ -199,25 +210,21 @@ Bake can read HCL, JSON, and Compose build definitions. HCL is especially useful
 
 ### In production
 
-Use Bake as the reviewed contract between application repositories and CI. Put tags, platforms, cache policy, and attestation policy in the file instead of distributing them across shell scripts.
+**Ownership:** App teams own bake files in repo; CI invokes pinned targets.
 
-Keep credentials out of `docker-bake.hcl`. Reference BuildKit secret or SSH mounts, and inject the source at execution time:
+**Failure mode:** Wrong target promoted → bad digest in prod. Detect with bake target naming + digest logs. Mitigate with explicit target lists in CI.
 
-```hcl
-target "task-api" {
-  secrets = ["id=pypi_token,env=PYPI_TOKEN"]
-}
-```
+| Do | Don't |
+|----|-------|
+| Named targets per env/artifact | Implicit “build all” in prod promote jobs |
+| Log digests from bake | Retag mutable latest as the only pointer |
 
-The Dockerfile consumes it without committing it to a layer:
+**Before you leave this section**
 
-```dockerfile
-# syntax=docker/dockerfile:1
-RUN --mount=type=secret,id=pypi_token \
-    PIP_INDEX_TOKEN="$(cat /run/secrets/pypi_token)" ./install-private.sh
-```
+- **Understand:** Bake coordinates multi-target BuildKit builds with shared cache.
+- **Try:** Add a bake target for Task API and build it.
+- **Watch in prod:** Wrong bake target promoted to prod.
 
-Require `docker buildx bake --print` during reviews of complex variable changes. The resolved plan exposes accidental tag, platform, and output changes before registry writes occur.
 
 ## 25.4 Multi-Platform Builds
 
@@ -226,6 +233,10 @@ Require `docker buildx bake --print` during reviews of complex variable changes.
 An image tagged `task-api:1.0` can represent several platform-specific images. When a client pulls it, the registry and runtime select the matching variant, such as `linux/amd64` for many servers or `linux/arm64` for ARM systems.
 
 The shared reference points to an OCI image index. Each entry in that index points to a normal image manifest with its own layers and configuration.
+
+Multi-platform images ship manifests for amd64/arm64/etc. Emulation works; native builders are faster. You might think one local arch proves all platforms—test at least one VM per critical arch.
+
+> ⚠️ **Common Pitfall:** Shipping a single-arch image to an arm64 node pool and wondering about Exec format errors.
 
 ### Under the hood
 
@@ -281,11 +292,21 @@ ENTRYPOINT ["task-api"]
 
 ### In production
 
-Test every published platform. A successful build proves only that files were assembled, not that the binary starts or behaves correctly. Run architecture-specific smoke tests on native runners where possible.
+**Ownership:** App teams declare platforms; platform provides builders that can produce them.
 
-Pin base images by digest when reproducibility is more important than automatic patch pickup. Remember that each platform variant has its own manifest digest, while the multi-platform index has another digest. Deployment policy should identify which digest level it verifies.
+**Failure mode:** Missing arch → CrashLoop on new node pools. Detect with image index inspection in CI. Mitigate with required platforms in gate checks.
 
-Avoid platform claims your dependencies cannot satisfy. Native extensions, system packages, and vendor agents may not exist for every architecture. Fail the release rather than publishing an incomplete index under a production tag.
+| Do | Don't |
+|----|-------|
+| Build and test critical archs | Assume QEMU equals native test |
+| Inspect manifest lists before promote | Push only amd64 to mixed clusters |
+
+**Before you leave this section**
+
+- **Understand:** Multi-platform needs explicit platforms and verification.
+- **Try:** Build with `--platform linux/amd64,linux/arm64` and inspect the manifest.
+- **Watch in prod:** Arch mismatches after node pool changes.
+
 
 ## 25.5 Cache Backends and Cache Design
 
@@ -294,6 +315,10 @@ Avoid platform claims your dependencies cannot satisfy. Native extensions, syste
 Build cache is saved work. BuildKit calculates whether an operation's inputs match previous inputs; if they do, it can reuse the result instead of running that step again.
 
 An internal builder cache is fast but tied to one builder. An external cache lets fresh CI runners import previous work and lets a completed build publish cache for the next build.
+
+Cache mounts and registry/gha cache backends cut build time. Cache correctness matters more than max hit rate. You might think caching apt packages without keys is fine—stale caches produce surprise CVE drift.
+
+> ⚠️ **Common Pitfall:** Caching `COPY . .` layers before dependency install—destroying cache on every commit.
 
 ### Under the hood
 
@@ -342,11 +367,21 @@ The cache mount accelerates package downloads without copying the package-manage
 
 ### In production
 
-Give caches a lifecycle. Use a stable cache reference per protected branch and a narrower reference for untrusted branches. Set registry retention rules and monitor builder disk pressure.
+**Ownership:** CI owns cache backend reliability; app teams structure Dockerfiles for cache hygiene.
 
-Treat cache as untrusted acceleration, not proof of correctness. BuildKit validates cache records against content and operation metadata, but cache policy does not replace dependency verification, locked versions, tests, or attestations.
+**Failure mode:** Poisoned/stale cache → broken artifacts. Detect with reproducible digest checks. Mitigate with mode=max carefully and periodic cache bust pins.
 
-Never pass secrets through `ARG`, `ENV`, copied files, or cache keys. Use `RUN --mount=type=secret` or `RUN --mount=type=ssh`; BuildKit excludes secret contents from the resulting layer, while your command must still avoid copying them elsewhere.
+| Do | Don't |
+|----|-------|
+| Order Dockerfile for cache | Cache secrets into layers |
+| Separate dependency and source layers | Unbounded caches without eviction |
+
+**Before you leave this section**
+
+- **Understand:** Cache backends accelerate builds; Dockerfile order decides hit rate.
+- **Try:** Compare a cold vs warm build with registry cache.
+- **Watch in prod:** Flaky builds from bad cache keys.
+
 
 ## 25.6 SBOM and Provenance Attestations
 
@@ -355,6 +390,10 @@ Never pass secrets through `ARG`, `ENV`, copied files, or cache keys. Use `RUN -
 An SBOM answers, "What software is in this image?" Provenance answers, "How and from what inputs was this image built?" An attestation associates such a statement with an image.
 
 These records are evidence, not a guarantee. An SBOM can be incomplete, and provenance can faithfully describe an unsafe process. Their value comes from generation, preservation, verification, and policy use together.
+
+SBOMs list dependencies; provenance attestations record how/where an image was built. Together they support promote-by-digest trust. You might think a tag is enough evidence—tags move; attestations bind to digests.
+
+> ⚠️ **Common Pitfall:** Generating SBOMs but never gating deploy on them—theater without policy.
 
 ### Under the hood
 
@@ -403,17 +442,23 @@ Be careful with `mode=max`: it provides stronger traceability but may expose bui
 
 ### In production
 
-Generate evidence in the same trusted CI job that publishes the digest. Then sign the immutable digest and enforce downstream policy against that digest, not a mutable tag.
+**Ownership:** Security/platform own attestation policy; app teams enable BuildKit attestations in CI.
 
-A practical release gate asks:
+**Failure mode:** Missing provenance → cannot prove what shipped. Detect with registry attestation presence checks. Mitigate by failing promote jobs without attestations.
 
-- Does the image have an SBOM in an accepted format?
-- Does provenance identify the expected repository and builder?
-- Was the attestation signature created by an approved identity?
-- Were all required platforms produced?
-- Does vulnerability policy accept the SBOM's components?
+> 🏭 **Production floor:** Promote by digest only. Mutable tags are pointers for humans; the gate that ships to prod must fail closed without SBOM/provenance on that digest.
 
-Retain provenance with the release for incident response. When a compromised dependency is announced, the SBOM finds affected images; provenance helps identify which source revision, builder, and process produced them.
+| Do | Don't |
+|----|-------|
+| Attest + verify on digest | Promote by mutable tag only |
+| Store SBOM with the image | Hand-written dependency lists as SoT |
+
+**Before you leave this section**
+
+- **Understand:** SBOM/provenance attach evidence to digests for supply-chain trust.
+- **Try:** Build with attestations and inspect them for an image digest.
+- **Watch in prod:** Prod images without provenance after CI changes.
+
 
 ## 25.7 Common Pitfalls
 

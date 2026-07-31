@@ -32,6 +32,10 @@ This chapter gathers the controls you reach for when real users depend on you: q
 
 **ResourceQuota** is a shared apartment’s breaker panel—no single roommate can pull enough amps to black out the building. **LimitRange** is the rule that every appliance must declare a sane default wattage so nothing plugs in as “unlimited.”
 
+Quotas cap a namespace’s aggregate usage; LimitRanges set defaults/min/max per Pod. Together they stop one team from eating the cluster. You might think quotas replace requests—without requests, scheduling and quotas both fail you.
+
+> ⚠️ **Common Pitfall:** Setting quotas without LimitRange defaults—Pods with no requests may still schedule unfairly until quota reckoning surprises you.
+
 ### Under the hood
 
 ```yaml
@@ -99,9 +103,21 @@ flowchart LR
 
 ### In production
 
-1. Align HPA `maxReplicas` with namespace quotas so scale-up does not fail mysteriously.
-2. Separate quotas per team namespace; avoid one giant “default” bucket.
-3. Review unused quota as carefully as exhausted quota—ghost capacity hides bad packing.
+**Ownership:** Platform owns quota classes per namespace tier; app teams stay inside them and request increases via change tickets.
+
+**Failure mode:** Hit quota → create/update denied mid-rollout. Detect with API errors and quota used/hard metrics. Mitigate with headroom and clear dashboards.
+
+| Do | Don't |
+|----|-------|
+| Pair Quota + LimitRange | Unlimited namespaces in multi-tenant clusters |
+| Dashboards for used vs hard | Raise quotas silently without capacity |
+
+**Before you leave this section**
+
+- **Understand:** Quotas bound namespaces; LimitRanges shape per-Pod defaults.
+- **Try:** Apply a quota and watch a create fail when exceeded.
+- **Watch in prod:** Rollouts failing with Forbidden quota errors.
+
 
 ---
 
@@ -110,6 +126,10 @@ flowchart LR
 ### In plain terms
 
 A **PodDisruptionBudget** limits *voluntary* disruptions—actions that politely evict Pods through the Eviction API—such as `kubectl drain`, cluster autoscaler scale-down, and many upgrade tools. It does **not** stop node crashes, power loss, or `kubectl delete pod`.
+
+PDBs limit voluntary disruptions so drains and upgrades do not take all replicas at once. They are availability contracts, not immortality. You might think PDB stops OOM kills—only voluntary/API eviction paths honor them.
+
+> ⚠️ **Common Pitfall:** `minAvailable: 100%` on a single-replica Deployment—blocks all voluntary drains forever.
 
 ### Under the hood
 
@@ -149,9 +169,23 @@ flowchart TB
 
 ### In production
 
-1. Never set `minAvailable` equal to total replicas without spare capacity—drains stall forever.
-2. Pair PDBs with topology spread so voluntary *and* involuntary failures have somewhere else to run.
-3. Remember API eviction honors PDBs; kubelet node-pressure eviction does not (Chapter 20).
+**Ownership:** App teams own PDB for their workloads; platform owns drain automation that respects them.
+
+**Failure mode:** Too-tight PDB → stuck node upgrades. Detect with drain timeouts and PDB allowed disruptions = 0. Mitigate with replica headroom before maintenance.
+
+| Do | Don't |
+|----|-------|
+| PDB + enough replicas | 100% minAvailable on 1 replica |
+| Test drain in staging | Delete pods to bypass PDB in prod |
+
+**Before you leave this section**
+
+- **Understand:** PDBs protect voluntary disruptions; size replicas accordingly.
+- **Try:** Create a PDB and observe drain blocking/allowing.
+- **Watch in prod:** Cluster upgrades stuck on tight PDBs.
+
+> 🏭 **Production floor:** Pair **drain + PDB** for node maintenance: confirm `ALLOWED DISRUPTIONS` > 0 or scale out first; drain; never `kubectl delete` to bypass. Paste PDB YAML and drain logs into the change record.
+
 
 ---
 
@@ -160,6 +194,10 @@ flowchart TB
 ### In plain terms
 
 **HPA** adds or removes *replicas* when load changes—hire more cashiers when the line grows. **VPA** recommends or adjusts *CPU/memory requests* so each cashier has the right-sized station. They solve different problems; combining them carelessly on the same metric fights itself.
+
+HPA scales replicas from metrics; VPA recommends or sets resources. Both need correct metrics and resource requests. You might think max replicas equals safety—without PDBs and dependency capacity you amplify load on databases.
+
+> ⚠️ **Common Pitfall:** HPA on CPU while the app is I/O bound—scales the wrong signal.
 
 ### Under the hood
 
@@ -208,9 +246,21 @@ flowchart LR
 
 ### In production
 
-1. Treat VPA as an optimization after stable SLIs—not day-one magic.
-2. Use custom/external metrics (Prometheus Adapter) when CPU is a poor proxy for user load.
-3. Watch PSI and saturation ([Chapter 22](22-observability.md)) so you do not scale on misleading utilization alone.
+**Ownership:** App teams own HPA/VPA policies; platform owns metrics pipelines they depend on.
+
+**Failure mode:** Flapping HPA → churn and cost. Detect with replica oscillation metrics. Mitigate with stabilization windows and custom metrics tied to SLIs.
+
+| Do | Don't |
+|----|-------|
+| Scale on user-facing signals when possible | HPA without requests set |
+| Cap max replicas vs dependency limits | VPA + HPA on same metrics without care |
+
+**Before you leave this section**
+
+- **Understand:** HPA/VPA need metrics, requests, and sane limits vs dependencies.
+- **Try:** Attach an HPA to Task API CPU and watch scale events in a load test.
+- **Watch in prod:** Autoscaling storms and DB overload.
+
 
 ---
 
@@ -219,6 +269,10 @@ flowchart LR
 ### In plain terms
 
 Kubernetes cleans up dependent objects the way a theater removes stage props when the show closes—**if** those props are tagged as belonging to the show. **Owner references** link children to parents. When you delete a Deployment, its ReplicaSets and Pods go too (cascading garbage collection). Orphaned objects without owners linger until someone deletes them by hand.
+
+Owner references make Kubernetes delete dependents when owners go. Understanding GC prevents orphan cost and surprise deletes. You might think deleting a Namespace is light—it cascades broadly; know the blast radius.
+
+> ⚠️ **Common Pitfall:** Orphaning PVCs by deleting workloads without a reclaim plan—or conversely, unexpected cascades.
 
 ### Under the hood
 
@@ -251,10 +305,21 @@ Custom controllers should set owner references on objects they create so namespa
 
 ### In production
 
-1. Prefer letting controllers own children—do not hand-create Pods that should belong to a Deployment.
-2. When debugging “terminating forever,” inspect `finalizers` and controller health.
-3. Use `kubectl delete --cascade=orphan` only when you *intentionally* keep dependents.
-4. Periodic hygiene: find orphaned ReplicaSets, unused PVCs, and abandoned Endpoints after botched cleanups.
+**Ownership:** App teams understand owners for their objects; platform monitors orphaned PVCs/LoadBalancers for cost.
+
+**Failure mode:** Orphans → cost leak; cascades → data loss. Detect with orphan reports. Mitigate with deletion policies and change checklists.
+
+| Do | Don't |
+|----|-------|
+| Know cascade vs orphan behavior | Delete namespaces casually in prod |
+| Track orphaned PVCs | Assume GC cleans cloud disks always |
+
+**Before you leave this section**
+
+- **Understand:** OwnerRefs drive cascading deletes; know what you orphan.
+- **Try:** Inspect ownerReferences on a Pod and ReplicaSet.
+- **Watch in prod:** Orphaned cloud resources after app teardown.
+
 
 ---
 
@@ -263,6 +328,10 @@ Custom controllers should set owner references on objects they create so namespa
 ### In plain terms
 
 A **Lease** is a short-lived “talking stick” in etcd. Controllers and kubelets use leases to say “I am still alive” or “I am the active leader.” Without leases, leader election and node heartbeats would be noisier and harder to reason about.
+
+Leases coordinate leaders (controllers, operators). Broken lease timing causes flapping leaders or split brains. You might think lease objects are “just config”—they are liveness for control loops.
+
+> ⚠️ **Common Pitfall:** Clock skew and too-aggressive lease durations causing leadership flaps under load.
 
 ### Under the hood
 
@@ -297,10 +366,21 @@ You rarely create Leases by hand for apps; you configure operator replicas and e
 
 ### In production
 
-1. Run critical operators with leader election enabled and ≥2 replicas across zones.
-2. Alert on prolonged leader flapping—often a symptom of API server or etcd latency.
-3. Do not delete `kube-node-lease` objects casually; you can confuse node health detection.
-4. When nodes stick NotReady, inspect both node conditions and their Leases.
+**Ownership:** Platform/operators own lease health for controllers; app teams rarely touch leases directly.
+
+**Failure mode:** Leader flap → control-plane thrash. Detect with leader change rate. Mitigate with sane durations and NTPM monitoring.
+
+| Do | Don't |
+|----|-------|
+| Monitor leader transitions | Hand-edit leases in prod |
+| Keep node time synced | Ultra-short leases without cause |
+
+**Before you leave this section**
+
+- **Understand:** Leases power leader election; flaps are control-plane incidents.
+- **Try:** List leases in kube-node-lease and one operator namespace.
+- **Watch in prod:** Controller flapping after clock or API latency issues.
+
 
 ---
 
@@ -309,6 +389,10 @@ You rarely create Leases by hand for apps; you configure operator replicas and e
 ### In plain terms
 
 On cloud clusters, someone must translate Kubernetes wishes into cloud API calls: create a load balancer for a Service, attach the right routes, label nodes with zone information, delete cloud disks when told. The **cloud controller manager (CCM)** is that translator. It moved *out* of the core `kube-controller-manager` so cloud logic can evolve with the provider.
+
+CCM integrates cloud LBs, nodes, and routes. Misconfigured CCM looks like “Services stuck Pending.” You might think CCM is optional on cloud—without it many LoadBalancer Services never provision.
+
+> ⚠️ **Common Pitfall:** Debugging app Networking for hours when the cloud LB quota is exhausted.
 
 ### Under the hood
 
@@ -345,14 +429,35 @@ spec:
 
 ### In production
 
-1. Know whether CCM (or the managed equivalent) is healthy before debugging stuck LoadBalancers or Node objects.
-2. Prefer official provider annotations and CSI drivers over legacy in-tree assumptions.
-3. Deleting a Service of type LoadBalancer should release cloud LB cost—verify in the cloud console after uninstalls.
-4. Separate failure domains: API server issues versus cloud API rate limits versus CCM bugs present differently.
+**Ownership:** Platform owns CCM and cloud quotas; app teams own Service annotations within documented allow-lists.
+
+**Failure mode:** LB Pending forever → external outage. Detect with Service events and cloud quota metrics. Mitigate with quota headroom and annotation policies.
+
+| Do | Don't |
+|----|-------|
+| Watch Service Events for LB provision | Invent undocumented cloud annotations |
+| Track cloud quota | Assume CCM bugs are app bugs |
+
+**Before you leave this section**
+
+- **Understand:** CCM bridges Kubernetes Services/nodes to cloud APIs.
+- **Try:** Describe a LoadBalancer Service and find CCM-related Events.
+- **Watch in prod:** Pending LBs from quota or IAM failures.
+
 
 ---
 
 ## 24.8 Node maintenance
+
+### In plain terms
+
+Cordon, drain, patch, uncordon—the change-safe node lifecycle. Combine with PDBs and capacity checks. You might think deleting a VM is faster—skipping drain strands volumes and breaks PDBs’ purpose.
+
+Node maintenance is a controlled blast-radius change: one failure domain at a time, with replacement capacity verified first. Treat console “terminate instance” as an incident, not a shortcut.
+
+> ⚠️ **Common Pitfall:** Draining without replacement capacity in other zones during a zonal event—or force-deleting Pods to “hurry” a drain and bypass PDBs.
+
+### Under the hood
 
 Safe worker maintenance loop:
 
@@ -373,7 +478,7 @@ node/worker-2 uncordoned
 - **drain** — evict Pods respectfully (honors PDBs)
 - **uncordon** — re-enable scheduling
 
-Never reboot nodes under load without drain unless you accept involuntary-style disruption.
+Never reboot nodes under load without drain unless you accept involuntary-style disruption. What breaks if `ALLOWED DISRUPTIONS` is 0: drain blocks until you add capacity or carefully adjust the PDB under change control.
 
 ```mermaid
 flowchart LR
@@ -384,6 +489,25 @@ flowchart LR
 
 *Figure 24.4: Safe node maintenance is cordon → drain → work → uncordon so new Pods do not land mid-change.*
 
+### In production
+
+**Ownership:** Platform owns node maintenance SOP; app teams provide PDBs and tolerate brief reschedules.
+
+**Failure mode:** Unsafe drain → multi-replica outage. Detect with error budget burn during maintenance windows. Mitigate with capacity checks and surge nodes.
+
+| Do | Don't |
+|----|-------|
+| Cordon → drain → maintain → uncordon | Delete VMs without drain |
+| Confirm PDB and capacity first | Drain many nodes in parallel blindly |
+
+> 🏭 **Production floor:** Node maintenance uses **drain + PDB**: pre-check capacity and `kubectl get pdb -A`, drain one failure domain at a time, capture Events and PDB status in the ticket, uncordon only when healthy. Never `kubectl delete pod` to bypass a blocking PDB in production.
+
+**Before you leave this section**
+
+- **Understand:** Node maintenance is a rehearsed SOP with PDB and capacity checks.
+- **Try:** Cordon and drain a lab node end-to-end.
+- **Watch in prod:** Parallel drains causing error-budget burn.
+
 ---
 
 ## 24.9 etcd backup and restore
@@ -391,6 +515,10 @@ flowchart LR
 ### In plain terms
 
 **etcd** holds cluster state. Lose etcd without a backup and you may rebuild from scratch. Application data (databases on PVs) is a separate backup story—etcd restore brings back object definitions, not necessarily every byte on every volume.
+
+Backups without tested restores are fiction. You might think volume snapshots of control-plane disks are enough—practice an API-consistent etcd restore into a scratch control plane and time it as RTO evidence.
+
+> ⚠️ **Common Pitfall:** Backing up etcd but never testing restore. Untested backups are fiction.
 
 ### Under the hood
 
@@ -404,17 +532,42 @@ $ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
 $ ETCDCTL_API=3 etcdctl snapshot status /var/backups/etcd/snapshot-2026-07-25.db --write-out=table
 ```
 
-Restore is a careful, version-sensitive procedure (stop API servers, restore snapshot, reintroduce members). Practice on a non-production clone.
+Restore is a careful, version-sensitive procedure (stop API servers, restore snapshot, reintroduce members). Practice on a non-production clone. What breaks if backups live only on the same hosts that fail: you discover too late that the snapshot is unreachable.
 
 On **managed Kubernetes**, the provider usually backs up the control plane—verify RPO/RTO in writing. You still back up **application data** (databases, object storage, PV snapshots—[Chapter 18](18-k8s-storage.md)) yourself.
 
-> ⚠️ **Common Pitfall:** Backing up etcd but never testing restore. Untested backups are fiction.
+### In production
+
+**Ownership:** Platform owns etcd backup schedules, encryption keys, and restore drills; app teams own application data backups separately.
+
+**Failure mode:** Untested backup → prolonged control-plane loss. Detect with backup job success *and* restore-drill cadence. Mitigate with quarterly restore to a non-prod control plane.
+
+| Do | Don't |
+|----|-------|
+| Test restore on a schedule | Backup without restore evidence |
+| Separate app data from etcd backups | Store etcd backups only on the same failing hosts |
+
+> 🏭 **Production floor:** **etcd backup tested restores** are mandatory change evidence. Each drill: restore to scratch, verify API (`kubectl get nodes,ns`), capture duration as RTO evidence, paste backup ID + drill log into the ticket. Never claim RTO from backup job success alone.
+
+**Before you leave this section**
+
+- **Understand:** etcd backup matters only if restore is rehearsed; app data is a separate story.
+- **Try:** Document where backups live and the last successful restore drill date.
+- **Watch in prod:** Missing restore drills; backups on the same failure domain.
 
 ---
 
 ## 24.10 Cluster upgrade strategies
 
-Typical goals: stay within the supported version window (**1.33–1.36** for this book’s baseline era), minimize downtime, avoid surprise API removals.
+### In plain terms
+
+Upgrades are controlled blast-radius changes: stay within the supported version window (**1.33–1.36** for this book’s baseline era), minimize downtime, avoid surprise API removals. You might think skip-level upgrades or all-nodes-at-once waves “save time”—they expand blast radius and violate skew.
+
+Typical goals: control plane first, then nodes, with drain+PDB and capacity. Read release notes before the change window.
+
+> ⚠️ **Common Pitfall:** Upgrading all nodes in parallel to “save time,” or skipping staging soak.
+
+### Under the hood
 
 Common approaches:
 
@@ -445,9 +598,38 @@ flowchart LR
 
 *Figure 24.5: Upgrade control plane first, then drain workers in waves so PDBs and capacity keep apps available.*
 
+What breaks if removed APIs still exist in GitOps: the upgrade succeeds while the next apply fails hard—scan for deprecated APIs first.
+
+### In production
+
+**Ownership:** Platform owns upgrade waves and skew policy; app teams provide PDBs and soak tests.
+
+**Failure mode:** Bad upgrade → partial API skew outage. Detect with component version matrix and error budget during waves. Mitigate with canary node pools and pause points.
+
+| Do | Don't |
+|----|-------|
+| Control plane then canary nodes | Skip-level jumps without vendor support |
+| Pause and verify SLIs each wave | Upgrade during peak without budget |
+
+**Before you leave this section**
+
+- **Understand:** Upgrades are waved changes with skew and PDB discipline.
+- **Try:** Read your platform’s supported version skew document.
+- **Watch in prod:** Parallel node upgrades burning error budgets.
+
 ---
 
 ## 24.11 High availability patterns
+
+### In plain terms
+
+HA means surviving loss of a failure domain: multi control-plane, etcd quorum, zoned workers, PDBs. You might think replica count alone is HA—three replicas on one node or one zone still share a fate.
+
+Platform owns control-plane/etcd HA; app teams own workload spread. Verify SLAs on managed control planes in writing.
+
+> ⚠️ **Common Pitfall:** Three replicas all on one node or one zone, or even-sized etcd that cannot form quorum cleanly.
+
+### Under the hood
 
 ### Control plane
 
@@ -468,6 +650,25 @@ Production self-managed clusters typically run **odd-sized etcd** (3 or 5) and m
 - Observability and alerts (Chapter 22)
 - GitOps or controlled Helm releases (Chapter 23)—no snowflake kubectl on prod
 - Healthy CCM / cloud integration for LoadBalancers and node lifecycle
+
+What breaks if etcd members share a disk or rack: one failure takes quorum—map failure domains explicitly.
+
+### In production
+
+**Ownership:** Platform owns control-plane/etcd HA; app teams own workload spread and PDBs.
+
+**Failure mode:** Zone loss → total outage despite replicas. Detect with topology skew dashboards. Mitigate with topology spread and multi-zone node pools.
+
+| Do | Don't |
+|----|-------|
+| Spread across zones | HA checkbox without zone failure test |
+| etcd quorum in distinct failure domains | Single disk for all etcd members |
+
+**Before you leave this section**
+
+- **Understand:** HA is failure-domain math, not only replica count.
+- **Try:** Map control-plane and worker failure domains on your cluster.
+- **Watch in prod:** Same-zone replica stacks.
 
 ---
 

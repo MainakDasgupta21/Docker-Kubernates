@@ -37,6 +37,10 @@ There are two honest answers to "how do I isolate tenants?"
 
 Most organizations end up somewhere in between: soft multitenancy for internal teams, and a full cluster (or a sandboxed runtime) for anything running untrusted code.
 
+Namespace tenancy vs cluster-per-tenant vs virtual clusters—blast radius and cost trade off. You might think namespaces alone equal hard multi-tenancy—without quota, PSA, NetworkPolicy, and RBAC they do not.
+
+> ⚠️ **Common Pitfall:** Soft multi-tenancy sold as hard isolation to regulated tenants.
+
 ### Under the hood
 
 The building block of soft multitenancy is the **namespace**. It is a scope for names and a hook for policy — it is *not* a security sandbox by itself. A namespace gives you:
@@ -78,12 +82,21 @@ flowchart LR
 
 ### In production
 
-- **Match the boundary to the threat, not the org chart.** Internal teams who already share source code and secrets can safely share a cluster with namespaces + quotas + RBAC. Anyone running code you did not review belongs behind a hard boundary.
-- **Never run untrusted code with only namespace isolation.** If customers can run arbitrary pods, use separate clusters or a sandboxed `RuntimeClass`. A shared kernel plus a hostile tenant is a breach waiting to happen.
-- **Standardize tenant onboarding.** A new tenant should mean "apply a namespace template" — the namespace, a default-deny NetworkPolicy, a ResourceQuota, a LimitRange, PSA labels, and baseline RBAC — created together by automation, never hand-assembled.
-- **Label everything for chargeback.** Cost-center and team labels on namespaces let you attribute spend later; retrofitting them across hundreds of namespaces is painful.
+**Ownership:** Platform owns tenancy model choice and guardrails; tenants own workloads inside the contract.
 
-> ⚠️ **Common Pitfall:** Treating a namespace as a security boundary equivalent to a VM or a separate cluster. It is an *administrative and policy* boundary. Isolation comes from what you layer on top (RBAC, quotas, PSA, NetworkPolicy, and node/runtime isolation).
+**Failure mode:** Noisy neighbor or escape → cross-tenant incident. Detect with quota breaches and network denies. Mitigate with layered controls (Ch 19/21/24).
+
+| Do | Don't |
+|----|-------|
+| Match model to isolation needs | Promise hypervisor isolation with shared nodes casually |
+| Document shared fate | Unlimited cluster-admin per tenant |
+
+**Before you leave this section**
+
+- **Understand:** Tenancy model sets blast radius—namespaces need layered controls.
+- **Try:** Classify your lab as soft vs hard tenancy and why.
+- **Watch in prod:** Overpromised isolation.
+
 
 ---
 
@@ -92,6 +105,10 @@ flowchart LR
 ### In plain terms
 
 A `ResourceQuota` is the electricity meter and the fuse box for a namespace. It answers "how much of the cluster may everything in this namespace consume, in total?" — total CPU, total memory, total number of pods, total number of Services, and so on. Without it, one team's runaway Deployment can eat the whole cluster and evict everyone else.
+
+Quotas stop one tenant from eating the cluster. Tie them to chargeback classes. You might think CPU quota without object count quotas is enough—CRD spam still hurts API.
+
+> ⚠️ **Common Pitfall:** Quotas on CPU/memory only while allowing unbounded Secret/ConfigMap counts.
 
 ### Under the hood
 
@@ -145,12 +162,21 @@ spec:
 
 ### In production
 
-- **Quota without LimitRange is a trap.** The moment you set a compute quota, pods lacking requests/limits fail admission with `must specify limits.cpu`. Always pair a compute `ResourceQuota` with a `LimitRange` that supplies defaults (next section).
-- **Quota rejects at admission, not at runtime.** If a namespace is at its pod quota, the *controller* (Deployment/ReplicaSet) keeps retrying and surfaces `failed quota` events. Watch controller events, not just pod status, when scaling stalls.
-- **Reserve headroom.** The sum of all namespace quotas can legitimately exceed cluster capacity (overcommit), but if it does, the *scheduler* — not quota — becomes the limiter, and pods sit `Pending`. Decide deliberately whether you are overcommitting.
-- **Cap `services.loadbalancers` and `requests.storage`.** These map directly to cloud spend. One `type: LoadBalancer` Service per developer experiment adds up fast.
+**Ownership:** Platform assigns quota classes; tenants request bumps via tickets with capacity review.
 
-> ⚠️ **Common Pitfall:** Setting a memory *limit* quota but forgetting the *request* quota (or vice versa). Tenants can then game the uncapped dimension. Cap both `requests.*` and `limits.*`.
+**Failure mode:** Quota hit mid-deploy. Detect with used/hard metrics per tenant. Mitigate with dashboards and headroom.
+
+| Do | Don't |
+|----|-------|
+| Include object-count quotas | Silent infinite namespaces |
+| Capacity review on bumps | Copy prod quota into tiny clusters blindly |
+
+**Before you leave this section**
+
+- **Understand:** Quotas enforce fair share; include object counts.
+- **Try:** Inspect a tenant namespace’s quota used vs hard.
+- **Watch in prod:** API spam without object quotas.
+
 
 ---
 
@@ -159,6 +185,10 @@ spec:
 ### In plain terms
 
 Where `ResourceQuota` caps the *namespace total*, a `LimitRange` sets rules for *each individual* pod, container, or PVC: a default request if you forgot one, a ceiling no single container may exceed, and a floor so nobody games the scheduler by requesting `1m` of CPU.
+
+LimitRanges default and bound container resources so tenants cannot omit requests. You might think LimitRange replaces quota—different layers.
+
+> ⚠️ **Common Pitfall:** Defaults so high that two Pods exhaust the namespace quota.
 
 ### Under the hood
 
@@ -208,10 +238,21 @@ The `LimitRange` admission controller mutates it to carry `requests: {cpu: 100m,
 
 ### In production
 
-- **Every namespace with a compute quota needs a LimitRange.** Treat them as a pair in your namespace template.
-- **Set `max` to catch fat-finger mistakes.** A developer copying a manifest that requests `memory: 512Gi` should be rejected loudly, not left `Pending` forever.
-- **Keep `default` and `defaultRequest` close.** A large gap between request and limit invites CPU throttling surprises and lets pods overcommit memory (risking OOM kills under node pressure).
-- **Remember LimitRange is per-object, not per-namespace.** Ten containers each at the `max` still need to fit under the namespace `ResourceQuota`.
+**Ownership:** Platform owns LimitRange templates per tier; tenants override within bounds.
+
+**Failure mode:** Bad defaults → instant quota exhaustion. Detect with create failures and defaulted resources in admits. Mitigate with tuned templates.
+
+| Do | Don't |
+|----|-------|
+| Defaults fit quota math | No LimitRange in multi-tenant NS |
+| Document min/max | Defaults that force privileged patterns |
+
+**Before you leave this section**
+
+- **Understand:** LimitRange defaults must fit quota arithmetic.
+- **Try:** Apply a LimitRange and create a Pod without requests.
+- **Watch in prod:** Defaults that exhaust quotas immediately.
+
 
 ---
 
@@ -222,6 +263,10 @@ The `LimitRange` admission controller mutates it to carry `requests: {cpu: 100m,
 **Pod Security Standards (PSS)** are three named security profiles — `privileged`, `baseline`, `restricted` — that describe *how hardened* a pod's spec must be. **Pod Security Admission (PSA)** is the built-in admission controller that enforces a chosen profile per namespace using labels. Think of PSS as the building code and PSA as the inspector at the door.
 
 PSA replaced the removed PodSecurityPolicy (gone since 1.25) and is a stable, always-on part of Kubernetes 1.36.
+
+PSS/PSA are tenancy guardrails—baseline/restricted per namespace class. You might think privileged namespaces for every team “temporarily” is OK—they become permanent.
+
+> ⚠️ **Common Pitfall:** Permanent privileged exceptions without expiry.
 
 ### Under the hood
 
@@ -293,26 +338,21 @@ spec:
 
 ### In production
 
-- **Adopt in stages.** Start with `warn=baseline` + `audit=baseline` cluster-wide (PSA can be configured with cluster defaults via the `AdmissionConfiguration`), fix the noise, then raise `enforce=baseline`, then repeat the climb toward `restricted`.
-- **Exempt system namespaces thoughtfully.** `kube-system`, CNI, and CSI namespaces often *need* `privileged`. Set them explicitly rather than leaving them unlabeled and forgotten.
-- **Pin the version label.** Unversioned `latest` means a control-plane upgrade can change what "restricted" forbids. Pin to a release and bump deliberately.
-- **PSA enforces at the pod template too — but only at pod creation.** Controllers (Deployments) surface violations in their events/status, and PSA's `warn` fires on the Deployment apply, which is friendlier than a silent ReplicaSet failure.
-- **Know PSA's limits.** It only checks a fixed set of pod-security fields. It cannot enforce "images must come from our registry," "every pod needs a `team` label," or "no `NodePort` Services." That is the job of a policy engine.
+**Ownership:** Platform owns PSS labels by namespace class; exemptions ticketed with expiry.
 
-> 📘 **Deep Dive (optional):** For rules beyond PSS, use a validating/mutating policy engine — **Kyverno** or **OPA Gatekeeper** — or the built-in **ValidatingAdmissionPolicy** (CEL-based, GA since 1.30) and **MutatingAdmissionPolicy** (advancing in 1.36). In-tree CEL policies avoid running a separate webhook and are attractive for simple org-wide rules; Kyverno/Gatekeeper offer richer libraries and reporting.
+**Failure mode:** Privileged escape risk. Detect with PSA audit and privileged Pod inventories. Mitigate with time-boxed exemptions.
 
-```mermaid
-flowchart TB
-  workload["Tenant workload request"] --> rbac["RBAC authorizes caller"]
-  rbac --> psa["Pod Security Admission checks Pod shape"]
-  psa --> orgPolicy["Organization admission policy"]
-  orgPolicy --> quota["ResourceQuota and LimitRange"]
-  quota --> networkPolicy["Default-deny NetworkPolicy"]
-  networkPolicy --> runtime["Node and RuntimeClass isolation"]
-  runtime --> admitted["Admitted tenant workload"]
-```
+| Do | Don't |
+|----|-------|
+| baseline/restricted by default | Open privileged for convenience |
+| Expire exemptions | One privileged label for all tenants |
 
-*Figure 31.2: Multitenancy relies on layered authorization, admission, resource, network, and runtime controls rather than namespaces alone.*
+**Before you leave this section**
+
+- **Understand:** PSS is a tenancy control with managed exemptions.
+- **Try:** List namespaces and their PSA enforce labels.
+- **Watch in prod:** Eternal privileged exceptions.
+
 
 ---
 
@@ -321,6 +361,10 @@ flowchart TB
 ### In plain terms
 
 RBAC (covered mechanically in Chapter 21) decides *who may call which verb on which resource*. This section is about the *habits* that keep RBAC safe as the number of humans, CI systems, and controllers grows — the difference between a policy that passes an audit and one that quietly grants `cluster-admin` to a leaked CI token.
+
+Tenant admins get namespace admin—not cluster-admin. Group bindings over individuals when possible. You might think cluster-reader for all humans is harmless—still a data leak surface.
+
+> ⚠️ **Common Pitfall:** Binding tenant CI to cluster-admin.
 
 ### Under the hood
 
@@ -372,12 +416,23 @@ pods              []                 []               [get list watch]
 
 ### In production
 
-- **Review the four built-in user-facing ClusterRoles before cloning them:** `view` (read-most, no secrets), `edit` (read/write most, no RBAC), `admin` (namespace admin including RBAC within the namespace), and `cluster-admin` (superuser). Most app teams want `edit` scoped to their namespace, not a hand-rolled role.
-- **Prefer groups over individual users in bindings.** Bind to `payments-team` (from your OIDC/IdP) so onboarding/offboarding is a change in the identity provider, not a cluster edit.
-- **Run periodic access reviews.** Export bindings (`kubectl get rolebindings,clusterrolebindings -A -o yaml`) and diff against the intended state in Git. RBAC belongs in version control like any other manifest.
-- **ServiceAccount tokens are bearer tokens.** Projected, audience-bound, short-lived tokens (the default for pods) are far safer than long-lived Secret-based tokens. Do not create long-lived token Secrets unless an external system truly needs one, and rotate them.
+**Ownership:** Platform owns binding patterns; tenants manage in-namespace Roles within guardrails.
 
-> ⚠️ **Common Pitfall:** Testing permissions as your own highly privileged user and concluding "it works." A workload runs as *its* ServiceAccount. Always test with `--as=system:serviceaccount:<ns>:<name>`.
+**Failure mode:** Privilege escalation across tenants. Detect with audit on ClusterRoleBindings. Mitigate with least privilege and periodic access reviews.
+
+| Do | Don't |
+|----|-------|
+| Namespace-scoped tenant admin | cluster-admin per tenant |
+| Access reviews | Orphaned bindings after offboarding |
+
+**Before you leave this section**
+
+- **Understand:** Tenant RBAC stays namespaced; review bindings.
+- **Try:** List ClusterRoleBindings and justify each.
+- **Watch in prod:** Tenant CI with cluster-admin.
+
+> 🏭 **Production floor:** **RBAC least privilege** for tenants: no cluster-admin, CI uses deploy-only Roles, paste `auth can-i` evidence in onboarding tickets.
+
 
 ---
 
@@ -386,6 +441,10 @@ pods              []                 []               [get list watch]
 ### In plain terms
 
 The API server is the front door to the whole cluster, and it can only process so many requests at once. **API Priority and Fairness (APF)** is the bouncer-and-queues system that decides, when the door is crowded, *whose* requests get served and whose wait — so that one runaway controller listing every pod every second cannot lock out `kubelet` heartbeats or your `kubectl`. APF is stable and on by default in Kubernetes 1.36.
+
+APF protects the API server from noisy tenants by queuing/fairness. You might think rate limits alone on ingress fix API storms—APF is specifically for kube-apiserver.
+
+> ⚠️ **Common Pitfall:** Disabling APF to “fix” timeouts without understanding workload.
 
 ### Under the hood
 
@@ -472,12 +531,21 @@ spec:
 
 ### In production
 
-- **Diagnose 429s before "scaling the API server."** A flood of `429`s in controller logs usually means a client is over-polling. APF is doing its job — throttling the offender to protect the cluster. Find the caller in `apiserver_flowcontrol_rejected_requests_total` (labeled by `flow_schema` and `priority_level`).
-- **Use informers/watches, not tight `list` loops.** The classic APF-triggering bug is a custom controller that `LIST`s all pods on a timer instead of using a shared informer cache. Fix the client, not the limits.
-- **Isolate risky integrations** into their own low-priority `FlowSchema` so their bad day is contained.
-- **Do not disable APF.** Turning it off removes the protection that keeps leader election and kubelet heartbeats alive under load — exactly when you need them.
+**Ownership:** Platform owns APF configuration; investigate before raising limits.
 
-> 💡 **Tip:** `kubectl` requests you make by hand ride in a low-priority level and may be throttled during an incident. If your own `kubectl` feels slow while the cluster is on fire, that is APF protecting the control plane — not necessarily a broken API server.
+**Failure mode:** API latency/503 under load. Detect with APF rejected/queue metrics. Mitigate by finding noisy verbs/users and tuning wisely.
+
+| Do | Don't |
+|----|-------|
+| Watch APF metrics | Disable APF in prod |
+| Find noisy controllers | Blindly raise all limits |
+
+**Before you leave this section**
+
+- **Understand:** APF sheds/fair-queues API load—tune with evidence.
+- **Try:** Find APF metrics on your metrics stack if exposed.
+- **Watch in prod:** API storms from runaway controllers.
+
 
 ---
 
@@ -486,6 +554,10 @@ spec:
 ### In plain terms
 
 The **audit log** is the cluster's security camera: a structured record of *who* did *what*, *to which object*, *when*, and *whether it was allowed*. When something goes wrong — a deleted namespace, a leaked token, a surprise `cluster-admin` binding — the audit log is how you reconstruct the story.
+
+Multi-tenant clusters need audit evidence per tenant actions. Retention and access to audits are security controls. You might think cloud trail alone covers Kubernetes RBAC changes—verify API audit is enabled.
+
+> ⚠️ **Common Pitfall:** Tenants able to delete their audit trails.
 
 ### Under the hood
 
@@ -557,12 +629,21 @@ A single event looks like this (trimmed):
 
 ### In production
 
-- **Log Secret and RBAC operations at higher fidelity, everything else lean.** Full `RequestResponse` on every read will bury you in gigabytes and can *leak* sensitive data into logs. Use `Metadata` for Secrets — you want to know *that* a secret was read, not its contents.
-- **Ship audit logs off the node.** Use the webhook backend or a log agent to forward to a SIEM. Logs stored only on a control-plane node vanish if that node dies (or is wiped by an attacker).
-- **On managed Kubernetes, you usually enable audit via the provider** (EKS/GKE/AKS control-plane logging) rather than editing API-server flags you cannot reach. Know your platform's knob.
-- **Alert on high-signal events:** `cluster-admin` bindings created, `exec`/`attach` into pods, secret reads by unexpected identities, and deletes of namespaces or CRDs.
+**Ownership:** Platform owns immutable audit shipping; security owns detections.
 
-> ⚠️ **Common Pitfall:** Setting `level: RequestResponse` globally. It generates enormous volume and can record secret payloads in plaintext. Be selective.
+**Failure mode:** No evidence after cross-tenant incident. Detect with audit pipeline SLOs. Mitigate with central immutable storage.
+
+| Do | Don't |
+|----|-------|
+| Immutable off-cluster audits | Audits only on control-plane disk |
+| Alert on privileged bindings | Tenant-writable audit buckets |
+
+**Before you leave this section**
+
+- **Understand:** Audits are multi-tenant incident evidence—protect them.
+- **Try:** Query one tenant’s Secret access in audits if available.
+- **Watch in prod:** Missing API audits in “managed” clusters.
+
 
 ---
 
@@ -571,6 +652,10 @@ A single event looks like this (trimmed):
 ### In plain terms
 
 Kubernetes evolves fast, and it makes two promises that let you keep up without chaos: **feature gates** let a feature graduate through Alpha → Beta → GA so you can opt in early or wait for maturity; and the **deprecation policy** guarantees that an API you depend on will not vanish overnight. Governance is not only about tenants *today* — it is about surviving the cluster's own upgrades.
+
+Feature gates and API deprecations are change-safety events. Track removed APIs before upgrades (1.33–1.36 window). You might think manifests that “still apply” are future-proof—removed versions fail hard later.
+
+> ⚠️ **Common Pitfall:** Ignoring deprecation warnings in CI until upgrade day.
 
 ### Under the hood
 
@@ -614,13 +699,21 @@ Tools like **`kubent` (kube-no-trouble)** and **Pluto** scan live objects and ma
 
 ### In production
 
-- **Read the release notes' "Urgent Upgrade Notes" before every minor bump.** That section lists removed APIs and behavioral changes. Skipping it is how a `kubectl apply` in CI suddenly fails after an upgrade.
-- **Migrate manifests ahead of the removal, not during the outage.** When a beta API is deprecated, change your YAML to the stable version now; the cluster serves both, so you can migrate calmly while the old version still works.
-- **Do not enable Alpha gates in production.** They lack upgrade/rollback guarantees and can be removed with no migration path. Beta features are the earliest you should consider for real workloads, and even then read the caveats.
-- **Pin PSA and other version labels** (as in §31.5) so a control-plane upgrade does not change enforcement semantics under you.
-- **Keep manifests in Git and lint them in CI** with a deprecation scanner. Governance that lives only in a running cluster rots; governance in version control gets reviewed.
+**Ownership:** Platform publishes allowed API versions; app teams migrate before upgrade waves.
 
-> 📘 **Deep Dive (optional):** Because every version of an object shares one **storage version**, a cluster upgrade that drops a served version does not lose data — but it *can* leave objects stored under an old version. The **`StorageVersionMigration`** API (graduating through recent releases) lets you rewrite stored objects to the current storage version so an old served version can be safely removed.
+**Failure mode:** Upgrade blocked by removed APIs. Detect with continuous deprecated API metrics. Mitigate with CI checks and migration PRs.
+
+| Do | Don't |
+|----|-------|
+| Fail CI on removed APIs | Silence deprecation warnings |
+| Migrate before upgrade | Enable alpha gates in prod casually |
+
+**Before you leave this section**
+
+- **Understand:** Deprecations are scheduled outages if ignored—migrate early.
+- **Try:** Scan manifests for deprecated apiVersions.
+- **Watch in prod:** Upgrade-day API removals.
+
 
 ---
 

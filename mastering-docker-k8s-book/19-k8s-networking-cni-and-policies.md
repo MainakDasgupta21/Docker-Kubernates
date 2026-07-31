@@ -34,6 +34,10 @@ By default, Kubernetes assumes a flat, reachable Pod network: any Pod can talk t
 
 When the kubelet creates a Pod, it does not invent networking itself. It calls the configured CNI plugin: “Give this Pod an address and a working network interface.” Without a healthy CNI, Pods sit in `ContainerCreating` with network setup errors—like buildings with no street numbers and no curb cuts.
 
+CNI solves the “how do containers on different nodes share a routable fabric?” problem so Services, NetworkPolicies, and mesh layers have something real to stand on. You might think networking is “just the cloud VPC”—kubelet still needs a CNI ADD/DEL hook per Pod; a healthy VPC with a crashed CNI DaemonSet still yields stuck Pods.
+
+> ⚠️ **Common Pitfall:** You might think NotReady nodes are always kubelet or disk. A CNI CrashLoop on one node often presents as ContainerCreating / networkPlugin errors while other nodes look fine.
+
 ### Under the hood
 
 A typical CNI hook sequence:
@@ -62,12 +66,25 @@ worker-1   10.244.1.0/24
 worker-2   10.244.2.0/24
 ```
 
+What breaks if Pod CIDR overlaps a peered VPC: return traffic blackholes; symptoms look like “intermittent timeouts” after hybrid connectivity lands.
+
 ### In production
 
-1. Treat CNI DaemonSets as critical infrastructure—alert on CrashLoopBackOff and NotReady nodes.
-2. Document Pod and Service CIDRs; overlapping ranges with on-prem or VPC networks break routing.
-3. Upgrade CNI with the same care as Kubernetes itself; dataplane regressions are cluster-wide outages.
-4. Verify NetworkPolicy support before relying on YAML isolation.
+**Ownership:** Platform owns CNI choice, DaemonSet health, and CIDR documentation. App teams own Service/NetworkPolicy labels on top of a working fabric. Incident evidence: CNI DaemonSet status, node PodCIDR, kubelet network plugin events.
+
+**Failure mode:** CNI node agent down → Pods stuck ContainerCreating on that node. Detect with DaemonSet unavailable and node NotReady / network plugin errors. Mitigate with page-worthy alerts, staged CNI upgrades, and a rollback plan equal to a Kubernetes upgrade.
+
+| Do | Don't |
+|----|-------|
+| Alert on CNI CrashLoop and NotReady | Treat CNI upgrades as casual patch Tuesday |
+| Document Pod/Service CIDRs in the runbook | Overlap CIDRs with on-prem or VPC ranges |
+| Verify NetworkPolicy enforcement before relying on YAML | Assume every CNI enforces NetworkPolicy |
+
+**Before you leave this section**
+
+- **Understand:** Kubelet delegates Pod networking to CNI; unhealthy CNI blocks Pod start.
+- **Try:** Identify your CNI DaemonSet and each node’s Pod CIDR.
+- **Watch in prod:** CNI readiness and CIDR conflicts after VPN/peering changes.
 
 ---
 
@@ -76,6 +93,10 @@ worker-2   10.244.2.0/24
 ### In plain terms
 
 You usually pick **one** primary CNI per cluster. Flannel is the simple overlay for labs. Calico emphasizes routing and mature policy. Cilium bets on eBPF for performance, identity-aware policy, and observability. Managed providers often choose for you—know what you inherited.
+
+The decision is really about dataplane + policy + observability trade-offs, not brand loyalty. You might think you can “add Calico later for policy” on top of an incompatible stack—many combinations fight over interfaces and routes. Pick a primary dataplane and design policy around what it actually enforces.
+
+> ⚠️ **Common Pitfall:** You might think applying NetworkPolicy YAML proves isolation. On a CNI that does not enforce policy, you only have false confidence.
 
 ### Under the hood
 
@@ -105,10 +126,21 @@ flowchart TB
 
 ### In production
 
-1. Do not run two competing full CNIs “to be safe”—pick one dataplane.
-2. Measure MTU and encapsulation overhead; overlays can surprise latency-sensitive apps.
-3. Align NetworkPolicy CRDs and CNI version; applying policies that nobody enforces creates false confidence.
-4. For multi-cluster or service mesh, confirm how the mesh dataplane interacts with CNI policy (order of enforcement).
+**Ownership:** Platform owns CNI selection and upgrade path; security/platform jointly own “is NetworkPolicy enforced?” evidence. App teams should not invent a second CNI for one namespace.
+
+**Failure mode:** Competing CNIs or MTU mismatch → packet loss and mysterious timeouts. Detect with cross-node connectivity probes and MTU path tests. Mitigate by standardizing one dataplane and documenting encapsulation overhead for latency-sensitive apps.
+
+| Do | Don't |
+|----|-------|
+| Pick one primary CNI | Run two full CNIs “for safety” |
+| Align policy CRDs with CNI version | Trust YAML without an enforcement test |
+| Confirm mesh vs CNI policy order | Ignore cloud CNI IP density limits |
+
+**Before you leave this section**
+
+- **Understand:** One primary CNI; policy only works if the dataplane enforces it.
+- **Try:** Name your cluster’s CNI and whether NetworkPolicy is enforced.
+- **Watch in prod:** MTU/latency regressions after CNI or overlay changes.
 
 ---
 
@@ -117,6 +149,10 @@ flowchart TB
 ### In plain terms
 
 Pod A on Node 1 calling Pod B on Node 2 is like a letter leaving one neighborhood, riding the city’s trunk roads (the underlay), and being delivered to another neighborhood. The CNI either **encapsulates** that letter in a tunnel (overlay) or **advertises routes** so the underlay can deliver it directly.
+
+Understanding this path matters because “Pods can’t talk” is rarely one failure—DNS, NetworkPolicy, kube-proxy, and underlay firewalls all sit on different hops. You might think `kubectl exec` ping success proves the Service path works; ClusterIP and EndpointSlice add hops that Pod-to-Pod never takes.
+
+> ⚠️ **Common Pitfall:** You might think fixing a Security Group for node IPs automatically covers Pod IPs. On some CNIs Pods use different addresses; on others they share the node ENI—know which model you run.
 
 ### Under the hood
 
@@ -155,11 +191,23 @@ sequenceDiagram
 
 *Figure 19.2: Cross-node Pod traffic rides the CNI datapath—often via overlay encapsulation, sometimes via direct routes.*
 
+What breaks if underlay firewalls allow node→node but not the overlay UDP port: cross-node Pod traffic dies while same-node traffic works—classic “it works until the scheduler spreads replicas.”
+
 ### In production
 
-1. When debugging, separate “DNS failed,” “NetworkPolicy denied,” and “CNI/routing broken.”
-2. Packet capture on nodes (tcpdump/cilium monitor) beats guessing.
-3. Watch for asymmetric routes after VPC peering or firewall rule changes.
+**Ownership:** Platform owns underlay/overlay health; app teams provide reproduce steps (source Pod, dest Pod/Service, port). Detect with synthetic probes across nodes and zones. Mitigate by separating DNS vs policy vs routing in the runbook before changing three layers at once.
+
+| Do | Don't |
+|----|-------|
+| Capture packets / Hubble before guessing | Blame the app for every timeout |
+| Test same-node vs cross-node paths | Ignore asymmetric routes after peering changes |
+| Check EndpointSlices when Services fail | Confuse Pod IP reachability with ClusterIP behavior |
+
+**Before you leave this section**
+
+- **Understand:** Cross-node traffic rides CNI overlay or routes; Services add kube-proxy/eBPF DNAT.
+- **Try:** Trace one request from Pod A to Pod B on another node in your lab notes.
+- **Watch in prod:** Same-node OK / cross-node fail patterns after network ACL changes.
 
 ---
 
@@ -168,6 +216,10 @@ sequenceDiagram
 ### In plain terms
 
 CoreDNS is the cluster phone book. Pods ask it for `task-api` and get the Service ClusterIP. Applications should call **Services by DNS name**, not Pod IPs—those change on every reschedule.
+
+DNS failure is a force multiplier: every microservice looks “down” at once. You might think scaling the app Deployment fixes “intermittent 503s” when CoreDNS is saturated or NetworkPolicy blocked UDP/TCP 53. Always verify resolution before deep application debugging.
+
+> ⚠️ **Common Pitfall:** Calling `localhost` from one Pod expecting to reach another Pod. `localhost` is always *this* network namespace. Use the Service DNS name.
 
 ### Under the hood
 
@@ -199,13 +251,23 @@ Name:	task-api.default.svc.cluster.local
 Address: 10.96.120.45
 ```
 
-> ⚠️ **Common Pitfall:** Calling `localhost` from one Pod expecting to reach another Pod. `localhost` is always *this* network namespace. Use the Service DNS name.
+What breaks if CoreDNS replicas are undersized at peak QPS: NXDOMAIN spikes and cascading client retries that look like an app outage.
 
 ### In production
 
-1. Alert on CoreDNS latency and error rates—DNS failure looks like “the whole mesh is down.”
-2. Size CoreDNS replicas for peak QPS; autoscale if your platform supports it.
-3. Prefer short names inside a namespace; use FQDNs across namespaces to avoid search-path surprises.
+**Ownership:** Platform owns CoreDNS sizing, PDB, and DNS SLOs; app teams own correct Service DNS names (short vs FQDN). Detect with CoreDNS latency/error metrics and synthetic `nslookup` probes. Mitigate with HPA where supported, caching discipline, and NetworkPolicy DNS allows before default-deny egress.
+
+| Do | Don't |
+|----|-------|
+| Alert on CoreDNS errors and latency | Debug apps before verifying DNS |
+| Prefer FQDNs across namespaces | Hard-code Pod IPs in configs |
+| Size replicas for peak QPS | Forget DNS allow when adding default-deny |
+
+**Before you leave this section**
+
+- **Understand:** Apps resolve Services via CoreDNS; Pod IPs are ephemeral.
+- **Try:** `nslookup` a Service FQDN from a debug Pod and match the ClusterIP.
+- **Watch in prod:** CoreDNS saturation and DNS failures after NetworkPolicy changes.
 
 ---
 
@@ -214,6 +276,10 @@ Address: 10.96.120.45
 ### In plain terms
 
 **Dual-stack** means Pods and Services can use both IPv4 and IPv6. Think of every building getting both a street number and a new postal code system at once. Clients may dial either family; Services can expose one or both.
+
+Enabling dual-stack is a cluster-wide networking change, not a Service annotation experiment. You might think flipping `ipFamilyPolicy` on one Service is harmless; without CNI, routes, and firewall parity for IPv6, you create half-working endpoints and confusing client behavior.
+
+> ⚠️ **Common Pitfall:** You might think NetworkPolicy IPv4 allows cover IPv6 peers. Dual-stack doubles the families you must allow intentionally.
 
 ### Under the hood
 
@@ -249,13 +315,23 @@ NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   IP-FAMILIES
 task-api   ClusterIP   10.96.120.45   <none>        80/TCP    IPv4,IPv6
 ```
 
-NetworkPolicies can reference IPv4 and IPv6 CIDRs in `ipBlock` peers. Default-deny still applies per selected Pod; dual-stack does not weaken policy—it doubles the address families you must allow intentionally.
+NetworkPolicies can reference IPv4 and IPv6 CIDRs in `ipBlock` peers. Default-deny still applies per selected Pod; dual-stack does not weaken policy—it doubles the address families you must allow intentionally. What breaks if cloud LBs are IPv4-only while Services advertise IPv6: external clients never reach the IPv6 family you thought you enabled.
 
 ### In production
 
-1. Do not enable dual-stack casually on a live cluster; plan CIDRs, CNI, and cloud LB support first (Chapter 32).
-2. Test NetworkPolicies for both families—an IPv4-only allow list will surprise IPv6 clients.
-3. Keep Services’ `ipFamilyPolicy` consistent with how clients actually connect.
+**Ownership:** Platform owns dual-stack enablement (CIDRs, CNI, cloud LB). App teams align Service `ipFamilyPolicy` with how clients actually connect. Detect with dual-family connectivity tests and LB health on both families.
+
+| Do | Don't |
+|----|-------|
+| Plan CIDRs/CNI/LB before enabling | Flip dual-stack on a live cluster casually |
+| Test NetworkPolicies for both families | Assume IPv4 allows cover IPv6 |
+| Keep `ipFamilyPolicy` consistent with clients | Mix PreferDualStack without client testing |
+
+**Before you leave this section**
+
+- **Understand:** Dual-stack is cluster plumbing plus Service fields; see Chapters 15 and 32.
+- **Try:** Inspect whether your lab Services show one or two IP families.
+- **Watch in prod:** Partial IPv6 enablement that only works inside the cluster.
 
 ---
 
@@ -264,6 +340,10 @@ NetworkPolicies can reference IPv4 and IPv6 CIDRs in `ipBlock` peers. Default-de
 ### In plain terms
 
 A **NetworkPolicy** selects Pods and lists who may talk to them (ingress) and whom they may call (egress). Once any policy selects a Pod in a direction, traffic not explicitly allowed in that direction is denied. Policies are additive allow-lists, not competing deny engines.
+
+This is the primary in-cluster lateral-movement control. You might think a deny rule somewhere will override allows—Kubernetes NetworkPolicy has no deny rules; isolation comes from selecting a Pod and omitting traffic from the allow-list. Mis-labeled Pods are either wide open (no selecting policy) or mysteriously blocked (selected but no matching peer).
+
+> ⚠️ **Common Pitfall:** You might think policies select Services. They select **Pods** by label—keep Service selectors and NetworkPolicy selectors aligned.
 
 ### Under the hood
 
@@ -293,11 +373,23 @@ flowchart TB
 
 > 📘 **Deep Dive (optional):** NetworkPolicy implementation is delegated to the CNI. If your plugin does not enforce policy, applying YAML does nothing useful. Verify enforcement.
 
+What breaks if labels drift between Deployment and NetworkPolicy: production traffic that worked yesterday fails after a harmless label rename—treat label contracts as API.
+
 ### In production
 
-1. Start in non-prod with default-deny plus explicit allows; promote only after traffic maps exist.
-2. Label namespaces consistently (`kubernetes.io/metadata.name` is auto-applied on modern clusters).
-3. Pair with RBAC and PSA ([Chapter 21](21-rbac-and-security.md))—policy is one layer, not the whole castle.
+**Ownership:** Security/platform own baseline policy posture; app teams own allow-lists for their namespace traffic matrix. Detect with connectivity tests in CI and denied-flow metrics (Cilium Hubble, Calico flow logs). Mitigate by generating policies from a traffic matrix, not hand-editing during incidents.
+
+| Do | Don't |
+|----|-------|
+| Start in non-prod with default-deny | Rely on policy without CNI enforcement proof |
+| Label namespaces consistently | Treat NetworkPolicy as a full security program alone |
+| Pair with RBAC and PSA (Chapter 21) | Select different labels than the Service uses |
+
+**Before you leave this section**
+
+- **Understand:** Once selected, unspecified traffic in that direction is denied; policies are allow-lists.
+- **Try:** Apply a policy that selects a Pod and observe blocked traffic.
+- **Watch in prod:** Label drift and “policy applied but CNI does not enforce.”
 
 ---
 
@@ -306,6 +398,10 @@ flowchart TB
 ### In plain terms
 
 Lock every door, then hand out specific keys: DNS, frontend to API, monitoring scrapes. Forgetting DNS is the classic foot-gun—apps fail with “name resolution” errors that look like application bugs.
+
+Default-deny is a blast-radius control: a compromised Pod should not freely scan the cluster or exfiltrate to the internet. You might think applying default-deny in production first is “more secure”—without a traffic map and staging rehearsal, you create a self-inflicted outage. Roll out detect→mitigate style: observe flows, write allows, then close the wall.
+
+> ⚠️ **Common Pitfall:** Creating a default-deny egress policy and forgetting DNS (UDP/TCP 53 to CoreDNS).
 
 ### Under the hood
 
@@ -437,9 +533,23 @@ flowchart LR
 
 ### In production
 
-1. Maintain a traffic matrix per namespace; generate policies from it when possible.
-2. Use staging to catch missing allows before production cutovers.
-3. Prefer named ports in apps and policies for clarity.
+**Ownership:** Platform publishes the default-deny + DNS allow pattern; app teams maintain the namespace traffic matrix and PR policy changes. Change safety: never apply default-deny to a busy namespace without a rollback NetworkPolicy set and a staging soak.
+
+**Failure mode:** Missing allow → total namespace outage or DNS blackhole. Detect with synthetic checks and error budgets on dependency success rates. Mitigate by applying DNS allow *with* default-deny in one change, then opening app paths incrementally.
+
+| Do | Don't |
+|----|-------|
+| Maintain a traffic matrix per namespace | Apply default-deny to prod first |
+| Prefer named ports in policies | Open `0.0.0.0/0` egress without except CIDRs |
+| Soak in staging with real clients | Forget monitoring scrape allows |
+
+> 🏭 **Production floor:** **NetworkPolicy default-deny rollout** is a controlled blast-radius change. Procedure: (1) inventory flows in staging (Hubble/flow logs/`tcpdump`), (2) commit default-deny + DNS allow + known app allows as one PR, (3) soak with synthetic probes and real canary traffic, (4) promote to prod with a revert PR ready (`kubectl delete networkpolicy default-deny-all -n <ns>` is *not* enough if other policies still select Pods—know your rollback set). Paste policy names, namespace, and probe results into the change ticket. If DNS breaks, restore DNS egress first—do not disable the entire CNI.
+
+**Before you leave this section**
+
+- **Understand:** Default-deny + explicit allows (including DNS) is the production baseline.
+- **Try:** In a scratch namespace, default-deny, prove block, add DNS and one app path.
+- **Watch in prod:** Rollouts that skip staging soak; missing monitoring or ingress peer allows.
 
 ---
 
@@ -460,7 +570,7 @@ $ kubectl describe networkpolicy allow-frontend-to-task-api -n tasks
 $ kubectl get pods -n kube-system -l k8s-app=calico-node
 ```
 
-> ⚠️ **Common Pitfall:** Creating a default-deny egress policy and forgetting DNS.
+Separate layers in the incident ticket: DNS failed / NetworkPolicy denied / CNI routing / empty EndpointSlices. That order prevents three teams changing three layers at once.
 
 ---
 
@@ -473,6 +583,8 @@ $ kubectl get pods -n kube-system -l k8s-app=calico-node
 > ⚠️ **Common Pitfall:** Overlapping Pod CIDRs with the corporate network after VPN or hybrid connect.
 
 > ⚠️ **Common Pitfall:** Enabling dual-stack Services without dual-stack CNI and firewall rules.
+
+> ⚠️ **Common Pitfall:** Creating a default-deny egress policy and forgetting DNS.
 
 ---
 

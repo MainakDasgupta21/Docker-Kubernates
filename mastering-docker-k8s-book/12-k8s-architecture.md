@@ -153,6 +153,14 @@ kube-scheduler-mastering-k8s-control-plane            mastering-k8s-control-plan
 
 > 💡 **Tip:** In kind, the control plane components run as **static Pods** on the control plane node — Pods defined by files on disk rather than by API objects. That is why they appear in `kubectl get pods -n kube-system` but have no controller managing them. Chapter 13 covers static Pods in detail.
 
+> ⚠️ **Common Pitfall:** Running an even number of etcd members "for symmetry." Quorum needs a majority; two members fail when one dies—worse than a deliberate single-node lab.
+
+**Before you leave this section**
+
+- **Understand:** Control plane decides; nodes do; everything hubs through the API server.
+- **Try:** List kube-system Pods and note which node each control-plane component runs on.
+- **Watch in prod:** etcd backup test age and control-plane replica count.
+
 ---
 
 ## 12.3 The API server: the only door
@@ -216,6 +224,14 @@ GET https://127.0.0.1:60093/api/v1/namespaces/default/pods/task-api 200 OK in 12
 
 > ⚠️ **Warning:** A component being unable to reach the API server is not the same as your app being down. During a control plane outage, running Pods keep serving traffic; what stops is *change* — no rollouts, no rescheduling, no scaling. Knowing this distinction keeps incident response calm.
 
+> 🏭 **Production floor:** Who owns the API server (managed provider vs self-hosted) owns admission policy and audit log retention. App teams escalate "forbidden" and webhook outages to that owner—do not disable admission to "unblock" a deploy without a change ticket.
+
+**Before you leave this section**
+
+- **Understand:** Authn → authz → admission → etcd; watches drive controllers.
+- **Try:** `kubectl get --raw='/readyz?verbose'` and raise `-v=6` on a get.
+- **Watch in prod:** API Priority and Fairness rejects and admission webhook latency.
+
 ---
 
 ## 12.4 etcd: the only truth
@@ -249,6 +265,12 @@ etcd_request_duration_seconds_count{operation="list",type="*core.Pod"} 96
 - **Keep objects small and few.** Events, giant ConfigMaps, and one-object-per-request patterns are what turn a healthy etcd into an incident.
 
 > 📘 **Deep Dive (optional):** Managed Kubernetes hides etcd entirely, and some distributions replace it — k3s can use SQLite or an external SQL database. The abstraction holds because only the API server ever touches the store, which is a nice demonstration of why the hub-and-spoke design pays off.
+
+**Before you leave this section**
+
+- **Understand:** etcd is the only truth; back it up and encrypt Secrets at rest.
+- **Try:** Find etcd request metrics via `kubectl get --raw='/metrics'`.
+- **Watch in prod:** fsync latency spikes and untested snapshot restores.
 
 ---
 
@@ -297,6 +319,14 @@ That message is the scheduler telling you exactly which filter rejected each nod
 - **Use topology spread constraints** to survive zone failures instead of hoping default scoring spreads replicas well (Chapter 20).
 - **Understand preemption.** Higher-priority Pods can evict lower-priority ones. Use PriorityClasses deliberately, and give platform components higher priority than batch jobs.
 - **Watch `Pending` as an SLO.** A rising count of unschedulable Pods is your earliest signal that the cluster needs to grow — it is the trigger most cluster autoscalers use.
+
+> ⚠️ **Common Pitfall:** Reading live CPU usage to explain Pending Pods. The scheduler compares **requests** to allocatable—not `kubectl top`.
+
+**Before you leave this section**
+
+- **Understand:** Filter then score; requests drive packing; FailedScheduling names the filter.
+- **Try:** Apply an unschedulable Pod and read the exact event message.
+- **Watch in prod:** Rising Pending counts before user-visible saturation.
 
 ---
 
@@ -352,6 +382,12 @@ On a cloud cluster the same command would also show `topology.kubernetes.io/regi
 - **Controller managers are leader-elected.** Only one replica is active at a time (see §12.9), so running three replicas gives you failover, not extra throughput.
 - **Cloud API rate limits are real.** A flapping Service or a thundering herd of node registrations can exhaust a cloud provider's quota and stall reconciliation cluster-wide.
 - **Out-of-tree is the rule now.** In-tree cloud providers were removed in the 1.31 cycle; on 1.36 every cloud integration is an out-of-tree cloud-controller-manager plus CSI drivers.
+
+**Before you leave this section**
+
+- **Understand:** Name the controller that owns the symptom (LB vs Deployment vs node lifecycle).
+- **Try:** Explain why LoadBalancer stays Pending on kind.
+- **Watch in prod:** Cloud API rate-limit errors stalling Service and Node reconciliation.
 
 ---
 
@@ -429,6 +465,12 @@ cgroup2fs
 - **Watch node conditions, not just `Ready`.** `MemoryPressure`, `DiskPressure`, and `PIDPressure` explain most mysterious evictions.
 - **Keep the kubelet within one minor version of the control plane.** The supported skew is that the kubelet may be up to three minor versions older than the API server, never newer.
 - **Prefer runtime-level debugging as a last resort.** `crictl` on a node is powerful and unsafe: it bypasses the API and therefore your audit trail and RBAC.
+
+**Before you leave this section**
+
+- **Understand:** kubelet starts containers via CRI; cgroup v2 enforces limits.
+- **Try:** `kubectl get nodes -o wide` and note the container runtime version.
+- **Watch in prod:** MemoryPressure/DiskPressure conditions and kubelet skew vs API server.
 
 ---
 
@@ -520,6 +562,14 @@ There is also an `apiserver-*` Lease per API server instance (used for identity 
 
 > 💡 **Tip:** If a node shows `Ready` but its Pods are unreachable, check the Lease `renewTime` first. A fresh Lease with broken workloads points at the CNI or kube-proxy; a stale Lease points at the kubelet or the network path to the API server.
 
+> 🏭 **Production floor:** Before draining nodes for upgrades, ensure workloads have PodDisruptionBudgets (Chapters 14 and 24). Lease/taint timers explain involuntary failure delay; PDBs govern voluntary drains—do not confuse the two in an incident bridge.
+
+**Before you leave this section**
+
+- **Understand:** Node Leases heartbeats; component Leases elect leaders; failover is minutes by default.
+- **Try:** Watch a node Lease `renewTime` update twice.
+- **Watch in prod:** Stale Leases and teams surprised by the ~5–6 minute eviction window.
+
 ---
 
 ## 12.9 Tracing `kubectl apply` end to end
@@ -592,6 +642,12 @@ Read the trace backwards when debugging, and the failure symptom tells you where
 | `ImagePullBackOff` | Image pull (CRI) | `kubectl describe pod`; check registry credentials |
 | `CrashLoopBackOff` | Your container | `kubectl logs <pod> --previous` |
 | `Running` but no traffic | Readiness / Service | `kubectl get endpointslices` (Chapter 15) |
+
+**Before you leave this section**
+
+- **Understand:** apply → etcd → schedule → kubelet → Ready; debug by stage.
+- **Try:** Watch events while applying a Pod and label each Reason with a component.
+- **Watch in prod:** ImagePullBackOff and FailedScheduling as first-line signals.
 
 ---
 
@@ -680,6 +736,12 @@ DNS follows namespaces: a Service `task-db` in namespace `tasks` is reachable as
 - **Namespaces are not a security boundary between untrusted tenants.** Nodes, kernel, and many cluster-scoped resources are shared. Hostile multi-tenancy needs separate clusters or virtual control planes.
 - **Deleting a namespace deletes everything in it,** asynchronously, and can hang on finalizers. `kubectl get namespace <ns> -o yaml` and looking at `spec.finalizers` and `status.conditions` explains a stuck `Terminating`.
 
+**Before you leave this section**
+
+- **Understand:** Namespaces scope names/quotas/RBAC—not the kernel.
+- **Try:** Create a namespace, set context, and resolve a Service short name from inside it.
+- **Watch in prod:** Stuck Terminating namespaces and namespaces without quotas/PSS.
+
 ---
 
 ## 12.11 Labels and selectors
@@ -735,6 +797,12 @@ Two neighboring concepts that are *not* labels:
 - **A Deployment's `spec.selector` is immutable.** Choose selector labels you will never need to change, and keep volatile information (version, build ID) in *template* labels and annotations only.
 - **Beware overlapping selectors.** Two controllers whose selectors match the same Pods will fight over them, producing endless creation and deletion. Include a unique `app` label in every selector.
 - **Label for cost and ownership too.** `team`, `cost-center`, and `env` labels are how you answer "who owns this and what does it cost" six months later.
+
+**Before you leave this section**
+
+- **Understand:** Labels wire Services and controllers; selectors on Deployments are immutable.
+- **Try:** Equality and set-based `kubectl get pods -l` queries.
+- **Watch in prod:** Overlapping selectors causing controller fights.
 
 ---
 
@@ -812,6 +880,12 @@ Beyond owner references, two related cleanup mechanisms are worth knowing: **fin
 - **Do not rely on cascading deletes for data safety.** Deleting a StatefulSet does not delete its PersistentVolumeClaims by default; that asymmetry is deliberate and has saved many databases (Chapter 18).
 - **Monitor node disk and image GC thresholds.** Nodes that never reclaim images hit `DiskPressure` and start evicting Pods for reasons that have nothing to do with your application.
 
+**Before you leave this section**
+
+- **Understand:** ownerReferences drive GC; orphan/foreground/background change the story.
+- **Try:** Inspect ownerReferences on a Deployment Pod; orphan a Deployment once in lab.
+- **Watch in prod:** Stuck finalizers and accidental data loss assumptions on delete.
+
 ---
 
 ## 12.13 API groups and versions
@@ -878,6 +952,12 @@ Objects are stored once and served in any supported version of their group, whic
 - **Custom resources join the same system.** A CRD adds a group and version and then behaves like everything else — same `kubectl`, same RBAC, same garbage collection. That uniformity is what makes operators feel native (Chapter 23).
 
 > 💡 **Tip:** `kubectl explain --recursive deployment.spec` prints the full field tree your cluster actually supports. It beats searching the web when you need to know whether a field exists in *your* version.
+
+**Before you leave this section**
+
+- **Understand:** Prefer GA APIs; audit deprecations before upgrades.
+- **Try:** `kubectl api-versions` and `kubectl api-resources --namespaced=false`.
+- **Watch in prod:** Manifests still on removed beta APIs after an upgrade.
 
 ---
 
@@ -953,6 +1033,12 @@ A five-minute health sweep, in order:
 5. `kubectl get --raw='/readyz?verbose'` — is the API server itself healthy in every subsystem?
 
 Write those five commands down. They resolve a surprising share of incidents before you ever look at application logs.
+
+**Before you leave this section**
+
+- **Understand:** A five-command health sweep beats guessing at app logs first.
+- **Try:** Run the sweep on your kind cluster and save the output.
+- **Watch in prod:** Whether on-call actually runs the sweep before paging app owners.
 
 ---
 

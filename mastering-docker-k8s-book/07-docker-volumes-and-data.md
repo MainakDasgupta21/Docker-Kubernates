@@ -32,6 +32,10 @@ Containers are disposable on purpose. You want to delete and recreate freely for
 
 If you write a file inside a container and then `docker rm` that container, the file is gone. A *stopped* container keeps its writable layer; a *removed* container does not.
 
+The distinction that trips people up is **stopped versus removed**. A stopped container is a parked car — the luggage in the trunk is still there when you start it again. A removed container is a car sent to the crusher — trunk and all. Because the whole point of containers is that you delete and recreate them freely (for upgrades, config changes, image bumps), any data living only in that writable layer is on borrowed time. It will survive your `stop`/`start` testing and then vanish the first time a deploy does `docker rm` and `docker run` with a new image.
+
+> ⚠️ **Common Pitfall:** You might conclude "my data persisted, so the container filesystem is fine" after a `docker restart`. Restart keeps the same container and its writable layer, so the test passes — and gives false confidence. The data loss only shows up on *removal*, which is exactly what your upgrade pipeline does.
+
 ### Under the hood
 
 ```bash
@@ -59,9 +63,21 @@ flowchart LR
 
 *Figure 07.1: Stopping keeps the writable layer; removing the container deletes it — and any data that lived only there.*
 
+**What breaks if X:** the writable layer is per-container, so even "same image, same name" gives you a brand-new empty layer after removal. There is no hidden merge, no recovery flag, no `--keep-data`. Once the container is removed, the writable layer is deleted by the storage backend and the space is reclaimed — the file is not in a trash can, it is gone.
+
 ### In production
 
 Treat the container filesystem as ephemeral scratch. Persist deliberately with volumes (or bind mounts in carefully controlled cases). Databases that write only to the writable layer are a production incident waiting to happen.
+
+**Who owns this:** the app team owns the decision of *what* must persist; the platform team owns *where* it persists (which volume, which backing storage, which backup job). The incident that crosses both is a stateful service — a database, an upload directory, a queue — that was never given a volume, ran fine for weeks, and lost everything the day an unrelated image bump triggered a recreate.
+
+**Failure mode and detection:** you rarely get a warning; the container is healthy right up to removal. Catch it in review, not in prod: audit that every stateful service declares a `-v`/`--mount`, and treat "database with no volume" as a blocking finding. **Do** map every path a service writes real data to onto a named volume; **don't** trust `docker restart` survival as evidence of persistence.
+
+**Before you leave this section**
+
+- **Understand:** writes land in a per-container writable layer that survives stop/start but is destroyed by `docker rm`.
+- **Try:** write a file in an Alpine container, `restart` it (file survives), then `rm` and recreate it (file gone) — feel the difference.
+- **Watch in prod:** stateful services with no volume that pass restart tests and lose data on the next recreate/upgrade.
 
 ---
 
@@ -70,6 +86,10 @@ Treat the container filesystem as ephemeral scratch. Persist deliberately with v
 ### In plain terms
 
 A **named volume** is Docker-managed storage you refer to by name. You do not care where it lives on disk; Docker places it under its data root and keeps it when containers come and go.
+
+The value of "you do not care where it lives" is portability and safety. You reference `app-data` by a stable name; Docker handles the on-disk path, permissions plumbing, and lifecycle. The volume has an independent life from any container — you can stop the database, delete its container, start a new container on a newer Postgres image, point it at the same `app-data`, and your rows are still there. That decoupling is precisely what the writable layer could not give you.
+
+> ⚠️ **Common Pitfall:** You might think "volume" and "the writable layer" are two names for the same thing. They are not: the writable layer is copy-on-write scratch tied to one container's lifecycle, while a named volume is a separate, Docker-managed store that outlives containers and takes a faster, direct I/O path (Section 07.7). Confusing them is why people put databases in the wrong place.
 
 ### Under the hood
 
@@ -116,9 +136,21 @@ $ docker run -d --name db \
     postgres:16
 ```
 
+If you mount the same named volume into a second container, both see the same files — useful for a sidecar backup job, dangerous if two writers assume exclusive access. **What breaks if X:** two Postgres containers pointed at one `app-data` volume will corrupt it; a database expects to be the sole owner of its data directory. Volume sharing is safe for read-mostly content, not for two processes that both write the same files.
+
 ### In production
 
 Name every volume that holds real data. Prefer named volumes for databases and application state. Avoid anonymous volumes from bare `VOLUME` instructions when you care about finding and backing up the data later — they are easy to lose track of, and `docker rm -v` deletes them with the container.
+
+**Who owns this:** the app team owns naming and knowing which volume holds which dataset; the platform team owns where the Docker data root lives, its disk capacity, and whether it is backed up. The recurring failure is the **anonymous volume**: a bare `VOLUME /data` in an image or a `-v /data` with no name creates a random-hashed volume that nobody can identify later, so it is neither backed up nor cleaned up — it just accumulates until disk fills.
+
+**Failure mode and detection:** run `docker volume ls` and look for a growing list of hex-named volumes with no owner; those are anonymous volumes leaking disk. Detect capacity pressure by monitoring the filesystem under the Docker data root. **Do** give every real dataset an explicit name and label (`--label app=tasks`); **don't** rely on anonymous volumes for anything you would miss.
+
+**Before you leave this section**
+
+- **Understand:** named volumes are Docker-managed, name-addressable, and outlive containers; they take a native I/O path, unlike the writable layer.
+- **Try:** create `app-data`, write to it from one container, remove that container, mount the same volume in a fresh container, and confirm the data survived.
+- **Watch in prod:** anonymous volumes piling up unnamed and unbacked-up, and two writers sharing one volume corrupting it.
 
 ---
 
@@ -127,6 +159,10 @@ Name every volume that holds real data. Prefer named volumes for databases and a
 ### In plain terms
 
 A **bind mount** maps a specific host path into the container. Edit files on your laptop; the container sees the change immediately. That tight loop is why bind mounts dominate local development.
+
+The trade-off is that a bind mount ties the container to a *specific host's directory layout*. Where a named volume says "give me managed storage, I don't care where," a bind mount says "use exactly `/home/dev/project/site` on this machine." That is perfect for development — your editor and the container share the same files in real time — and fragile for production, because the path may not exist on another host, and the container now reads and writes with the host's raw UID/GID and permissions.
+
+> ⚠️ **Common Pitfall:** You might expect a bind mount to behave like a named volume when the target directory has files in the image — copying them out first. It does not. A bind mount *covers* the target: whatever is on the host path wins, and image content at that path becomes invisible. Mount an empty host dir over `/etc/nginx` and nginx sees an empty config directory.
 
 ### Under the hood
 
@@ -151,7 +187,17 @@ $ docker run -d --mount type=bind,source="$(pwd)/site",target=/usr/share/nginx/h
 
 Bind mounts depend on host directory layout, skip copy-on-first-mount, and share raw UID/GID with the host. That makes them less portable and more permission-sensitive than named volumes. Use them for live source and host config in development; prefer named volumes (or Kubernetes PVCs later) for production state.
 
-> ⚠️ **Common Pitfall:** Binding an empty host directory over a path that had files in the image *hides* those files. If the app's config directory suddenly looks empty, check your mounts.
+**Who owns this:** whoever writes the run/Compose definition owns the host-path assumption. A bind mount is a coupling between the container and one machine's filesystem, so it is the app team's job to document it and the platform team's job to guarantee the path exists with the right ownership on every host that runs the workload.
+
+**Failure mode and detection:** two failure shapes dominate. First, **permission mismatches** — the container process runs as UID 1000 but the host directory is owned by root, so writes fail with `permission denied`; on SELinux hosts you also need `:z`/`:Z` labels or the mount is silently unreadable. Second, a bind mount of a sensitive host path (`/`, `/var/run/docker.sock`, `/etc`) hands the container far more of the host than intended. Detect the first with the app's own error logs and `ls -ln` on the host path; detect the second in review. **Do** keep bind mounts read-only (`:ro`) whenever the container only reads; **don't** bind-mount the Docker socket or host root into application containers.
+
+> 🏭 **Production floor:** Bind mounts read and write the host filesystem directly with the container's UID/GID and no Docker-managed boundary. Mounting a sensitive host path — the Docker socket, `/etc`, or `/` — gives a compromised container a direct lever on the host, so treat any such mount as a change-managed, security-reviewed decision. Default to `:ro`, scope the path as narrowly as possible, and prefer named volumes for anything that is real production state rather than live-edited source.
+
+**Before you leave this section**
+
+- **Understand:** bind mounts map a specific host path in, share host UID/GID, skip copy-on-first-mount, and hide image content at the target.
+- **Try:** serve `./site/index.html` with `-v "$(pwd)/site:/usr/share/nginx/html:ro"`, edit on the host, refresh, and watch the change appear live.
+- **Watch in prod:** permission/SELinux-label failures and over-broad host paths (socket, `/etc`, `/`) mounted into app containers.
 
 ---
 
@@ -161,6 +207,10 @@ Bind mounts depend on host directory layout, skip copy-on-first-mount, and share
 
 A **tmpfs** mount lives in RAM. Fast, never written to disk, gone when the container stops. Ideal for scratch, caches, or secrets you do not want lingering on disk.
 
+The deciding property is *where the bytes physically live*. Named volumes and bind mounts persist on disk; a tmpfs mount is memory that merely looks like a directory. That makes it the natural home for two very different needs: throwaway speed (a scratch or cache directory a batch job rewrites constantly) and disk hygiene (a decrypted secret or session token you specifically do not want surviving on the host's disk, where forensics or a stray backup could recover it).
+
+> ⚠️ **Common Pitfall:** You might treat tmpfs as "just a fast volume" and forget it competes for real RAM. An unbounded or oversized tmpfs under load can consume enough memory to trigger the kernel OOM killer, which then reaps *some other* container — a confusing incident where the victim is not the culprit. Always cap it with `size=`.
+
 ### Under the hood
 
 ```bash
@@ -169,11 +219,19 @@ $ docker run -d --name worker \
     my-batch-job:1.0
 ```
 
-tmpfs mounts are Linux-oriented in classic Engine usage and cannot be shared between containers the way named volumes can.
+tmpfs mounts are Linux-oriented in classic Engine usage and cannot be shared between containers the way named volumes can — each container gets its own private in-memory filesystem, and it evaporates when that container stops. **What breaks if X:** anything written to a tmpfs path is gone on stop, restart, or crash, so treating it as durable storage loses data by design; and because it is per-container, you cannot use it to hand files between containers.
 
 ### In production
 
 Pair tmpfs with `--read-only` root filesystems (Chapter 10) so temporary paths still work. Size the mount; unbounded tmpfs can pressure host memory under load.
+
+**Who owns this:** the app team owns which paths are scratch versus durable and sets the `size=` cap based on real working-set measurements. **Failure mode and detection:** watch host memory and container OOM events (`docker events`, `dmesg` OOM lines) — a runaway tmpfs shows up as memory pressure rather than a disk-full error. **Do** size every tmpfs and use it to keep secrets off disk; **don't** point durable state at it or leave it uncapped.
+
+**Before you leave this section**
+
+- **Understand:** tmpfs is RAM-backed, per-container, non-persistent, and counts against host memory.
+- **Try:** run a container with `--tmpfs /scratch:rw,size=100m`, write a file, stop and restart it, and confirm the file is gone.
+- **Watch in prod:** uncapped or oversized tmpfs mounts driving memory pressure and OOM kills that hit an innocent bystander container.
 
 ```mermaid
 flowchart TB
@@ -214,6 +272,10 @@ Volumes hold the data you deliberately persist. Image layers and the container's
 ### In plain terms
 
 Think of image layers as floors of a building and the running container as a temporary rooftop patio. The patio can change; the floors underneath stay shared and read-only until someone rewrites a tile — then Docker copies that tile onto the patio first (**copy-on-write**). Volumes are a separate filing cabinet bolted on from outside the building: they bypass that copy-on-write path for native-speed I/O.
+
+The backend that manages those floors and the patio is what changed in Docker Engine 29.x. It used to be a Docker-specific component (a **graph driver** such as `overlay2`); the modern default on fresh installs is the **containerd image store**, the same storage machinery Kubernetes nodes already use under the hood. For everyday work you rarely touch it — but knowing which backend you are on matters the day you migrate, debug disk usage, or hit the `userns-remap` incompatibility below.
+
+> ⚠️ **Common Pitfall:** You might assume every Docker 29 host uses the containerd image store. Only *fresh* Engine 29.x installs default to it; a host **upgraded** from an older Engine typically keeps the legacy `overlay2` graph driver until you deliberately migrate. Never assume — check with `docker info` before making claims about a given machine.
 
 ```mermaid
 flowchart TB
@@ -284,6 +346,14 @@ The containerd image store is **incompatible with `userns-remap`**. If your secu
 
 > 💡 **Tip:** On Docker Desktop, the containerd image store is already the default on modern clean installs. Desktop users usually do not edit graph-driver settings the way Linux Engine admins do.
 
+**Who owns this:** the platform team owns the storage backend decision, the migration plan, and disk monitoring on the data roots; app teams should never flip `containerd-snapshotter` on a shared daemon on a whim. **Failure mode and detection:** the two migration surprises are (1) local images appearing to vanish after the switch — they are hidden, not deleted, and reappear if you switch back or after you push/`docker save` them first — and (2) enabling the containerd image store on a `userns-remap` daemon, an **unsupported combination**. Detect the backend with `docker info --format '{{.Driver}}'` (`overlayfs` = containerd image store, `overlay2` = legacy graph driver) and confirm `userns-remap` status before any migration. **Do** push or save local images before switching; **don't** enable it on a remapped daemon without first retiring or replacing remapping.
+
+**Before you leave this section**
+
+- **Understand:** fresh Engine 29.x installs default to the containerd image store (snapshotters like `overlayfs`, content under paths such as `/var/lib/containerd`); many upgraded hosts stay on deprecated `overlay2`; volumes bypass copy-on-write either way.
+- **Try:** run `docker info --format '{{.Driver}}'` and record whether you are on `overlayfs` or `overlay2`, and note which data roots exist.
+- **Watch in prod:** local images "disappearing" after switching stores (hidden, not deleted), and the unsupported containerd-image-store + `userns-remap` combination.
+
 ---
 
 ## 07.8 Backup and restore
@@ -291,6 +361,10 @@ The containerd image store is **incompatible with `userns-remap`**. If your secu
 ### In plain terms
 
 Do not dig through `/var/lib/docker` by hand. Run a short-lived helper container that mounts the volume and a host backup directory, then archive with `tar`.
+
+The reason for the helper-container pattern is that a volume's on-disk location is an implementation detail Docker owns — poking at `/var/lib/docker/volumes/...` directly is brittle, breaks under the containerd image store, and risks corrupting data if you touch files a running container is using. Instead you let a throwaway container mount the volume the normal way, alongside a host directory, and `tar` bridges the two. It is portable, works the same on every backend, and never assumes a path.
+
+> ⚠️ **Common Pitfall:** You might expect `docker volume prune` to only remove truly junk volumes. By default it removes unused *anonymous* volumes — but `--all` also sweeps unused *named* volumes, and "unused" only means "no container currently references it." A database volume whose container is temporarily stopped or recreated can look unused and get deleted. This is an irreversible, data-losing command.
 
 ### Under the hood
 
@@ -341,9 +415,23 @@ $ docker volume prune
 
 `docker volume prune` removes unused *anonymous* volumes by default; `--all` also removes unused *named* volumes — think twice.
 
+**What breaks if X:** there is no undo. `docker volume rm app-data` or a too-broad `docker volume prune --all` deletes the backing data immediately; unlike `docker rm` on a container, nothing about the image or a registry can reconstruct volume contents. The only recovery is the backup you took beforehand — which is the entire point of this section.
+
 ### In production
 
 A file-level copy of a *running* database can capture a torn, inconsistent state. Stop the container first, or — better — use the database's own tooling (`pg_dump`, `mysqldump`) and archive that output. Automate backups; test restores on a schedule, not on incident day.
+
+**Who owns this:** the platform/on-call team owns backup automation and restore drills; the app team owns knowing which volumes are precious and how to produce a consistent dump for its datastore. The incident nobody forgets is a reflexive `docker volume prune --all` or a copy-pasted `docker system prune --volumes` on the wrong host that wipes a production database with no tested restore path.
+
+**Failure mode and detection:** the failure is total and instantaneous, so the only meaningful "detection" is prevention plus verified backups. Test restores on a schedule and alert if a backup job stops producing artifacts. **Do** protect prod hosts from bulk prune commands and keep an off-host copy of backups; **don't** run `prune --all`/`system prune --volumes` interactively on anything holding real data.
+
+> 🏭 **Production floor:** `docker volume rm` and `docker volume prune --all` (and `docker system prune --volumes`) are irreversible data-deletion commands with no image or registry to fall back on. Treat them as change-managed on any host with production data: require an explicit named target rather than a blanket prune, confirm a fresh tested backup exists first, and never run bulk prune commands on a shared or production host out of habit. A single misfired prune is a full data-loss incident, not a cleanup.
+
+**Before you leave this section**
+
+- **Understand:** back up volumes with a throwaway container + `tar` (backend-agnostic), and volume deletion is irreversible with no fallback but your backup.
+- **Try:** back up `notes-data` to the host, delete the volume, restore into a fresh volume, and verify the contents match.
+- **Watch in prod:** bulk `prune --all`/`system prune --volumes` on hosts with real data, and backups that silently stop or were never restore-tested.
 
 ---
 

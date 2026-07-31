@@ -33,6 +33,10 @@ If you only use the container writable layer, you will lose data the first time 
 
 Ephemeral volumes are sticky notes on the hotel room desk. Useful while you are there; gone when you check out. Use them for caches, scratch space shared by containers in one Pod, or projected configuration—not for the database that must survive a redeploy.
 
+The problem they solve is real: containers need somewhere to write temporary files, share a scratch directory with a sidecar, or hold a short-lived cache without provisioning a cloud disk. The misconception is treating “it survived a container restart” as “it is durable.” A container restart keeps the Pod (and thus `emptyDir`); a Pod reschedule, Deployment rollout, or node drain does not.
+
+> ⚠️ **Common Pitfall:** You might think writing under `/tmp` in the container is “temporary but safe enough.” The container writable layer and `/tmp` die with the container or Pod—there is no reclaim policy, no snapshot, and no restore path.
+
 ### Under the hood
 
 | Volume type | Lifetime | Typical use |
@@ -127,12 +131,23 @@ flowchart TB
 
 ### In production
 
-1. Set `sizeLimit` on `emptyDir` so a runaway cache cannot fill the node disk.
-2. Prefer Memory `emptyDir` only for small, sensitive, or high-churn scratch—it consumes node RAM.
-3. Do not put databases on ephemeral volumes and hope for the best.
-4. Generic ephemeral volumes still consume CSI capacity while the Pod runs; track them in quotas.
+**Ownership:** App teams choose ephemeral vs durable; platform owns node disk pressure SLOs and default `emptyDir` guidance.
+
+**Failure mode:** A cache without `sizeLimit` fills the node disk → kubelet disk-pressure eviction of *other* workloads. Detect with node condition `DiskPressure`, kubelet eviction events, and container filesystem usage metrics. Mitigate with `sizeLimit`, Memory `emptyDir` only for small scratch, and alerts on node disk utilization.
+
+| Do | Don't |
+|----|-------|
+| Set `sizeLimit` on every `emptyDir` | Put databases or uploads on ephemeral volumes |
+| Prefer Memory `emptyDir` only for small, high-churn scratch | Assume “it survived one restart” means durable |
+| Track generic ephemeral CSI usage in quotas | Ignore that ephemeral CSI still bills while the Pod runs |
 
 > 💡 **Tip:** Treat anything under the container root filesystem as disposable. Persist deliberately with a PVC (or an object store outside the cluster).
+
+**Before you leave this section**
+
+- **Understand:** Ephemeral data dies with the Pod (or container); only PVCs (or external stores) outlive reschedules.
+- **Try:** Write to `emptyDir`, delete the Pod, recreate, and confirm the file is gone.
+- **Watch in prod:** Node `DiskPressure` and Pods without `sizeLimit` on large caches.
 
 ---
 
@@ -141,6 +156,10 @@ flowchart TB
 ### In plain terms
 
 Kubernetes separates **who provides storage** from **who consumes it**. A **PV** is a piece of storage that exists in the cluster. A **PVC** is a namespaced request (“I need 20Gi, ReadWriteOnce”). A **StorageClass** is the recipe that creates PVs on demand. Developers claim; platform teams control how disks appear.
+
+This split exists so app teams can request capacity without knowing vendor disk APIs, while platform engineers keep reclaim policies, topology, and cost classes under change control. You might think a PVC “is” the disk—it is not. The PVC is a ticket; the PV (and the CSI volume behind it) is the inventory item. Delete the ticket under the wrong reclaim policy and the inventory item vanishes with it.
+
+> ⚠️ **Common Pitfall:** You might think deleting a PVC is as safe as deleting a Deployment. With `reclaimPolicy: Delete`, the underlying cloud disk usually goes with it—often with no recycle bin.
 
 ### Under the hood
 
@@ -251,14 +270,27 @@ Key StorageClass fields:
 - **`allowVolumeExpansion`** — whether PVC size can grow
 - **`volumeBindingMode`** — `Immediate` vs `WaitForFirstConsumer` (prefer the latter for zonal disks)
 
-With `WaitForFirstConsumer`, a PVC staying `Pending` until a Pod schedules is **expected**.
+With `WaitForFirstConsumer`, a PVC staying `Pending` until a Pod schedules is **expected**. What breaks if you force `Immediate` on zonal block disks: the provisioner may create the volume in zone A while the scheduler later places the Pod in zone B—mount fails or the Pod never schedules.
 
 ### In production
 
-1. Prefer CSI StorageClasses over legacy in-tree provisioners on Kubernetes 1.36.
-2. Use `Retain` for irreplaceable data classes; know that cloud defaults often use `Delete`.
-3. Align access modes with the backend—asking for RWX on a block-only class leaves PVCs Pending forever.
-4. A multi-replica Deployment sharing one RWO PVC will strand replicas; use StatefulSet `volumeClaimTemplates`, RWX, or object storage.
+**Ownership:** Platform owns StorageClass catalog (provisioner, reclaim, binding mode, expansion). App teams own PVC size and access-mode choice against that catalog. Incident evidence: `kubectl get pvc,pv,sc`, PVC Events, CSI controller logs.
+
+**Failure mode:** Wrong access mode or class → PVC Pending forever; multi-replica Deployment + one RWO PVC → stranded replicas. Detect with Pending PVC age alerts and Deployment unavailable replicas. Mitigate with catalog docs, admission policies that reject incompatible combinations, and StatefulSet templates for per-replica disks.
+
+| Do | Don't |
+|----|-------|
+| Prefer CSI classes on Kubernetes 1.36 | Use legacy in-tree provisioners for new work |
+| Use `Retain` for irreplaceable data classes | Assume cloud defaults (`Delete`) are safe for databases |
+| Prefer `WaitForFirstConsumer` for zonal disks | Ask for RWX on a block-only class |
+
+> 🏭 **Production floor:** Treat PVC deletion as a **data-plane change**, not cleanup. Require reclaim-policy check in the change ticket (`kubectl get pvc <name> -o jsonpath='{.spec.storageClassName}'` then inspect the class / PV reclaim policy). For `Delete` classes, snapshot or backup **before** delete; for `Retain`, schedule admin reclaim of Released PVs so you do not leak cost or orphan disks. Paste PV name, reclaim policy, and snapshot ID into the incident or change record.
+
+**Before you leave this section**
+
+- **Understand:** PVC requests; PV provides; StorageClass recipes dynamic disks; reclaim policy decides fate on PVC delete.
+- **Try:** Create a dynamic PVC, inspect bound PV reclaim policy, and note what would happen on delete.
+- **Watch in prod:** Pending PVCs older than a few minutes; accidental deletes on `Delete` reclaim classes.
 
 ---
 
@@ -267,6 +299,10 @@ With `WaitForFirstConsumer`, a PVC staying `Pending` until a Pod schedules is **
 ### In plain terms
 
 CSI (Container Storage Interface) is the plug that lets Kubernetes talk to Amazon EBS, Azure Disk, GCE PD, Ceph, Longhorn, and dozens of others without baking vendor code into Kubernetes itself. Drivers run as controllers plus node plugins; your apps stay portable by changing `storageClassName`.
+
+Without CSI, every storage vendor would need code inside Kubernetes. With CSI, the vendor ships a driver; you ship StorageClasses. The misconception is “storage is the cloud console’s problem”—from the app’s view, FailedMount and Pending PVCs *are* your outage, and the CSI DaemonSet is on the critical path.
+
+> ⚠️ **Common Pitfall:** You might think expanding a PVC is always online and instant. Filesystem resize can require a remount or Pod restart; shrinking is generally unsupported.
 
 ### Under the hood
 
@@ -306,16 +342,27 @@ persistentvolumeclaim/task-db-data patched
 
 Filesystem resize may require a remount or Pod restart depending on the driver. You generally **cannot shrink** PVC size.
 
-Zone-aware disks must live where the consumer runs. `WaitForFirstConsumer` lets the scheduler pick a node first; then the provisioner creates the disk in that topology. Immediate binding can trap a PVC in zone A while free capacity sits in zone B.
+Zone-aware disks must live where the consumer runs. `WaitForFirstConsumer` lets the scheduler pick a node first; then the provisioner creates the disk in that topology. Immediate binding can trap a PVC in zone A while free capacity sits in zone B. What breaks if the CSI node plugin is down on a worker: new mounts fail with FailedMount even though the PV looks Bound.
 
 ### In production
 
-1. Monitor CSI controller and node DaemonSet health—storage outages often look like “Pods Pending / FailedMount.”
-2. Test expansion in staging; some filesystems need explicit resize2fs-style steps handled by the driver.
-3. Document which classes are RWO vs RWX and which zones they span.
-4. Avoid `hostPath` for HA production data; it bypasses the PV model and pins you to one node.
+**Ownership:** Platform owns CSI driver lifecycle (DaemonSet/controller health, upgrades). App teams own expansion requests and verifying the app tolerates resize. Detect CSI failure via FailedMount events, CSI controller CrashLoop, and volume attachment timeouts.
+
+**Failure mode:** CSI controller outage → new PVCs stuck Pending; node plugin outage → Pods cannot mount on that node. Mitigate with DaemonSet disruption budgets where supported, staged driver upgrades, and runbooks that check `kubectl describe pvc/pod` before blaming the app.
+
+| Do | Don't |
+|----|-------|
+| Monitor CSI controller and node DaemonSets | Ignore FailedMount as “app bug” |
+| Test expansion in staging first | Assume shrink works |
+| Document RWO vs RWX and zone span per class | Use `hostPath` for HA production data |
 
 > 📘 **Deep Dive (optional):** In-tree volume plugins are deprecated in favor of CSI. Always prefer CSI StorageClasses on Kubernetes 1.36.
+
+**Before you leave this section**
+
+- **Understand:** CSI provisions and mounts; topology + WaitForFirstConsumer keep zonal disks with their Pods.
+- **Try:** Patch a PVC size upward on an expandable class and watch PVC conditions / Pod events.
+- **Watch in prod:** CSI DaemonSet readiness and FailedMount spikes after node or driver upgrades.
 
 ---
 
@@ -324,6 +371,10 @@ Zone-aware disks must live where the consumer runs. `WaitForFirstConsumer` lets 
 ### In plain terms
 
 Mount the claim by name. The volume name inside the Pod is arbitrary; `claimName` must match the PVC. For databases, give each replica its own claim via StatefulSet templates—like assigning each musician their own locked trunk, not one shared suitcase.
+
+Deployments are for interchangeable replicas; StatefulSets are for identity-bound storage. Mixing them—N Deployment replicas on one RWO PVC—is the most common storage scheduling outage for newcomers. You might think “the Service will load-balance writes across replicas onto one disk”; the kubelet will refuse to mount that disk on a second node, and extra Pods stay Pending.
+
+> ⚠️ **Common Pitfall:** You might think deleting a StatefulSet with `kubectl delete sts` also deletes its PVCs. By default it does **not**—ordinal PVCs remain unless you delete them explicitly (or use the appropriate cleanup policy). That is usually good for data safety and surprising for cost.
 
 ### Under the hood
 
@@ -390,11 +441,25 @@ $ kubectl exec deploy/task-api -- sh -c 'echo hello > /data/uploads/note.txt && 
 hello
 ```
 
+What breaks if you change `storageClassName` on an existing PVC: the API rejects it—you must create a new claim and copy data (or restore from snapshot).
+
 ### In production
 
-1. Pin important StatefulSet StorageClasses and reclaim policies before go-live.
-2. Backup application data independently of etcd backups (Chapter 24).
-3. Plan PVC migration: you cannot change `storageClassName` on an existing PVC—create a new claim and copy data.
+**Ownership:** App team owns Deployment vs StatefulSet choice and mount paths; platform owns approved StorageClasses and backup tooling. For databases, treat PVC + snapshot schedule as part of the service’s RPO/RTO, not an afterthought.
+
+**Failure mode:** Scale Deployment with shared RWO → Pending replicas; orphaned StatefulSet PVCs after delete → cost leak. Detect with unavailable replica alerts and cost/orphan PV reports. Mitigate with architecture review gates and explicit PVC cleanup checklists.
+
+| Do | Don't |
+|----|-------|
+| Pin StorageClass and reclaim policy before go-live | Change `storageClassName` in place |
+| Backup app data independently of etcd | Assume etcd backup restores PVC contents |
+| Use `volumeClaimTemplates` for per-replica disks | Share one RWO PVC across Deployment replicas |
+
+**Before you leave this section**
+
+- **Understand:** One RWO PVC ≠ N Deployment replicas; StatefulSet templates create per-ordinal PVCs.
+- **Try:** Mount a PVC in a one-replica Pod, write a file, recreate the Pod, confirm persistence.
+- **Watch in prod:** Orphaned PVCs after StatefulSet teardown; Pending Pods after scale-up on RWO.
 
 ---
 
@@ -404,7 +469,9 @@ hello
 
 A **VolumeSnapshot** is a point-in-time picture of one volume—like photographing one filing cabinet drawer. A **VolumeGroupSnapshot** (GA in Kubernetes **1.36**) photographs several drawers *at the same instant* so multi-volume apps (database data + WAL, or several tablespace PVCs) get a crash-consistent recovery point across the set.
 
-Crash-consistent is not application-consistent: buffers not flushed to disk may be missing, just as after a power loss. For true application consistency, quiesce the app (or use its native backup) around the snapshot.
+Crash-consistent is not application-consistent: buffers not flushed to disk may be missing, just as after a power loss. For true application consistency, quiesce the app (or use its native backup) around the snapshot. Snapshots solve “I need a restore point without copying terabytes slowly”; they do not by themselves prove you can meet RTO—only a tested restore does.
+
+> ⚠️ **Common Pitfall:** You might think “GA VolumeGroupSnapshot” means every CSI driver can do it. The API can be installed while the driver still returns “unimplemented.” Always verify driver support before promising group restore in an SLO.
 
 ### Under the hood
 
@@ -495,12 +562,25 @@ NAME                                                   READYTOUSE   SOURCEPVC   
 volumesnapshot.snapshot.storage.k8s.io/task-db-snap…   true         task-db-data    20Gi
 ```
 
+What breaks if `readyToUse` never becomes true: restore PVCs stay Pending; check VolumeSnapshotContent events and CSI snapshotter logs—often quota, permissions, or missing driver RPCs.
+
 ### In production
 
-1. Confirm your CSI driver supports snapshots (and group snapshots separately)—the API being GA does not mean every driver implements it.
-2. Automate snapshot lifecycle (schedule, retention, tested restore) rather than one-off YAML.
-3. Prefer group snapshots when consistency across multiple PVCs matters; otherwise single VolumeSnapshots are simpler.
-4. Practice restore in a scratch namespace before you need it in an incident.
+**Ownership:** Platform owns snapshot CRDs/controllers and VolumeSnapshotClass catalog; app teams own schedule, retention, and **tested restore** for their data. RPO/RTO owners must include restore drills in the service runbook.
+
+**Failure mode:** Snapshots succeed but restores never practiced → incident extends into data loss theater. Detect with restore drill cadence metrics and `readyToUse=false` age. Mitigate with automated restore-to-scratch-namespace jobs and retention that matches compliance, not “keep forever.”
+
+| Do | Don't |
+|----|-------|
+| Verify driver snapshot *and* group support separately | Equate crash-consistent with app-quiesced |
+| Automate schedule, retention, and restore tests | Rely on one-off YAML from an old ticket |
+| Prefer group snapshots for multi-PVC consistency | Skip labeling PVCs that must join a group |
+
+**Before you leave this section**
+
+- **Understand:** Snapshots are restore points; group snapshots align multiple PVCs; GA ≠ universal driver support.
+- **Try:** Snapshot a lab PVC, restore via `dataSource`, confirm file contents.
+- **Watch in prod:** Snapshot `readyToUse`, restore drill success rate, snapshot storage cost.
 
 ---
 
@@ -509,6 +589,10 @@ volumesnapshot.snapshot.storage.k8s.io/task-db-snap…   true         task-db-da
 ### In plain terms
 
 **VolumeAttributesClass** lets you change mutable volume parameters (IOPS, throughput, and similar vendor knobs) after the volume exists—like upgrading the hotel mini-bar service tier without moving rooms. **Storage capacity** reporting helps the scheduler and operators know whether a class still has room to provision, instead of creating PVCs that sit Pending forever.
+
+Performance and capacity are day-2 problems: a database that “worked in staging” can starve under production IOPS, and a zone that looks empty in the console can still refuse new PVCs if CSI capacity objects say otherwise. You might think bumping PVC size always buys more performance—size and IOPS are often independent knobs.
+
+> ⚠️ **Common Pitfall:** You might think empty CSIStorageCapacity means “the cloud is out of disks.” It means *this driver reports no remaining capacity for that class/topology*—check quotas, reserved pools, and driver bugs before opening a cloud ticket.
 
 ### Under the hood
 
@@ -557,14 +641,25 @@ NAMESPACE     NAME                         STORAGECLASS   CAPACITY   AGE
 kube-system   csisc-us-east1-b-fast-ssd    fast-ssd       2Ti        3d
 ```
 
-With capacity-aware scheduling, the control plane can avoid placing Pods whose unbound PVCs cannot be provisioned in a given zone.
+With capacity-aware scheduling, the control plane can avoid placing Pods whose unbound PVCs cannot be provisioned in a given zone. What breaks if you change attributes without driver support: the PVC modification condition fails; the volume stays on the old performance tier while your change ticket claims success—verify with cloud metrics, not only `kubectl get pvc`.
 
 ### In production
 
-1. Treat attribute classes like SLOs: document silver/gold cost and performance expectations.
-2. Changing attributes can fail or take time; monitor PVC conditions and CSI events.
-3. Empty capacity is a first-class outage mode—alert on low CSIStorageCapacity for critical classes.
-4. Quotas on `persistentvolumeclaims` and storage requests still matter in multi-tenant clusters (Chapter 24).
+**Ownership:** Platform owns VolumeAttributesClass catalog and CSIStorageCapacity monitoring; app teams request tier changes through change control with cost approval. Treat attribute classes like SLOs: document silver/gold cost and performance expectations.
+
+**Failure mode:** Low capacity → Pending PVCs and stuck rollouts; failed attribute modify → silent under-performance. Detect with CSIStorageCapacity alerts and PVC modify conditions. Mitigate with capacity headroom per zone and staged attribute changes.
+
+| Do | Don't |
+|----|-------|
+| Alert on low CSIStorageCapacity for critical classes | Change attributes without watching PVC conditions |
+| Keep quotas on PVC count and storage requests | Assume size expansion equals IOPS upgrade |
+| Document cost per attribute class | Skip multi-tenant storage quotas (Chapter 24 / 31) |
+
+**Before you leave this section**
+
+- **Understand:** Attributes tune performance in place; CSIStorageCapacity feeds capacity-aware scheduling.
+- **Try:** `kubectl get csistoragecapacities -A` and map classes to zones.
+- **Watch in prod:** Capacity exhaustion in one zone while another looks fine; failed volume modify operations.
 
 ---
 

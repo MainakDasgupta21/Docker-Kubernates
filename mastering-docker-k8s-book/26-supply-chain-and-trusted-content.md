@@ -55,6 +55,10 @@ Docker Scout creates an inventory of an image and correlates its packages with v
 
 Scout is not merely a "critical count." A useful review considers exploitability, package location, available fixes, base-image lineage, exceptions, and whether the analyzed digest is the digest that will be deployed.
 
+Scout analyzes images for CVEs and policy issues against your repos. It helps prioritize remediation, not magically patch running clusters. You might think a green Scout local scan equals prod safety—prod must run the same digest you scanned.
+
+> ⚠️ **Common Pitfall:** Scanning `:latest` locally while prod runs an older digest.
+
 ### Under the hood
 
 Analyze a local or registry image:
@@ -94,16 +98,21 @@ Replace the placeholder with a real digest resolved by the build. Policy capabil
 
 ### In production
 
-Scan at more than one point:
+**Ownership:** App teams remediate findings; security owns severity gates in CI.
 
-- **Pull request** — catch dependency and Dockerfile changes early.
-- **Release build** — evaluate the exact digest before promotion.
-- **Registry monitoring** — detect new disclosures affecting unchanged images.
-- **Incident response** — identify deployed images containing a named package or CVE.
+**Failure mode:** Critical CVE in prod digest. Detect with continuous registry scanning on deployed digests. Mitigate with digest promote and rebuild SLAs.
 
-Do not rebuild merely to produce a more recent scan. Vulnerability intelligence changes independently of image bytes, so the same digest can receive a different assessment tomorrow. Preserve the digest, scan timestamp, database source, and policy result.
+| Do | Don't |
+|----|-------|
+| Scan the digest you deploy | Gate only on tags |
+| SLA for critical CVE rebuilds | Ignore base image drift |
 
-Define exception ownership and expiration. A waived vulnerability is a risk decision with a reason, compensating controls, an owner, and a review date—not a permanent suppression.
+**Before you leave this section**
+
+- **Understand:** Scout informs risk; digests bind scan results to what runs.
+- **Try:** Scan Task API image and note critical CVEs.
+- **Watch in prod:** Prod digests not in the scanned set.
+
 
 ## 26.3 Docker Hardened Images
 
@@ -114,6 +123,10 @@ Define exception ownership and expiration. A waived vulnerability is a risk deci
 Docker Hardened Images, or DHI, are security-focused images maintained by Docker. They emphasize minimal contents, reduced attack surface, frequent updates, and verifiable supply-chain metadata.
 
 They can reduce the work involved in producing and documenting a trusted base. They do not make the application layered on top automatically secure, and access to particular images or features may require an appropriate Docker subscription.
+
+Hardened/minimal base images reduce attack surface and CVE noise. Switching bases is a rebuild+test change, not a tag swap. You might think distroless means “no debugging forever”—plan ephemeral debug differently.
+
+> ⚠️ **Common Pitfall:** Moving to distroless without fixing shell-based healthchecks and entrypoints.
 
 ### Under the hood
 
@@ -154,19 +167,21 @@ $ docker scout attest get \
 
 ### In production
 
-Adopt hardened bases through a managed catalog, not ad hoc developer substitution. For each base, record:
+**Ownership:** Platform may publish approved bases; app teams rebase and test.
 
-- Approved repository and digest
-- Supported architectures
-- Update and end-of-life expectations
-- Required runtime capabilities
-- Debugging approach for shell-free images
-- Evidence verification procedure
-- Fallback owner if an upstream update breaks the application
+**Failure mode:** Broken entrypoint after rebase → rollout failure. Detect in staging soak. Mitigate with approved base catalog and compatibility checklist.
 
-Test observability agents, certificate paths, time-zone behavior, native libraries, and health checks. Minimal images intentionally remove assumptions that broad distribution images satisfy.
+| Do | Don't |
+|----|-------|
+| Use approved hardened bases | Random minimal images without support |
+| Test probes after rebase | Assume shell exists in distroless |
 
-Rebuild applications when the pinned base digest changes. A mutable base tag does not alter an already-built child image; only a new build can incorporate the patched layers.
+**Before you leave this section**
+
+- **Understand:** Hardened bases shrink surface; rebases need test discipline.
+- **Try:** Compare package count of a hardened vs fat base.
+- **Watch in prod:** Healthcheck failures after distroless moves.
+
 
 ## 26.4 Signing and Verification
 
@@ -193,6 +208,10 @@ flowchart TB
 *Figure 26.2: SBOM, provenance, and signature answer different questions that policy combines into one decision.*
 
 Cosign is part of Sigstore and supports key-based and keyless signing. Notation is a CNCF Notary Project tool implementing the Notary Project signature model. Both store signatures as OCI-related artifacts in supporting registries, but their trust-policy formats and ecosystems differ.
+
+Sign digests (Notary/cosign/etc.); verify at admit/deploy time. Signing without verification is incomplete. You might think signature proves “safe code”—it proves identity of builder/publisher, not absence of bugs.
+
+> ⚠️ **Common Pitfall:** Verifying signatures only in CI while the cluster admits unsigned digests.
 
 ### Under the hood
 
@@ -241,14 +260,20 @@ $ notation verify \
 
 ### In production
 
-Prefer workload identity over long-lived private keys in CI. Constrain verification to an expected repository workflow, service account, issuer, and registry scope. An unrestricted "any valid Sigstore identity" rule is not authorization.
+**Ownership:** Security/platform own signing keys and admission verify; CI signs on build.
 
-Use separate identities for build, promotion, and emergency release when duties differ. Log each signing event, protect registry artifact deletion, and test signature behavior during replication and garbage collection.
+**Failure mode:** Unsigned or wrong identity admitted. Detect with admission denials and registry audits. Mitigate with enforce mode after warn soak.
 
-Choose one primary signing ecosystem for enforcement unless interoperability requirements justify both. Parallel tools create parallel trust stores, rotation procedures, incident runbooks, and policy semantics.
+| Do | Don't |
+|----|-------|
+| Sign and verify the same digest | Sign tags that move |
+| Protect signing keys like prod secrets | Share CI signing keys widely |
 
-> ⚠️ **Warning:** Never sign a mutable tag without resolving it to a digest. The tag can later point elsewhere while the signature continues to describe only the original digest.
+**Before you leave this section**
 
+- **Understand:** Signatures attest publisher identity on digests; verify at deploy.
+- **Try:** Sign a lab image and verify before run.
+- **Watch in prod:** Cluster admitting unsigned images.
 
 
 ## 26.5 Registry and Deployment Policy Gates
@@ -260,6 +285,10 @@ Choose one primary signing ecosystem for enforcement unless interoperability req
 A policy gate converts evidence into a decision: allow, warn, quarantine, or reject. The registry is a useful collection point, but a registry scan alone cannot guarantee that only approved content runs. Enforcement should also occur near deployment.
 
 Promotion is safer than rebuilding. The same tested digest moves from a development repository or label to a production-approved location while evidence remains attached.
+
+Gates block deploy unless scan/sign/attestation policy passes. This is change safety for artifacts. You might think registry ACLs alone are enough—clusters need admission policy too.
+
+> ⚠️ **Common Pitfall:** Different rules in staging vs prod without a promotion path—teams learn to bypass staging.
 
 ### Under the hood
 
@@ -317,11 +346,23 @@ sequenceDiagram
 
 ### In production
 
-Start with audit mode to measure impact, but assign a date and owner for enforcement. Alert-only controls that never graduate become decorative.
+**Ownership:** Platform owns gate enforcement; app teams fix failing evidence.
 
-Design failure behavior explicitly. If a scanner or transparency service is unavailable, should production deployment fail closed, use a recently cached verification result, or require a documented break-glass approval? The answer depends on workload criticality and recovery objectives.
+**Failure mode:** Bypass → unreviewed digest in prod. Detect with admission audit. Mitigate with break-glass that still logs and expires.
 
-Keep a break-glass path narrow, authenticated, logged, time-limited, and retrospectively reviewed. Emergency access should bypass one control for a specific digest—not disable supply-chain enforcement globally.
+| Do | Don't |
+|----|-------|
+| Same digest promoted across envs | Rebuild per environment with different digests |
+| Warn then enforce gates | Silent bypass aliases |
+
+**Before you leave this section**
+
+- **Understand:** Policy gates enforce evidence before deploy.
+- **Try:** Trace one image from CI scan to cluster admission rule.
+- **Watch in prod:** Env-specific rebuilds breaking provenance.
+
+> 🏭 **Production floor:** **Digest promote** is the artifact SOP: CI builds once → scan/sign/attest → promote the *same digest* dev→stage→prod. Tickets must include digest, scanner result, signature ID. Never retag `latest` as the promote mechanism.
+
 
 ## 26.6 Consuming SBOMs
 
@@ -332,6 +373,10 @@ Keep a break-glass path narrow, authenticated, logged, time-limited, and retrosp
 Generating an SBOM is only inventory creation. Consuming it means using that inventory to answer operational questions: Are we affected by this vulnerability? Do we ship a prohibited license? Which image contains this package? What changed between releases?
 
 An SBOM is a snapshot associated with a specific image digest. It becomes stale only when interpreted against changing external knowledge; the component list for immutable bytes does not change.
+
+SBOMs answer “what’s inside?” for incident CVE response. Store and query them by digest. You might think generating SBOM at build is enough—on-call must know where to fetch it in five minutes.
+
+> ⚠️ **Common Pitfall:** SBOMs in CI logs that expire in 14 days while images live for years.
 
 ### Under the hood
 
@@ -358,18 +403,21 @@ VEX complements an SBOM by communicating whether a known vulnerability affects t
 
 ### In production
 
-Store or reference SBOMs in a system that can search across all deployed digests. Connect deployment inventory to image digests so an incident query returns running workloads, owners, and environments—not only registry repositories.
+**Ownership:** Security owns SBOM retention; app teams ensure builds emit them.
 
-Define minimum SBOM quality:
+**Failure mode:** Cannot answer “are we affected?” during a CVE storm. Detect with missing-SBOM reports per prod digest. Mitigate with registry-stored SBOMs and runbook links.
 
-- Covers operating-system and language packages
-- Identifies the image digest as subject
-- Uses accepted SPDX or CycloneDX versions
-- Includes a known generator and timestamp
-- Is attached to or immutably linked with the image
-- Is signed or delivered through an authenticated trusted channel
+| Do | Don't |
+|----|-------|
+| Retain SBOM with digest lifetime | Only CI log attachments |
+| Practice CVE lookup drill | Hand-maintained spreadsheets as SoT |
 
-Test consumption before an incident. Choose a harmless package, ask which production images contain it, and verify the result against running containers.
+**Before you leave this section**
+
+- **Understand:** SBOMs are incident evidence keyed by digest.
+- **Try:** Fetch an SBOM for an image and find one dependency version.
+- **Watch in prod:** Missing SBOMs during CVE response.
+
 
 ## 26.7 Common Pitfalls
 

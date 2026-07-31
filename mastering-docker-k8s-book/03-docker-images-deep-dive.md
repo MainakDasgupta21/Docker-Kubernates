@@ -23,6 +23,10 @@ Imagine a skyscraper assembled from prefabricated floors. The foundation floor i
 
 Docker **images** work the same way. Each change during a build usually creates a **layer**. Containers started from the same image share those read-only layers on disk, saving space and pull time. When you finally understand layers, image size, build speed, and security scanning all become less mysterious.
 
+This chapter is where “promote the same thing” becomes concrete. By the end you should refuse to treat a movable tag as identity, you should read `RepoDigests` without fear, and you should expect platform (amd64 vs arm64) to be part of every pull and build conversation.
+
+> ⚠️ **Common Pitfall:** You might think learning image commands is optional because “CI builds for me.” When a node cannot pull, when two environments disagree, or when `exec format error` appears, image literacy is the on-call skill—not a specialty chapter you can skip.
+
 ---
 
 ## 03.2 What an Image Contains
@@ -30,6 +34,10 @@ Docker **images** work the same way. Each change during a build usually creates 
 ### In plain terms
 
 An image is not “just files.” It is a stacked set of filesystem diffs plus a configuration that says how to start the app. When a container starts, Docker adds a thin writable “rooftop patio” on top; the floors underneath stay read-only and shareable.
+
+That design solves two problems at once: **sharing** (ten containers can reuse the same base layers on disk) and **immutability** (the lower floors do not change under your feet when a container writes a log file). If you only remember “image = tarball of my app,” you will be surprised by layer caching, digest identity, and why deleting one container does not delete the base OS layer.
+
+> ⚠️ **Common Pitfall:** You might think editing files inside a running container changes the image. It does not. You changed the container’s writable layer. A new container from the same image starts clean unless you commit (discouraged) or rebuild.
 
 ### Under the hood
 
@@ -59,12 +67,32 @@ Inspect config fields after you pull an image:
 
 ```bash
 $ docker pull python:3.12-slim
-$ docker inspect python:3.12-slim --format '{{.Os}}/{{.Architecture}} Cmd={{json .Config.Cmd}}'
+$ docker inspect python:3.12-slim --format '{{.Os}}/{{.Architecture}} Cmd={{json .Config.Cmd}} User={{.Config.User}}'
 ```
+
+```text
+linux/amd64 Cmd=["python3"] User=
+```
+
+Empty `User` usually means root unless the image set another user—note it for later hardening.
+
+**What breaks if you assume `SIZE` in `docker images` is unique disk:** shared layers mean summing sizes overcounts. Use `docker system df` for real consumption.
 
 ### In production
 
+**Ownership:** app teams own what goes into application layers; platform owns approved base images and scan policy for the final artifact.
+
 Treat image contents as your attack surface and your deploy contract. Smaller images with fewer packages usually mean faster pulls, smaller blast radius, and clearer SBOMs. Prefer promoting an immutable digest over rebuilding “the same tag” on every environment.
+
+**Failure mode:** a “slim” image that still ships a compiler toolchain in the final stage. **Detect:** `docker history` and scanners show build packages; size jumps in CI. **Mitigate:** multi-stage builds (Chapter 04); fail the pipeline on unexpected size/CVE budgets.
+
+**Do:** inspect `Cmd`, `User`, and digests before promoting. **Don’t:** treat an unreproducible local `docker commit` as a release artifact.
+
+**Before you leave this section**
+
+- **Understand:** Image = read-only layers + config; container adds a writable layer.
+- **Try:** Pull `python:3.12-slim` and inspect Os/Arch, Cmd, and User.
+- **Watch in prod:** Final images that still contain build toolchains.
 
 ---
 
@@ -73,6 +101,10 @@ Treat image contents as your attack surface and your deploy contract. Smaller im
 ### In plain terms
 
 A tag is a sticky note humans move around (“this is version 1.27-alpine”). A digest is a fingerprint of the exact bytes. Sticky notes can be moved; fingerprints cannot.
+
+The problem digests solve is trust across time and machines. Humans like `1.4.2`; machines and auditors need “these exact bytes.” If your promotion story only says “deploy `myapp:prod`,” you have a nickname, not an identity.
+
+> ⚠️ **Common Pitfall:** You might think `latest` means “newest stable.” It is only a convention. It moves when someone pushes, and it may not be what you think.
 
 ### Under the hood
 
@@ -108,6 +140,10 @@ After a pull, find digests you actually have:
 $ docker inspect nginx:alpine --format '{{json .RepoDigests}}'
 ```
 
+```text
+["nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+```
+
 #### The `latest` trap
 
 `nginx` means `nginx:latest`. **latest** is only a convention—it is not guaranteed to be the newest stable, and it moves. Fine for quick demos; risky as your only production pin.
@@ -127,12 +163,28 @@ flowchart LR
 
 *Figure 03.2: Tags are movable pointers; digests identify exact bytes you promote.*
 
+**What breaks if two environments pull the same tag a week apart:** they can run different bytes while dashboards still show the same tag string. Incidents become “but we both run 1.4.2!” arguments. Compare digests.
+
 ### In production
+
+**Ownership:** app teams mint version tags; release engineering / platform enforces digest pins in prod deploy paths and retention.
 
 - Use versioned tags for humans (`1.4.2`, `1.4.2-alpine`).
 - Record digests in release notes, GitOps manifests, or deploy systems.
 - Ban floating `:latest` in production deploy configs.
 - When promoting across environments, promote the digest you tested—not a retagged name that might have moved.
+
+**Failure mode:** someone retags `prod` after a hotfix and staging silently drifts. **Detect:** digest mismatch between env manifests; registry webhook on tag move. **Mitigate:** immutable tags + digest references in deploy manifests; deny `:latest` via policy.
+
+> 🏭 **Production floor:** Promote by digest. In regulated environments, deploy specs should reference `image@sha256:…` (or an immutable tag that is never overwritten). Incident tickets list intended digest vs observed digest before debating application code.
+
+**Do:** pin what you tested. **Don’t:** let `:latest` or a movable `:prod` be the only identifier in production.
+
+**Before you leave this section**
+
+- **Understand:** Tags move; digests identify bytes.
+- **Try:** Pull an image and save its `RepoDigests` value to a text file.
+- **Watch in prod:** Deploy configs that only mention floating tags.
 
 ---
 
@@ -140,7 +192,9 @@ flowchart LR
 
 ### In plain terms
 
-Your daily toolkit is short: list what you have, pull what you need, inspect what is inside, tag for renaming, remove what you no longer need.
+Your daily toolkit is short: list what you have, pull what you need, inspect what is inside, tag for renaming, remove what you no longer need. Fluency here pays rent every day—slow image hygiene becomes disk-full outages and “where did my image go?” confusion.
+
+> ⚠️ **Common Pitfall:** Treating `IMAGE ID` as something you paste into production manifests. Prefer registry digests (`RepoDigests`) for cross-machine identity.
 
 ### Under the hood
 
@@ -223,9 +277,23 @@ $ docker system df
 
 Shows real disk use for images, containers, and volumes—more trustworthy than summing the `SIZE` column.
 
+**What breaks if you `docker rmi -f` without checking containers:** you can force-remove and leave yourself unable to restart a stopped container that needed that image until you re-pull.
+
 ### In production
 
+**Ownership:** platform sets prune policies on CI agents; developers avoid deleting the only local copy of a prod digest without a registry backup.
+
 Automate cleanup in CI agents and developer laptops (`docker image prune`, retention policies on registries). Never delete “old” images that are still the only local copy of what production digests expect without a registry backup story.
+
+**Failure mode:** aggressive prune on a bastion that was caching the only copy of an air-gapped image. **Detect:** sudden ImagePull failures after cleanup windows. **Mitigate:** registry is source of truth; nodes pull from registry, not from a peer’s accidental cache.
+
+**Do:** `docker system df` before big prunes. **Don’t:** `docker system prune -a` on shared builders without a change window.
+
+**Before you leave this section**
+
+- **Understand:** tag renames; rmi refuses when containers reference; `system df` beats summing SIZE.
+- **Try:** Tag an image, confirm shared IMAGE ID, remove only the extra tag.
+- **Watch in prod:** Unscheduled prune jobs on shared builders.
 
 ---
 
@@ -234,6 +302,10 @@ Automate cleanup in CI agents and developer laptops (`docker image prune`, reten
 ### In plain terms
 
 If the lower floors of the skyscraper did not change, builders can reuse them. That is why Dockerfile order matters: put slow, stable work early; put frequently changing app code late.
+
+Cache is a performance feature with a correctness edge. When it works, rebuilds are fast. When you misunderstand inputs, you can ship stale layers or be surprised that “I changed a file” rebuilt half the world.
+
+> ⚠️ **Common Pitfall:** Copying the entire repo before installing dependencies. Any code edit busts the dependency layer—every time.
 
 ### Under the hood
 
@@ -257,9 +329,27 @@ flowchart TD
 
 Shared base layers across images also mean ten services `FROM python:3.12-slim` do not store ten full copies of the base on the daemon—storage is content-addressed.
 
+```bash
+$ docker history --human myapp:1.0
+```
+
+**What breaks if a base tag moves under you:** cache keys and security posture change while your Dockerfile text looks unchanged. Pin bases by digest when you need bit-for-bit reproducibility.
+
 ### In production
 
+**Ownership:** app teams structure Dockerfiles for cache; platform provides BuildKit cache backends in CI so agents are not cold every run.
+
 Cache hits are a performance feature and a correctness hazard if you misunderstand inputs. Pin base digests when you need bit-for-bit reproducibility; invalidate deliberately when security patches land.
+
+**Failure mode:** CI “green” using a week-old cached base with a critical CVE. **Detect:** scan the final digest every promote; periodically `--no-cache` or rebuild on base digest change. **Mitigate:** digest-pin bases; scheduled rebuilds; cache bust on advisories.
+
+**Do:** order Dockerfiles for stable-first caching. **Don’t:** confuse “cache hit” with “still patched.”
+
+**Before you leave this section**
+
+- **Understand:** Changed COPY inputs invalidate that step and everything after.
+- **Try:** Sketch where `requirements.txt` vs `app.py` edits bust cache on Figure 03.3.
+- **Watch in prod:** Long-lived CI caches with no base-image refresh policy.
 
 ---
 
@@ -267,7 +357,9 @@ Cache hits are a performance feature and a correctness hazard if you misundersta
 
 ### In plain terms
 
-A registry is where images live when they are not only on your laptop. Docker Hub is the default public warehouse; companies usually add a private one.
+A registry is where images live when they are not only on your laptop. Docker Hub is the default public warehouse; companies usually add a private one. Without a registry strategy, “it works on my machine” never becomes “it works on the node.”
+
+> ⚠️ **Common Pitfall:** Anonymous Hub pulls in CI until you hit rate limits at the worst possible time (release day).
 
 ### Under the hood
 
@@ -281,13 +373,33 @@ $ docker tag myapp:1.0 registry.example.com/team/myapp:1.0
 $ docker push registry.example.com/team/myapp:1.0
 ```
 
+```text
+The push refers to repository [registry.example.com/team/myapp]
+...
+1.0: digest: sha256:bbbb... size: 1234
+```
+
 Rate limits, authentication, and private registries appear again in Chapter 10. For now: if pulls fail with `429` or auth errors, the problem is registry access—not your Dockerfile.
 
+**What breaks if push credentials can overwrite any tag:** a compromised laptop can replace `prod` bytes. Separate push roles; prefer immutable tags; require digest verification on deploy.
+
 ### In production
+
+**Ownership:** platform owns registry HA, auth, and mirrors; app teams own repositories and who can push to them.
 
 - Prefer org or private registries for internal apps.
 - Enforce pull-through caches or mirrors when Hub rate limits hurt CI.
 - Sign and scan images as part of promotion (Chapter 10 and later CI chapters).
+
+**Do:** authenticate CI pulls; mirror critical bases. **Don’t:** rely on anonymous Hub from ephemeral runners.
+
+> 🏭 **Production floor:** The registry is part of your blast radius. If it is down, autoscaling cannot pull. Budget registry SLOs like you budget the database—not like optional developer tooling.
+
+**Before you leave this section**
+
+- **Understand:** Push/pull via registry is how images leave your laptop.
+- **Try:** `docker login` against a registry you use (or Hub) and pull an authenticated image.
+- **Watch in prod:** CI 429s and missing mirrors for hot base images.
 
 ---
 
@@ -297,6 +409,10 @@ Rate limits, authentication, and private registries appear again in Chapter 10. 
 
 Your Mac might be arm64 while your server is amd64. A multi-platform image is a “table of contents” (manifest list / index) that points to the right architecture variant. The engine picks the matching one—or you ask for a specific platform explicitly.
 
+The misconception: “I pulled `python:3.12-slim` so every machine has the same bytes.” You pulled *your* platform’s variant of that name. The tag is shared; the layers often are not.
+
+> ⚠️ **Common Pitfall:** Building only for your laptop’s arch and pushing `:latest`. Production amd64 nodes fail with `exec format error`.
+
 ### Under the hood
 
 Many Hub images are **manifest lists** pointing to `linux/amd64`, `linux/arm64`, and other variants. On an Apple silicon Mac, `docker pull` typically selects `arm64` automatically. When you deploy to an `amd64` server, build or pull for that platform explicitly:
@@ -304,6 +420,10 @@ Many Hub images are **manifest lists** pointing to `linux/amd64`, `linux/arm64`,
 ```bash
 $ docker pull --platform linux/amd64 python:3.12-slim
 $ docker inspect python:3.12-slim --format '{{.Os}}/{{.Architecture}}'
+```
+
+```text
+linux/amd64
 ```
 
 **Buildx** is the modern BuildKit client used by `docker build` on Docker Engine 29.x. Multi-platform *builds* usually look like:
@@ -333,7 +453,11 @@ flowchart TB
 
 *Figure 03.4: A multi-platform tag is an index that points at per-architecture manifests and their layers.*
 
+**What breaks if you `--load` a multi-platform build on an old graph-driver setup:** the load may be rejected. Push a manifest list to a registry or use a compatible builder driver.
+
 ### In production
+
+**Ownership:** CI owns explicit `--platform` matrices; app teams confirm their binaries/wheels support each arch they claim.
 
 - Build and test for every architecture you deploy to—do not assume “it pulled on my M-series Mac” means “it runs on the amd64 node pool.”
 - In CI, set `--platform` explicitly for release pipelines.
@@ -341,13 +465,23 @@ flowchart TB
 
 > 💡 **Tip:** If a container crashes with `exec format error`, you almost always ran the wrong CPU architecture for the host.
 
+**Do:** test one container per release arch. **Don’t:** treat laptop pulls as proof for server arch.
+
+**Before you leave this section**
+
+- **Understand:** A multi-arch tag is an index; each arch has its own layers.
+- **Try:** `docker pull --platform linux/amd64 python:3.12-slim` and inspect Architecture.
+- **Watch in prod:** `exec format error` after Mac-only builds.
+
 ---
 
 ## 03.8 Image Size Literacy
 
 ### In plain terms
 
-Smaller images usually pull faster, start sooner under autoscaling, and carry fewer unused packages an attacker could abuse.
+Smaller images usually pull faster, start sooner under autoscaling, and carry fewer unused packages an attacker could abuse. Size is not vanity—it is pull latency, node disk, and attack surface.
+
+> ⚠️ **Common Pitfall:** Switching to Alpine “because small” without checking libc assumptions. Some Python wheels expect glibc (Debian `slim`) and misbehave on musl.
 
 ### Under the hood
 
@@ -360,9 +494,23 @@ $ docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 $ docker history --human --no-trunc myapp:1.0
 ```
 
+**What breaks if you delete caches in a later layer than you created them:** the fat layer still exists underneath; final size barely shrinks. Cleanup must happen in the same `RUN` that dirtied the filesystem.
+
 ### In production
 
+**Ownership:** app teams keep final stages lean; platform may enforce soft size budgets in CI.
+
 Track image size in CI as a soft budget. Investigate sudden size jumps—they often mean a debug toolchain or cache directory leaked into the final stage.
+
+**Failure mode:** a 1.5 GB debug image promoted because “it worked.” **Detect:** size delta alerts; history shows compilers in final stage. **Mitigate:** multi-stage; block promote over budget without waiver.
+
+**Do:** budget size next to CVE policy. **Don’t:** optimize Alpine micro-savings while shipping build-essential in runtime.
+
+**Before you leave this section**
+
+- **Understand:** Size affects pull time, disk, and attack surface; cleanup must be same-layer.
+- **Try:** Compare `docker history` of a fat vs slim base you already pulled.
+- **Watch in prod:** Sudden image size jumps on otherwise small commits.
 
 ---
 
@@ -453,6 +601,7 @@ They let one name (tag) resolve to architecture-specific image variants—for ex
 - Layer caching and sharing explain build speed and disk behavior.
 - Multi-platform awareness (and buildx) prevents “works on my Mac, fails on the server” surprises.
 - Avoid relying on `latest` for anything you care about reproducing.
+- In production, promote digests, mirror registries for CI, and treat size + CVE budgets as first-class gates.
 
 ---
 

@@ -65,34 +65,82 @@ Chapter 04 introduces a small **Task API** (Python Flask) that recurs as a runni
 
 **Fail on purpose occasionally.** Stop a container wrongly, pull a bad tag, mis-set a port—then recover using the debugging chapters. Recovery skill is production skill.
 
-**Use the three depth tiers.** Most major concepts appear as *In plain terms*, *Under the hood*, and *In production*. Skim the first tier when you need intuition; dig into the second when you implement; treat the third as your checklist when you ship.
-
 **Keep versions in mind.** This book assumes **Docker Engine 29.x** (Compose V2, BuildKit and buildx by default) and **Kubernetes 1.36**. If a command fails oddly, check `docker version` and `kubectl version` before assuming the book is wrong.
+
+### The reading method: plain → hood → production floor
+
+Most major concepts are written in **three depth tiers**. Read them in order the first time through a chapter. On later passes, jump to the tier that matches the job you are doing.
+
+| Tier | Heading | What it is for |
+|------|---------|----------------|
+| 1 | **In plain terms** | Intuition, the problem being solved, and one common misconception |
+| 2 | **Under the hood** | Mechanism, realistic commands or YAML, sample output, and what breaks if you get a detail wrong |
+| 3 | **In production** | Who owns it, how failures show up, how you mitigate, and a concrete do / don’t |
+
+After those three tiers you will often see a short micro-checklist:
+
+```markdown
+**Before you leave this section**
+
+- **Understand:** the idea you must be able to explain aloud
+- **Try:** a small command or experiment on your machine
+- **Watch in prod:** the signal an on-call engineer would notice first
+```
+
+Treat that checklist as a gate, not decoration. If you cannot complete **Understand**, re-read plain terms. If **Try** fails oddly, stay in under the hood until the sample output makes sense. If you skip **Watch in prod**, you will memorize flags without building an operational eye.
+
+Occasionally you will see a heavier callout:
+
+```markdown
+> 🏭 **Production floor:** …
+```
+
+Those are reserved for **change safety**, **blast radius**, **digest pinning**, and similar rules that an MNC platform mentor would put on a team wiki—not for everyday tips. When you see one, slow down: it is usually about what one bad change can take down, and what evidence you paste into an incident ticket.
 
 ```mermaid
 flowchart TD
-  why["Why: motivation and mental model"] --> how["How: commands, YAML, and flags"]
-  how --> practice["Practice: type the commands"]
-  practice --> depth["Depth tiers: plain / hood / production"]
-  depth --> versions["Confirm Engine 29.x and Kubernetes 1.36"]
+  why["Why: motivation and mental model"] --> plain["In plain terms"]
+  plain --> hood["Under the hood"]
+  hood --> practice["Practice: type the commands"]
+  practice --> prod["In production"]
+  prod --> gate["Before you leave this section"]
+  gate --> floor["Production floor callouts when blast radius matters"]
+  floor --> versions["Confirm Engine 29.x and Kubernetes 1.36"]
 ```
 
-*Figure 00.1: A durable learning loop — understand why, practice how, then treat production checklists as the bar you ship against.*
+*Figure 00.1: A durable learning loop — plain intuition, hood mechanism, production ownership, then a leave-section gate before you move on.*
+
+> ⚠️ **Common Pitfall:** Reading only *In production* to “save time.”  
+> Without the plain-terms mental model, production checklists become superstition. Without under-the-hood evidence (`docker inspect`, digests, events), you cannot tell whether a checklist item actually passed.
+
+**Before you leave this section**
+
+- **Understand:** The three tiers answer *what / how / who owns and what fails*, in that order.
+- **Try:** Skim Chapter 01’s first major concept and identify its three tiers plus the leave-section checklist.
+- **Watch in prod:** Whether your team’s runbooks cite evidence (digests, inspect output, events) or only folklore.
 
 ---
 
 ## What “Production” Means Here
 
-“Production” in this book does **not** mean “runs on the biggest cloud” or “uses every CNCF project.” It means:
+“Production” in this book does **not** mean “runs on the biggest cloud” or “uses every CNCF project.” It means a set of operational habits you can defend in an incident review:
 
-- Images are **reproducible** and preferably pinned by digest when promoting
+- Images are **reproducible** and preferably pinned by **digest** when promoting across environments
 - Processes run as **non-root** when possible
 - Resources have **limits**; restarts are intentional, not accidental loops
 - Configuration and secrets are **injected**, not baked into layers
 - Changes are **observable** (logs, events, health) and **reversible** (rollbacks)
 - Deployments are **automated** enough that humans are not copy-pasting by memory at 2 a.m.
 
-You will meet these ideas gradually. Early chapters prioritize clarity over perfection; later chapters tighten the screws.
+You will meet these ideas gradually. Early chapters prioritize clarity over perfection; later chapters tighten the screws. When *In production* sections talk about **ownership**, they mean: who changes the image versus who owns the Deployment versus who owns the cluster—and how far one bad change can blast.
+
+A useful mental pipeline for any lasting change:
+
+```text
+PR → CI build + scan → promote by digest → rollout → watch signals → rollback if needed
+```
+
+If your personal workflow skips digests, skips a reversible path, or has no first signal to watch, you are practicing demos—not production—even if the app is “in the cloud.”
 
 ```mermaid
 flowchart TD
@@ -104,6 +152,14 @@ flowchart TD
 ```
 
 *Figure 00.2: “Production” in this curriculum is a stack of operational habits, not a cloud vendor badge.*
+
+> 🏭 **Production floor:** Prefer promoting an immutable digest over rebuilding “the same tag” in each environment. Tags move; digests do not. Incident tickets should record the digest you intended to run and the digest `docker inspect` / cluster status actually shows.
+
+**Before you leave this section**
+
+- **Understand:** Production here is habits (reproducible, limited, observable, reversible)—not a vendor badge.
+- **Try:** Write one sentence naming the first signal you would watch after a container deploy (logs, health, restart count, or error rate).
+- **Watch in prod:** Deploys that cannot answer “which digest is live?” within a minute.
 
 ---
 
@@ -206,6 +262,15 @@ Docker Engine / Desktop **29.x** and Kubernetes **1.36**.
 
 </details>
 
+**Q5.** In what order should you read the three depth tiers the first time you meet a major concept?
+
+<details>
+<summary>Show answer</summary>
+
+In plain terms → Under the hood → In production, then complete the Before you leave this section checklist (Understand / Try / Watch in prod).
+
+</details>
+
 ---
 
 ## Key Takeaways
@@ -213,8 +278,9 @@ Docker Engine / Desktop **29.x** and Kubernetes **1.36**.
 - Containers standardize how software is packaged and moved—like shipping containers for cargo.
 - This book is a beginner-friendly textbook with objectives, stories, exercises, and self-checks.
 - Learn *why* before *how*; practice on a real mini-app (Task API) as concepts deepen.
+- Read major concepts as **plain → hood → production**, then pass the **Before you leave this section** gate; treat **Production floor** callouts as blast-radius rules.
 - Target versions are Docker Engine 29.x and Kubernetes 1.36.
-- “Production” means safe, observable, reversible operations—not buzzword tooling.
+- “Production” means safe, observable, reversible operations—prefer digests when promoting—not buzzword tooling.
 
 ---
 

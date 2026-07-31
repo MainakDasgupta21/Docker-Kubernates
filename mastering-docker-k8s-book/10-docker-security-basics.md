@@ -37,6 +37,10 @@ The guiding principle is **least privilege**: every permission a container does 
 
 Most images default to root. That is convenient and dangerous. Create an unprivileged user in the Dockerfile (best) or override the user at run time (for images you do not control).
 
+Here is why this is the highest-value habit in the whole chapter. Root inside a container is *the same UID 0* the kernel trusts on the host — the container boundary (namespaces, cgroups) is the only thing standing between in-container root and host root. That boundary is strong but not infinite: a kernel bug, an over-broad mount, or a misconfigured `--privileged` flag can let in-container root become host root. Running as an unprivileged user means that even after an attacker gets code execution inside your container, they start with almost nothing — no ability to write system files, install packages, or bind privileged ports — turning many exploit chains into dead ends before they reach the host boundary at all.
+
+> ⚠️ **Common Pitfall:** You might think "the app doesn't need root, so it probably isn't running as root." Unless the image sets `USER` or you override it, the default is UID 0 — most base images ship that way for build convenience. Convenience at build time becomes standing risk at run time; verify with `docker run --rm <image> whoami` rather than assuming.
+
 ### Under the hood
 
 ```bash
@@ -75,9 +79,21 @@ $ docker run -d \
 
 `--read-only` makes the container filesystem immutable (tmpfs for scratch). `no-new-privileges` blocks gaining privileges via setuid binaries. Deeper options: **`userns-remap`** and **rootless Docker** map even "root in the container" to an unprivileged host user — remember from Chapter 07 that **userns-remap is incompatible with the containerd image store**.
 
+**What breaks if X:** if a root container is also given a dangerous mount — the Docker socket (`/var/run/docker.sock`), the host root filesystem, or `--privileged` — the isolation argument collapses entirely. In-container root plus the Docker socket is *game over*: that process can launch a new container that mounts the host's `/` and writes anywhere, i.e., trivially become host root. This is why "non-root" and "no sensitive mounts" are one combined discipline, not two separate nice-to-haves.
+
 ### In production
 
 Require `USER` in every Dockerfile your team owns. Gate CI on "runs as non-root." Prefer rootless Engine where the platform supports your workload. Never treat Docker group membership lightly — it is effectively root-equivalent on the host.
+
+**Who owns this:** the app team owns the `USER` line in every Dockerfile it ships; the platform/security team owns the CI gate that rejects root images and the policy on Docker group membership. **Failure mode and detection:** the recurring finding is a service quietly running as root because nobody added `USER` — it works fine, so it survives review unless something checks. Detect at build time (a CI step running `docker inspect`/config to assert a non-root user) and at runtime (`docker inspect --format '{{.Config.User}}' <ctr>` being empty means root). **Do** bake `USER` into images, gate CI on non-root, and pair it with `--read-only`, `--tmpfs`, and `no-new-privileges`; **don't** grant Docker group membership casually — it is root-equivalent on the host.
+
+> 🏭 **Production floor:** A root container is one misconfiguration away from being host root — especially if it also mounts the Docker socket, host paths, or runs `--privileged`. Treat "runs as root" as a blocking security finding, not a style nit: enforce non-root `USER` in CI, ban the Docker socket and `--privileged` from application containers by policy, and remember Docker group membership on the host is itself root-equivalent. The blast radius of one root+socket container is the entire host and every other container on it.
+
+**Before you leave this section**
+
+- **Understand:** in-container root is host UID 0 behind only the namespace boundary; non-root turns many post-exploitation steps into dead ends.
+- **Try:** run `docker run --rm alpine:3.20 whoami` (root), then rebuild with a `USER app` line (or `--user 1001:1001`) and confirm the change.
+- **Watch in prod:** services silently running as root, root containers with the Docker socket or host paths mounted, and casual Docker-group membership.
 
 ```mermaid
 flowchart TD
@@ -97,6 +113,10 @@ flowchart TD
 ### In plain terms
 
 Linux split root's power into discrete **capabilities** — bind low ports, change ownership, craft raw packets, and so on. Docker starts containers with a trimmed default set. Least privilege says: drop everything, add back only what you can justify.
+
+Capabilities exist because "root" used to be all-or-nothing: a process was either fully privileged or fully unprivileged. That is a terrible fit for containers, where a web server might legitimately need *one* root-ish power (bind port 80) and none of the other forty. Capabilities slice root into granular permissions so you can grant exactly the sliver a workload needs. Docker already drops most of them by default; the mature posture goes further — drop **all**, then add back the specific few you can name and justify, so an attacker who takes over the process inherits a deliberately tiny set of powers.
+
+> ⚠️ **Common Pitfall:** You might reach for `--privileged` to make a permission error go away. `--privileged` is not "a few more capabilities" — it grants *all* capabilities, adds device access, and disables key confinements, effectively giving the container ownership of the host. It is almost never the right fix; the right fix is identifying the one capability (or the ownership/port issue) actually needed.
 
 ### Under the hood
 
@@ -124,9 +144,21 @@ ping: permission denied (are you root?)
 | `--cap-drop ALL --cap-add X` | Exactly what you list | Production target |
 | `--privileged` | Everything, weak confinement | Almost never |
 
+**What breaks if X:** `--privileged` (or a broad `--cap-add SYS_ADMIN`) re-opens the exact attack surface the rest of this chapter closes — with it, seccomp/AppArmor confinement is weakened and a container can mount host devices and filesystems, so a single exploited privileged container is effectively a host compromise regardless of how carefully you dropped other things.
+
 ### In production
 
 Document every `--cap-add`. Prefer fixing volume ownership or listening on high ports over granting `SYS_ADMIN`. Ban `--privileged` in production policy except for carefully reviewed host tools.
+
+**Who owns this:** the app team documents and justifies every `--cap-add`; the security team owns the policy that bans `--privileged` and audits capability grants. **Failure mode and detection:** the quiet erosion is capability creep — a `--cap-add` added to unblock something during an incident and never removed. Detect with `docker inspect --format '{{.HostConfig.CapAdd}} {{.HostConfig.Privileged}}' <ctr>` and treat any `Privileged=true` on an application container as a finding. **Do** drop `ALL` and add back a named, reviewed minimum; **don't** use `--privileged` to paper over a permission or ownership problem.
+
+> 🏭 **Production floor:** `--privileged` and broad capabilities like `SYS_ADMIN` hand a container host-level power and weaken the confinement layers below. Make `--privileged` a policy-banned, explicitly-reviewed exception for a short list of host tools — never a default fix for permission errors. Every `--cap-add` widens blast radius, so require each one to be named, justified, and revisited; an exploited privileged container is a host incident, not a container one.
+
+**Before you leave this section**
+
+- **Understand:** capabilities slice root into granular powers; drop `ALL` and add back only a named, justified minimum.
+- **Try:** run `--cap-drop ALL alpine ping` (fails), then add exactly `--cap-add NET_RAW` and watch `ping` work again.
+- **Watch in prod:** capability creep from un-reverted `--cap-add`, and any `--privileged` on an application container.
 
 ```mermaid
 flowchart TD
@@ -146,6 +178,10 @@ flowchart TD
 ### In plain terms
 
 Capabilities control *what a process is allowed to be*. **Seccomp** and **AppArmor** (or SELinux) control *what it may say to the kernel* and *which resources it may touch*.
+
+These are different, complementary layers — that is the whole point of defense in depth. Dropping capabilities removes categories of privilege. Seccomp goes narrower: it filters the individual **system calls** a process may make, so even a process that somehow has a capability can be blocked from the specific syscall that would abuse it. AppArmor/SELinux go sideways: they constrain which **files, paths, and network operations** the process may touch, regardless of syscalls or capabilities. Stacked, they mean an attacker must defeat several independent boundaries, and the failure of any one does not hand over the host.
+
+> ⚠️ **Common Pitfall:** You might disable these with `--security-opt seccomp=unconfined` during debugging and forget to remove it. Docker's *default* seccomp and AppArmor profiles are free, always-on protection blocking a dangerous subset of syscalls; running `unconfined` in a real service strips that protection silently — nothing errors, you are just measurably less safe than the defaults.
 
 ### Under the hood
 
@@ -188,6 +224,14 @@ flowchart TD
 
 Keep defaults on — they are free protection. Invest in custom profiles for high-value or internet-exposed workloads. Never leave `unconfined` on after a debugging session.
 
+**Who owns this:** the platform/security team owns the default profiles and any custom ones; the app team owns knowing whether its workload needs a syscall the default profile blocks (rare, but some runtimes do). **Failure mode and detection:** two shapes. A left-behind `seccomp=unconfined`/`apparmor=unconfined` from debugging silently ships weakened confinement — detect with `docker inspect --format '{{.HostConfig.SecurityOpt}}' <ctr>` and grep run/Compose definitions for `unconfined`. The other is a too-strict custom profile that blocks a syscall the app legitimately needs, surfacing as `Operation not permitted` errors — read the app logs and, on newer kernels, seccomp audit logs to find the offending call. **Do** keep defaults on and version custom profiles like code; **don't** leave `unconfined` in any committed definition.
+
+**Before you leave this section**
+
+- **Understand:** seccomp filters syscalls, AppArmor/SELinux confines files/paths/network, capabilities remove privilege slices — three independent layers.
+- **Try:** inspect a running container's `SecurityOpt` and confirm the default seccomp/AppArmor profiles are applied (not `unconfined`).
+- **Watch in prod:** `unconfined` left behind after debugging, and overly strict custom profiles throwing `Operation not permitted`.
+
 ---
 
 ## 10.5 Trusting what you run: signing
@@ -195,6 +239,10 @@ Keep defaults on — they are free protection. Invest in custom profiles for hig
 ### In plain terms
 
 Hardening *how* containers run is half the story. You also need confidence that `nginx:1.27` (or your Task API tag) is the authentic artifact the publisher built — not a tampered substitute.
+
+The gap signing closes is *provenance*. All the runtime hardening in the world does not help if the image you pulled was swapped for a malicious one somewhere between the publisher and your host — a compromised registry, a hijacked tag, a typo-squatted name. A tag like `nginx:1.27` is a mutable pointer; it can be repointed. Signing lets the publisher attach a cryptographic signature to the exact artifact they built, and lets you verify at pull or admission time that what you are about to run is that artifact and not a substitute.
+
+> ⚠️ **Common Pitfall:** You might set `DOCKER_CONTENT_TRUST=1` as your shiny new supply-chain policy. That enables **Docker Content Trust (Notary v1)**, which is **deprecated and being retired** — Official Images are moving off it. Keep the *goal* (verify provenance) but implement it with the modern tools below; do not build new workflows on DCT.
 
 ### Under the hood
 
@@ -226,9 +274,19 @@ The following checks were performed on each of these signatures:
   - The signatures were verified against the specified public key
 ```
 
+**What breaks if X:** a signature only protects you if something *verifies* it. Signing images in CI but never enforcing verification at pull or admission is security theater — the signatures exist, but nothing stops an unsigned or tampered image from running. And a valid signature on a *tag* still leaves the tag mutable; pin by digest (`image@sha256:…`) so the thing you verified is the exact thing you run.
+
 ### In production
 
 Enforce verification in CI and at admission time (Kubernetes admission later in the book). Prefer digest pins (`image@sha256:…`) alongside signatures. For Docker Hub base images and a maintained minimal, signed catalog, see **Docker Hardened Images** and the broader supply-chain story in **Chapter 26** — including provenance, SBOMs, and continuous rebuilds when CVEs land.
+
+**Who owns this:** the platform/security team owns the signing keys or keyless CI identities and the admission/CI enforcement gate; app teams own producing signed, digest-pinned artifacts in their pipelines. **Failure mode and detection:** the common non-event is "we sign but never verify" — detect it by checking whether any gate actually rejects an unsigned image (try to deploy one and confirm it is blocked). **Do** verify at admission, pin digests, and migrate off DCT to cosign/Notation; **don't** rely on `DOCKER_CONTENT_TRUST` for new policy or trust a signature you never enforce.
+
+**Before you leave this section**
+
+- **Understand:** signing proves provenance; DCT (Notary v1) is deprecated — use cosign or Notation, and pair signatures with digest pins.
+- **Try:** `cosign verify …` a signed image and read the checks it reports; note that verification, not signing, is what protects you.
+- **Watch in prod:** signing with no enforcement gate, mutable tags that bypass what you verified, and lingering `DOCKER_CONTENT_TRUST` policy.
 
 > 📘 **Deep Dive (optional):** Chapter 26 covers Hardened Images, SLSA-style provenance, SBOM consumption, and how signing fits a full supply-chain program. This chapter only needs you to stop investing in DCT and start with cosign or Notation.
 
@@ -250,6 +308,10 @@ flowchart LR
 ### In plain terms
 
 Do not bake passwords into images. Do not sprinkle them in plain `-e` flags if you can avoid it. Deliver secrets as files (or a dedicated secret store) to processes that need them.
+
+The reason files beat both images and env vars is *where the secret ends up leaving copies of itself*. Bake a secret into an image and it lives in a layer forever — anyone who pulls the image, or reads its history, has it, and rebuilding does not erase the old layer from registries or caches. Pass it as `-e PASSWORD=…` and it leaks through a dozen side channels: `docker inspect`, `/proc/<pid>/environ`, child processes that inherit the environment, crash dumps, and logging that echoes config. Delivering a secret as a file (ideally on a tmpfs-style path) to just the process that needs it keeps it out of image layers and out of those environment side channels.
+
+> ⚠️ **Common Pitfall:** You might treat an environment variable as "temporary" — just for this one debug run. Once a secret hits shell history, a CI log, or an orchestration manifest, treat it as permanently compromised and rotate it. There is no clean "unset and forget"; the value has already been copied somewhere you do not control.
 
 ### Under the hood
 
@@ -274,6 +336,16 @@ Prefer `*_FILE` configuration knobs. On single-host Compose, the `secrets:` key 
 
 Rotate credentials on a schedule. Never commit `.env` files with real secrets. Scrub CI logs. Treat "temporary" plaintext env vars as permanent once they hit shell history or orchestration manifests.
 
+**Who owns this:** the platform/security team owns the secret store (Swarm secrets, Kubernetes Secrets, Vault, cloud secret managers) and rotation policy; app teams own reading secrets from files/`*_FILE` knobs instead of hard-coding them. **Failure mode and detection:** the recurring incident is a committed `.env` or a `Dockerfile` `ENV SECRET=…` discovered by a secret scanner — or worse, by an attacker — long after the fact. Detect with a secret scanner in CI and history scans, and treat any hit as "rotate now," not "delete the line." **Do** deliver secrets as files, prefer `*_FILE` env knobs, and rotate on a schedule; **don't** bake secrets into images or pass them as plain `-e` when a file-based path exists.
+
+> 🏭 **Production floor:** A secret in an image layer or a plain `-e` flag has a blast radius far beyond the one container — image layers are pulled and cached widely, and env vars leak through `docker inspect`, `/proc`, child processes, logs, and crash dumps. Once exposed, a credential must be rotated, not just removed. Gate CI on secret scanning, deliver credentials as files from a real secret store, and treat any leaked value (shell history, CI log, committed `.env`) as compromised and rotate it immediately.
+
+**Before you leave this section**
+
+- **Understand:** secrets belong in files from a secret store, not image layers or plain env vars, which leave copies in layers, `docker inspect`, `/proc`, logs, and dumps.
+- **Try:** create a Swarm secret, attach it to a service, and confirm it appears under `/run/secrets/<name>` but not in the container's `env`.
+- **Watch in prod:** committed `.env`/`ENV` secrets, plaintext `-e` credentials, and "temporary" env secrets that were never rotated.
+
 ---
 
 ## 10.7 Scanning
@@ -281,6 +353,10 @@ Rotate credentials on a schedule. Never commit `.env` files with real secrets. S
 ### In plain terms
 
 Your image is more than your code: base OS, system libraries, language packages — each with CVE history. **Scanning** inventories packages and matches them against vulnerability databases.
+
+The mental shift is that *you ship far more than you wrote*. Your handful of application files ride on top of a base OS, its libraries, and your language's dependency tree — often hundreds of packages you never chose directly. Each has its own vulnerability history, and new CVEs are published against *existing* versions every day. Scanning inventories everything in the image and cross-references it against vulnerability databases so you learn about the openssl or glibc issue in your base layer before an attacker does.
+
+> ⚠️ **Common Pitfall:** You might scan once at build time, see a clean report, and consider the image "secure." Vulnerability databases grow daily against packages already in your image, so a report that was clean last month can show critical findings today with *zero* code changes. Scanning is a recurring loop, not a one-time gate.
 
 ### Under the hood
 
@@ -308,9 +384,13 @@ Act on results:
 - **Scan in CI** — fail builds on new criticals.
 - **Triage** by severity and exploitability, not raw CVE count alone.
 
+**What breaks if X:** if you gate CI on raw CVE *count* rather than severity and exploitability, you get alert fatigue — hundreds of low/unreachable findings drown the one critical, reachable one, and teams start rubber-stamping "accept all." Triage by whether the vulnerable code path is actually reachable and how severe it is, not by a number.
+
 ### In production
 
 Scanning once is theater. New CVEs publish against *existing* images daily. Rebuild on a cadence, re-scan continuously, and track base-image freshness as an SLO-ish habit. Pair scanning with signing so you know *which* remediated artifact is allowed to run.
+
+**Who owns this:** the app team owns triaging and remediating findings in images it builds; the platform/security team owns the scanning infrastructure, the CI policy (what severity fails a build), and continuous re-scanning of already-published images. **Failure mode and detection:** the quiet failure is a fleet of images that were clean at build and have since accumulated criticals because nothing re-scans or rebuilds them — detect by scanning *running/registry* images on a schedule, not just at build, and tracking base-image age. **Do** rebuild on a cadence, re-scan continuously, prefer minimal bases, and pair scanning with signing so only remediated artifacts run; **don't** treat a one-time clean scan as durable or gate solely on CVE count.
 
 ```mermaid
 flowchart LR
@@ -321,6 +401,12 @@ flowchart LR
 ```
 
 *Figure 10.5: Scanning is a loop — remediate, rebuild, re-sign, and scan again as CVEs land.*
+
+**Before you leave this section**
+
+- **Understand:** you ship a whole OS and dependency tree, not just your code; scanning is a recurring loop because CVEs land daily against existing packages.
+- **Try:** `docker scout cves` (or Trivy/Grype) an old vs current `slim` base tag and compare the findings; write one sentence of base-image policy.
+- **Watch in prod:** one-time "clean" scans treated as durable, CI gates on raw CVE count, and published images that are never re-scanned or rebuilt.
 
 ---
 

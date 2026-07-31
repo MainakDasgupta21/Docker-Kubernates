@@ -28,6 +28,10 @@ This chapter opens the walls. We will follow a single request from a Pod all the
 
 A `ClusterIP` Service has an IP address — but if you go looking, no network card anywhere owns that IP. It is a **virtual IP (VIP)**: a fiction that the cluster agrees to honor. When a Pod sends a packet to that VIP, something on the node quietly rewrites the destination to one of the real Pod IPs behind the Service. That "something" is **kube-proxy** (or, increasingly, a CNI plugin doing the same job), and it is essentially a programmable receptionist that redirects callers to whichever backend is healthy and available.
 
+kube-proxy (iptables/IPVS) or eBPF replacements implement Service VIPs. Mode choice affects performance and debugging. You might think Services work without any dataplane—something always implements DNAT/load-balancing.
+
+> ⚠️ **Common Pitfall:** Debugging app timeouts without checking kube-proxy/eBPF health on nodes.
+
 ### Under the hood
 
 The flow of a Service in three layers:
@@ -89,12 +93,21 @@ Two Service traffic-policy fields change the receptionist's choices:
 
 ### In production
 
-- **Prefer nftables (or an eBPF CNI) at scale.** Clusters with thousands of Services and endpoints see slow rule programming and CPU burn on the legacy iptables backend. nftables and eBPF dataplanes update incrementally and match faster.
-- **Watch conntrack.** Every connection consumes a conntrack entry. High-throughput nodes can exhaust `nf_conntrack_max`, causing dropped connections that look like random timeouts. Monitor `node_nf_conntrack_entries` and raise the limit or reduce churn.
-- **Understand `externalTrafficPolicy: Local` trade-offs.** It preserves client IP (useful for logging and rate limiting) but can create imbalance; pair it with pod anti-affinity or a topology-aware setup.
-- **kube-proxy is not on the data path for pod-to-pod traffic** — that is the CNI. kube-proxy only realizes *Service* VIPs. When "pods can't reach a Service" but "pods can reach each other," suspect kube-proxy/EndpointSlices; when even pod-to-pod fails, suspect the CNI.
+**Ownership:** Platform owns kube-proxy/eBPF mode and upgrades; app teams own Service definitions.
 
-> ⚠️ **Common Pitfall:** Assuming a `ClusterIP` is pingable or that you can `tcpdump` it on an interface. It is a translation target, not an address on any NIC. Test Services with an actual connection (`curl`), not `ping`.
+**Failure mode:** kube-proxy fail → ClusterIP blackhole. Detect with Service connectivity probes. Mitigate with DaemonSet monitoring and staged mode changes.
+
+| Do | Don't |
+|----|-------|
+| Probe ClusterIP from Pods | Change proxy mode mid-incident fleet-wide |
+| Document mode (iptables/IPVS/eBPF) | Assume cloud LB issues are always kube-proxy |
+
+**Before you leave this section**
+
+- **Understand:** Service VIPs need a healthy proxy/eBPF dataplane.
+- **Try:** Identify your cluster’s kube-proxy mode.
+- **Watch in prod:** Node-local Service blackholes.
+
 
 ---
 
@@ -103,6 +116,10 @@ Two Service traffic-policy fields change the receptionist's choices:
 ### In plain terms
 
 Pods talk to each other by *name* — `task-api`, `task-api.tasks.svc.cluster.local` — not by chasing IPs that change every deploy. The service that turns those names into addresses is **CoreDNS**, the cluster's phone book. Understanding it turns "DNS is flaky" from a shrug into a diagnosis.
+
+CoreDNS config, autopath, stub domains, and ndots affect latency and correctness. You might think DNS issues are always NetworkPolicy—ndots and search paths cause surprising cross-domain queries.
+
+> ⚠️ **Common Pitfall:** Setting ndots without understanding extra search queries.
 
 ### Under the hood
 
@@ -184,13 +201,21 @@ sequenceDiagram
 
 ### In production
 
-- **Cut DNS load with `ndots`.** For workloads that mostly call *external* names, the `ndots:5` default causes multiple useless lookups per external call. Set fewer search attempts via `dnsConfig` on the Pod, or use fully-qualified names with a trailing dot (`example.com.`) to skip the search list.
-- **Scale CoreDNS and consider NodeLocal DNSCache.** Under high query volume, CoreDNS becomes a bottleneck and conntrack for UDP:53 can overflow. **NodeLocal DNSCache** runs a per-node caching agent so most lookups never leave the node — a standard fix for "intermittent DNS timeouts."
-- **Autoscale CoreDNS** with `cluster-proportional-autoscaler` so replicas track cluster size; a fixed two-replica CoreDNS on a 500-node cluster will struggle.
-- **Beware the classic UDP conntrack race** on old kernels/iptables; nftables/IPVS and NodeLocal DNSCache mitigate the well-known 5-second DNS delay symptom.
-- **Set TTLs deliberately.** Aggressive caching hides endpoint changes; too-low TTLs hammer CoreDNS. 30s is a reasonable default.
+**Ownership:** Platform owns CoreDNS ConfigMap; app teams prefer FQDNs across namespaces.
 
-> ⚠️ **Common Pitfall:** Debugging "my app can't resolve `db`" without checking the namespace. `db` resolves within the *pod's own* namespace first; a database in another namespace needs `db.<its-namespace>` (or the FQDN). This is the single most common cluster-DNS confusion.
+**Failure mode:** DNS latency → app timeouts. Detect with CoreDNS latency histograms. Mitigate with Autopath carefully and right-sized replicas.
+
+| Do | Don't |
+|----|-------|
+| Monitor CoreDNS latency/errors | Edit CoreDNS ConfigMap casually |
+| FQDN across namespaces | Unbounded stub domains |
+
+**Before you leave this section**
+
+- **Understand:** DNS internals drive latency and failure modes—measure them.
+- **Try:** Read CoreDNS ConfigMap and note servers/stub domains.
+- **Watch in prod:** DNS latency after ConfigMap edits.
+
 
 ---
 
@@ -199,6 +224,10 @@ sequenceDiagram
 ### In plain terms
 
 **Dual-stack** means every Pod and (optionally) every Service can have *both* an IPv4 and an IPv6 address at once. You get IPv6's vast address space and native reachability without giving up IPv4 compatibility. Dual-stack is a stable, default-available capability in modern Kubernetes.
+
+Production dual-stack needs CNI, routes, policies, and LBs for both families—not only Service fields. You might think PreferDualStack on one Service finishes the project.
+
+> ⚠️ **Common Pitfall:** IPv6 routes missing while Services advertise IPv6.
 
 ### Under the hood
 
@@ -252,12 +281,21 @@ The `ipFamilies` list controls order and the primary family; `clusterIPs` (plura
 
 ### In production
 
-- **Decide the primary family intentionally.** `ipFamilies` order sets which VIP is primary; clients and logging that assume IPv4 should keep IPv4 primary during migration.
-- **Test both paths.** A Service can *have* an IPv6 VIP that nothing actually reaches if a NetworkPolicy, firewall, or upstream LB only permits IPv4. Verify connectivity on *each* family, not just that the address exists.
-- **NetworkPolicy must cover both families.** A policy that allows a `/24` IPv4 block does nothing for IPv6 peers; write `ipBlock` rules for both, or your "deny" may be an accidental "allow" over v6 (and vice versa).
-- **Migration is usually IPv4-primary → dual-stack → IPv6-primary,** never a flag flip. Introduce dual-stack, verify, then shift the primary family.
+**Ownership:** Platform owns dual-stack enablement end-to-end; app teams test both families.
 
-> 📘 **Deep Dive (optional):** You cannot convert an existing single-stack cluster's CIDRs in place trivially — the service/pod CIDRs are set at cluster creation. Dual-stack is easiest designed in from the start; retrofitting typically means a new node pool or cluster.
+**Failure mode:** Half-broken dual-stack → intermittent client failures. Detect with dual-family probes. Mitigate with staged rollout and policy for both CIDRs.
+
+| Do | Don't |
+|----|-------|
+| E2E dual-family tests | Enable only at Service layer |
+| Update NetworkPolicies for IPv6 | Assume cloud LB IPv6 without checking |
+
+**Before you leave this section**
+
+- **Understand:** Dual-stack is a platform project with probes on both families.
+- **Try:** List Service ipFamilies in your cluster.
+- **Watch in prod:** Partial IPv6 enablement.
+
 
 ---
 
@@ -266,6 +304,10 @@ The `ipFamilies` list controls order and the primary family; `clusterIPs` (plura
 ### In plain terms
 
 Chapter 16 introduced the Gateway API and its role-oriented split — **GatewayClass** (the implementation), **Gateway** (the listeners, owned by the platform team), and **HTTPRoute** (the rules, owned by app teams). This section goes deeper into what makes it worth adopting: the *routing* is expressive enough to do canary releases, blue/green, header-based routing, and URL surgery **as typed API fields**, with no controller-specific annotations.
+
+Gateway API separates roles (infra vs app routes) better than classical Ingress sprawl. Treat Gateway like a production load balancer. You might think migrating overnight is safe—run parallel and compare.
+
+> ⚠️ **Common Pitfall:** App teams creating Gateways in shared clusters without infra ownership.
 
 ### Under the hood
 
@@ -403,12 +445,23 @@ Beyond HTTP, the Gateway API also standardizes `GRPCRoute`, `TCPRoute`, `UDPRout
 
 ### In production
 
-- **Do progressive delivery with weights, driven by automation.** A controller like Argo Rollouts or Flagger can nudge `HTTPRoute` weights based on metrics (error rate, latency) and auto-roll-back — a full canary system built on typed Gateway fields.
-- **Keep the platform/app split.** Platform team owns `Gateway` (ports, TLS, listeners); app teams own `HTTPRoute`s that attach via `parentRefs`. This is the operational payoff of the role-oriented model.
-- **Version your routes with the rest of the app** in Git; the weight/hostname/match fields are declarative config, ideal for GitOps.
-- **Prefer typed fields over implementation extensions.** Some controllers add features via `filters` of type `ExtensionRef`; those are as non-portable as Ingress annotations. Use them knowingly.
+**Ownership:** Platform owns GatewayClasses/Gateways; app teams own HTTPRoutes.
 
-> 💡 **Tip:** Traffic splitting at the *edge* (Gateway) shifts north-south traffic between versions. Splitting *east-west* (service-to-service, deep in the call graph) is where a mesh starts to earn its keep — see the next section.
+**Failure mode:** Bad Gateway change → mass HTTP outage. Detect with route status and edge SLIs. Mitigate with role separation and canary routes.
+
+> 🏭 **Production floor:** Shared Gateways are blast-radius objects. App teams own HTTPRoutes; only platform changes Gateways—and only under a change window with canary listeners.
+
+| Do | Don't |
+|----|-------|
+| Role-separate Gateway vs Routes | Everyone edits shared Gateway |
+| Canary migrations from Ingress | Delete Ingress before Gateway soak |
+
+**Before you leave this section**
+
+- **Understand:** Gateway API needs clear ownership of Gateway vs Routes.
+- **Try:** Inspect GatewayClass and who can create Gateways.
+- **Watch in prod:** Shared Gateway edits without change control.
+
 
 ---
 
@@ -419,6 +472,10 @@ Beyond HTTP, the Gateway API also standardizes `GRPCRoute`, `TCPRoute`, `UDPRout
 A **service mesh** (Istio, Linkerd, Cilium's mesh, Consul) puts a smart proxy next to every workload — historically a **sidecar** container, increasingly a per-node or "ambient" proxy — and routes *all* service-to-service traffic through it. That gives you, uniformly and without app changes: **mutual TLS** everywhere, fine-grained traffic control (retries, timeouts, circuit breaking, east-west canaries), and rich **observability** (golden metrics, distributed traces) for every call.
 
 The boundary question is: Kubernetes already gives you Services, DNS, NetworkPolicy, Ingress/Gateway API, and (via CNIs) even mTLS in some cases. When do those primitives run out, and when are you about to hand-build a worse mesh out of retries-in-code and cron-rotated certificates?
+
+Meshes add mTLS, traffic policy, and observability—also complexity and failure modes. You might think a mesh replaces NetworkPolicy—layers differ; often you want both.
+
+> ⚠️ **Common Pitfall:** Installing a mesh to “fix” DNS or CNI problems.
 
 ### Under the hood
 
@@ -436,6 +493,10 @@ The cost side is real: every meshed pod carries proxy overhead (CPU, memory, lat
 
 ### In production — a decision guide
 
+**Ownership:** Platform owns mesh lifecycle if adopted; app teams opt in with clear SLOs. Treat mesh install like a cluster dataplane change—staged, observed, reversible.
+
+**Failure mode:** Mesh control-plane outage → sidecar/proxy storms and mass 5xx. Detect with control-plane SLOs and sidecar version skew. Mitigate with gradual injection, break-glass non-injection namespaces, and clear rollback.
+
 Reach for **built-in primitives** (and stop there) when:
 
 - You mainly need **north-south** routing and TLS termination → Gateway API / Ingress + cert-manager.
@@ -449,11 +510,22 @@ Reach for a **service mesh** when several of these are true:
 - You want **uniform, automatic** golden-signal metrics and distributed tracing without instrumenting each service.
 - You need **east-west** progressive delivery, retries, and circuit breaking as policy, consistently, at scale.
 
+| Do | Don't |
+|----|-------|
+| Adopt mesh for clear requirements | Mesh as first fix for CNI/DNS bugs |
+| Track control-plane SLOs | Mandatory injection without break-glass |
+
 > ⚠️ **Warning:** Adopting a mesh "because it's best practice" on a five-service cluster usually adds more failure modes than it removes. The mesh control plane, sidecar upgrades, and cert rotation become new sources of outages. Adopt when the *problems* a mesh solves are problems you actually have.
 
 The honest middle path: start with Gateway API + NetworkPolicy + cert-manager. Add a mesh when you catch yourself building retries, mTLS, and per-service metrics *by hand across many teams* — that is the signal you're reinventing a mesh, and it's time to use a real one.
 
 > 📘 **Deep Dive (optional):** The Gateway API is growing **GAMMA** (Gateway API for Mesh Management and Administration), which lets you configure east-west mesh routing with the same `HTTPRoute` resources you use at the edge. This blurs the old line between "ingress config" and "mesh config," so a future adoption may be less of a jump than it once was.
+
+**Before you leave this section**
+
+- **Understand:** Meshes are optional complexity—adopt with requirements and SLOs; NetworkPolicy still matters.
+- **Try:** Write a one-paragraph mesh go/no-go for Task API listing two tipping capabilities.
+- **Watch in prod:** Mesh outages amplifying app incidents; injection without escape hatches.
 
 ---
 

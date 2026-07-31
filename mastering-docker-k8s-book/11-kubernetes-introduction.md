@@ -69,6 +69,8 @@ flowchart TB
 
 Orchestration is the difference between hiring a contractor for one afternoon and hiring a building superintendent. The contractor does exactly what you ask, when you ask. The superintendent keeps the building in the condition you agreed on — forever — noticing broken things before you do and fixing them without a conversation.
 
+The problem orchestration solves is *scale of decisions*: every restart, placement, scale-up, discovery, and rollback is a decision someone must make. On one host you can be that someone. Across dozens of services and machines, the clipboard becomes the outage.
+
 Concretely, an orchestrator answers questions you would otherwise answer by hand:
 
 | Question at 3 a.m. | Who answers it in Kubernetes |
@@ -79,6 +81,8 @@ Concretely, an orchestrator answers questions you would otherwise answer by hand
 | Where should this new copy run? | The scheduler, using resource requests and constraints |
 | How do callers find the healthy copies? | A Service, backed by EndpointSlices and cluster DNS |
 | The new version is broken. Who rolls back? | The Deployment controller, from its revision history |
+
+> ⚠️ **Common Pitfall:** You might think Kubernetes replaces Docker. It does not—you still build OCI images; Kubernetes schedules and runs them through a CRI runtime. Orchestration sits *above* containers.
 
 ### Under the hood
 
@@ -114,6 +118,14 @@ Orchestration is not free, and pretending otherwise is how teams get hurt. Adopt
 
 A useful rule of thumb: adopt Kubernetes when you have **many services, more than one machine, and real uptime expectations**. One container on one small VM is a job for plain Docker or a managed container service, and choosing the boring option there is a sign of seniority, not inexperience.
 
+> ⚠️ **Common Pitfall:** Adopting Kubernetes for a single container on one VM "to learn production." You learn the control plane's failure modes without the problems orchestration solves—prefer a real multi-service need, or keep the learning cluster explicitly non-production.
+
+**Before you leave this section**
+
+- **Understand:** Orchestration answers restart, place, scale, discover, and roll back—without a human clipboard.
+- **Try:** Map each 3 a.m. question in the table to a later chapter you will open.
+- **Watch in prod:** Teams running Kubernetes without requests, without Git, and without an upgrade plan.
+
 ---
 
 ## 11.3 Imperative and declarative
@@ -121,6 +133,8 @@ A useful rule of thumb: adopt Kubernetes when you have **many services, more tha
 ### In plain terms
 
 Imperative is a *recipe*: "boil water, add pasta, drain after nine minutes." Declarative is an *order*: "I would like a plate of pasta, al dente." The recipe tells someone what to do; the order tells them what you want, and lets them figure out the steps — including what to do when the water boils over.
+
+The problem declarative config solves is *intent that survives the operator*: the cluster remembers what should be true, not only what command last ran. That is the difference between shell history and a Git-reviewed contract.
 
 With Docker you were imperative:
 
@@ -139,6 +153,7 @@ With Kubernetes you mostly write down what you want and let the cluster keep tha
 # "There should always be three healthy copies of task-api:1.0."
 ```
 
+> ⚠️ **Common Pitfall:** You might think imperative `kubectl run` is "just as good" if you write it down in a wiki. Wikis drift; `apply` from Git is the auditable desired state.
 ### Under the hood
 
 Kubernetes accepts both styles, and the difference shows up in how state is stored.
@@ -181,6 +196,14 @@ Declarative configuration is the entry ticket to every practice that makes clust
 - **Safe collaboration.** Server-side apply lets several controllers own different fields of the same object without fighting each other.
 
 > ⚠️ **Warning:** `kubectl edit` and `kubectl scale` change the cluster but not your files. The next `apply` will silently revert your change, usually at the worst possible moment. Treat live edits as emergency surgery: allowed, then immediately reflected back into the repository.
+
+> 🏭 **Production floor:** Declarative Git is the audit trail. If an incident fix only exists as `kubectl edit`, the next apply or the next on-call will undo it. Paste the PR link and the `kubectl apply` revision into the ticket—not "I fixed it on the cluster."
+
+**Before you leave this section**
+
+- **Understand:** `apply` records managed fields; imperative edits fight Git.
+- **Try:** Apply the same manifest twice and watch `created` vs `unchanged`.
+- **Watch in prod:** Live edits that never land back in the repository.
 
 ---
 
@@ -239,6 +262,14 @@ The loop shapes how you debug and how you design:
 - **Fix causes, not symptoms.** If Pods restart in a loop, the loop is working correctly and your container is not.
 
 > 💡 **Tip:** Whenever something in the rest of this book "just fixes itself," pause and name the controller responsible. That habit turns Kubernetes from magic into mechanism.
+
+> ⚠️ **Common Pitfall:** Deleting a Pod owned by a Deployment and celebrating "I fixed it" when a replacement appears. You exercised reconciliation; you did not change desired state. Edit the Deployment (or scale) if the intent changed.
+
+**Before you leave this section**
+
+- **Understand:** Controllers observe, compare, act, and write status—forever.
+- **Try:** Delete a Deployment-owned Pod and name the controller that recreates it.
+- **Watch in prod:** Humans fighting controllers instead of changing `spec`.
 
 ---
 
@@ -319,6 +350,12 @@ DESCRIPTION:
 - **Annotations are for tools.** Anything non-identifying — checksums, controller hints, change-cause notes — belongs in annotations, which are never used for selection.
 
 > 📘 **Deep Dive (optional):** The `apiVersion` field encodes a group and a version, such as `apps/v1` (group `apps`) or plain `v1` (the legacy core group, whose group name is the empty string). Groups let Kubernetes evolve independently in different areas, and versions (`v1alpha1` → `v1beta1` → `v1`) encode stability promises. This book uses GA (`v1`) APIs everywhere; Chapter 12 shows how to list what your cluster serves.
+
+**Before you leave this section**
+
+- **Understand:** Every object shares apiVersion/kind/metadata/spec; status is observed.
+- **Try:** `kubectl explain pod.spec.containers.image` on your cluster.
+- **Watch in prod:** Label schemes that differ per team and break Service selectors.
 
 ---
 
@@ -427,6 +464,14 @@ Your laptop cluster is a learning environment, not a small production cluster. R
 | Access control | Your kubeconfig is cluster-admin | RBAC per team, short-lived credentials (Chapter 21) |
 
 The habit worth building today is context hygiene: check `kubectl config current-context` before anything destructive. "I thought I was on staging" is the single most expensive sentence in cluster operations.
+
+> ⚠️ **Common Pitfall:** Treating kind as a tiny production cluster—single control plane, no real LB, local storage. Use it to learn APIs; do not invent HA stories from it.
+
+**Before you leave this section**
+
+- **Understand:** kind gives a real 1.36 API on your laptop; contexts select clusters.
+- **Try:** Create the three-node kind cluster and verify `kubectl get nodes` shows v1.36.0.
+- **Watch in prod:** Wrong-context deletes; pin kind node image digests in CI.
 
 ---
 
@@ -587,6 +632,14 @@ Two habits to start now:
 
 - **Store manifests in Git next to the app.** The image tag and the manifest that deploys it should move through review together.
 - **Pin image tags.** `:latest` means two nodes can run two different builds of "the same" version, and rollbacks stop being meaningful. This book always pins (`:1.0`), and digests (`@sha256:…`) are better still.
+
+> 🏭 **Production floor:** Never leave bare Pods as the production shape—wrap them in a Deployment (Chapter 14). Pin images by **digest** for regulated paths: PR → scan → promote digest → apply → rollback to the previous digest. Paste digest and context name into the incident ticket.
+
+**Before you leave this section**
+
+- **Understand:** Imperative Pods teach; declarative controllers last.
+- **Try:** Delete a bare Pod and confirm nothing replaces it; then try the same with a Deployment.
+- **Watch in prod:** `:latest` tags and unmanaged Pods in app namespaces.
 
 ---
 

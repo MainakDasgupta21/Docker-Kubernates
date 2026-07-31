@@ -27,6 +27,10 @@ This chapter is about **owning writes deliberately**: server-side apply and fiel
 
 **Client-side apply** (`kubectl apply` the old way) merged locally and sent a big patch. **Server-side apply (SSA)** asks the API server to merge fields and remember *who owns which field* via **field managers**. Conflicts become visible instead of silent last-write-wins surprises.
 
+SSA tracks which manager owns which fields so kubectl, Helm, and controllers do not clobber blindly. Conflicts are evidence, not noise. You might think `kubectl apply` client-side is the same—ownership tracking differs.
+
+> ⚠️ **Common Pitfall:** Mixing client-side apply, SSA, and helm without understanding field managers—mystery resets.
+
 ### Under the hood
 
 Enable SSA on apply (default for recent kubectl in many flows; be explicit in scripts):
@@ -112,14 +116,23 @@ After scaling, `replicas` may be owned by `kubectl-scale` (or similar). The next
 
 ### In production
 
-1. Pick **stable field manager names** per actor (`helm`, `kustomize-controller`, `ci-kubectl`) so conflicts are attributable.
-2. Do not put HPA-managed `replicas` in the same apply path that fights the autoscaler—omit the field or use a patch strategy that leaves it alone.
-3. Prefer SSA in GitOps and platform CLIs; teach humans not to `kubectl edit` fields owned by automation without coordination.
-4. Use `--dry-run=server` in CI to validate admission and merge behavior before merge to main.
+**Ownership:** Platform sets apply conventions; every automation identity is a named field manager.
 
-> ⚠️ **Common Pitfall:** Two GitOps tools both applying the same Deployment with different managers and overlapping fields. One will constantly “fix” the other. One writer per field set.
+**Failure mode:** Field conflicts → apply failures or silent overwrites. Detect with conflict errors in CI/CD. Mitigate with consistent SSA and `kubectl apply --server-side --field-manager=...`.
 
-> 💡 **Tip:** `kubectl diff --server-side -f` (where supported by your kubectl version) helps preview ownership-aware changes before apply.
+| Do | Don't |
+|----|-------|
+| Named field managers per tool | Force overwrite as daily habit |
+| Inspect managedFields in incidents | Three tools editing the same fields |
+
+**Before you leave this section**
+
+- **Understand:** SSA field managers make ownership explicit—use them in prod apply paths.
+- **Try:** Inspect `managedFields` on a Deployment after an apply.
+- **Watch in prod:** Apply wars between CI and operators.
+
+> 🏭 **Production floor:** **SSA field managers** are change-safety evidence. Standardize `--field-manager` names (`helm`, `flux`, `kubectl-ci`). On conflicts: `kubectl get <obj> -o yaml` → read managedFields → decide owner in the ticket—do not `--force-conflicts` without naming who loses.
+
 
 ---
 
@@ -128,6 +141,10 @@ After scaling, `replicas` may be owned by `kubectl-scale` (or similar). The next
 ### In plain terms
 
 **Kustomize** is the built-in way to say: “here is a base app, and here are overlays that tweak it for staging or production”—without forking entire YAML trees or learning a separate templating language. `kubectl -k` runs it natively.
+
+Kustomize overlays patch bases without forked YAML sprawl. Overlays are change-controlled. You might think Kustomize replaces Helm always—different composition models; pick deliberately.
+
+> ⚠️ **Common Pitfall:** Edits in base that surprise every overlay environment.
 
 ### Under the hood
 
@@ -258,12 +275,21 @@ Useful Kustomize features for day-two ops:
 
 ### In production
 
-1. Keep **bases boring** and overlays thin—logic creep in patches becomes unreadable.
-2. Prefer generators for Secrets in CI with sealed/SOPS patterns; do not commit raw production secrets.
-3. Render (`kubectl kustomize`) in CI and diff against the cluster or against a previous render artifact.
-4. Agree whether Helm or Kustomize owns a given app; nesting both without discipline produces mystery meat.
+**Ownership:** App teams own overlays; platform may provide base guardrail patches.
 
-> 📘 **Deep Dive (optional):** Kustomize can set `buildMetadata` and options that interact with origin annotations; combine thoughtfully with server-side apply field managers in GitOps controllers (Flux Kustomization, Argo CD kustomize builds).
+**Failure mode:** Bad base change → all envs break. Detect with rendered diff in PR. Mitigate with CI `kustomize build` diffs per overlay.
+
+| Do | Don't |
+|----|-------|
+| PR diffs of rendered overlays | Hand-edit live and ignore overlays |
+| Keep secrets out of bases | One mega-overlay for all clusters |
+
+**Before you leave this section**
+
+- **Understand:** Kustomize overlays need rendered diffs in CI.
+- **Try:** Build two overlays and diff them.
+- **Watch in prod:** Base changes breaking all environments.
+
 
 ---
 
@@ -272,6 +298,10 @@ Useful Kustomize features for day-two ops:
 ### In plain terms
 
 JSONPath is a **query language for picking fields** out of API objects. Instead of piping YAML through ad-hoc scripts, you ask kubectl for exactly the nodes, images, or IPs you need.
+
+JSONPath extracts fields for scripts and incident triage. Prefer stable fields. You might think scraping human `kubectl` tables in scripts is fine—tables change; JSONPath on objects is stabler.
+
+> ⚠️ **Common Pitfall:** Parsing `kubectl` columnar output in production scripts.
 
 ### Under the hood
 
@@ -317,11 +347,21 @@ Common gotchas:
 
 ### In production
 
-1. Encode JSONPath checks in CI (“every container has a tag, not `:latest`”).
-2. Prefer stable fields (`metadata.name`, `status.phase`) over brittle UI-oriented output.
-3. Document team snippets in a shared cheatsheet (see the kubectl appendix).
+**Ownership:** Everyone writing automation owns resilient queries; platform publishes common snippets.
 
-> ⚠️ **Common Pitfall:** Assuming JSONPath list output always includes separators. Without explicit `{"\n"}` or tabs, names run together.
+**Failure mode:** Broken scripts mid-incident. Detect with CI tests of queries. Mitigate with go-templates/jsonpath against fixtures.
+
+| Do | Don't |
+|----|-------|
+| JSONPath/go-template in scripts | Parse table output |
+| Test queries in CI | Undocumented one-liners as SoT |
+
+**Before you leave this section**
+
+- **Understand:** JSONPath is for stable automation and triage.
+- **Try:** Write a JSONPath that lists image digests for a Deployment.
+- **Watch in prod:** Scripts parsing kubectl tables.
+
 
 ---
 
@@ -330,6 +370,10 @@ Common gotchas:
 ### In plain terms
 
 YAML’s indentation and “helpful” type guessing cause famous bugs (the Norway problem: `NO` becoming boolean `false`). **KYAML** is a Kubernetes-oriented, less ambiguous YAML subset: flow-style objects and arrays, explicitly quoted strings, still parseable as ordinary YAML.
+
+KYAML aims at safer Kubernetes YAML authoring ergonomics—know what your kubectl version supports before standardizing. You might think KYAML changes cluster APIs—it is an authoring/representation concern.
+
+> ⚠️ **Common Pitfall:** Mandating KYAML fleet-wide before toolchain support is even.
 
 ### Under the hood
 
@@ -372,11 +416,21 @@ Compared to classic YAML:
 
 ### In production
 
-1. Adopt KYAML output in tools that round-trip manifests and suffered YAML footguns.
-2. Do not rewrite the world overnight—team familiarity with block YAML still matters.
-3. Treat KYAML as **encoding hygiene**, not a new API; the objects are the same.
+**Ownership:** Platform decides supported authoring formats; keep CI renderers consistent.
 
-> 💡 **Tip:** If `kubectl get -o kyaml` is unexpected in your build of kubectl, check release notes for the KYAML feature state and any `KUBECTL_KYAML` gate leftover from earlier alphas.
+**Failure mode:** Tooling mismatch → rejected manifests. Detect in CI. Mitigate with version-pinned kubectl/kustomize.
+
+| Do | Don't |
+|----|-------|
+| Pin toolchain versions | Mix unsupported KYAML in prod GitOps early |
+| Document team standard | Assume all editors round-trip identically |
+
+**Before you leave this section**
+
+- **Understand:** KYAML is authoring ergonomics—standardize only when tooling is ready.
+- **Try:** Check your kubectl version notes for KYAML support.
+- **Watch in prod:** Format mismatch between local and CI.
+
 
 ---
 
@@ -385,6 +439,10 @@ Compared to classic YAML:
 ### In plain terms
 
 **kubeconfig** is about *which clusters and credentials*. **kuberc** is about *how you like kubectl to behave*: aliases, default flags, and credential plugin policy. Separating them means you can share cluster access files without sharing your personal shortcuts—and vice versa.
+
+kuberc stores kubectl user preferences (aliases, defaults)—helpful locally, dangerous if it hides flags on-call needs. You might think shared kuberc on jump hosts is fine—document it or surprise juniors.
+
+> ⚠️ **Common Pitfall:** Silent defaults that change namespace or output format during incidents.
 
 ### Under the hood
 
@@ -439,12 +497,21 @@ $ kubectl kuberc set --section credentialplugin --policy Allowlist \
 
 ### In production
 
-1. Keep **secrets out of kuberc**—it is for preferences, not tokens.
-2. Check in a *recommended* kuberc snippet for the team (aliases), not mandatory identical files for every laptop.
-3. In CI, set `KUBERC=off` or use a minimal file so aliases cannot hide what a pipeline really runs.
-4. From 1.36 onward, prefer `command` over deprecated `name` in credential plugin allowlist entries.
+**Ownership:** Individuals own laptop kuberc; shared bastions need documented defaults.
 
-> ⚠️ **Common Pitfall:** Debugging a script that behaves differently on your laptop because an alias or default `--interactive` came from kuberc. Reproduce with `KUBERC=off`.
+**Failure mode:** Wrong namespace applies. Detect with prompt showing context/namespace. Mitigate with explicit `-n` in runbooks.
+
+| Do | Don't |
+|----|-------|
+| Explicit -n in runbooks | Rely on hidden default namespace |
+| Document bastion kuberc | Undocumented aliases that mutate clusters |
+
+**Before you leave this section**
+
+- **Understand:** kuberc personalizes kubectl—keep incident commands explicit.
+- **Try:** Inspect whether you use kuberc and what it sets.
+- **Watch in prod:** Wrong-namespace actions from defaults.
+
 
 ---
 
@@ -453,6 +520,10 @@ $ kubectl kuberc set --section credentialplugin --policy Allowlist \
 ### In plain terms
 
 Production images are often distroless: no shell, no `curl`, no package manager. **Ephemeral containers** let you attach a temporary toolbox container to a **running Pod’s namespaces** for debugging—without rebuilding or restarting the app container. `kubectl debug` is the ergonomic CLI for that (and for node copy debugging).
+
+Ephemeral debug containers attach troubleshooting tools without rebuilding images—great for distroless. You might think debug access is always allowed—RBAC and PSA may block; that is good.
+
+> ⚠️ **Common Pitfall:** Granting widespread `pods/ephemeralcontainers` in multi-tenant clusters.
 
 ### Under the hood
 
@@ -494,12 +565,21 @@ RBAC: users need permission to `update` (or the subresource that grants ephemera
 
 ### In production
 
-1. Prefer **ephemeral debug** over `kubectl exec` into app containers when images lack a shell.
-2. Restrict who can debug nodes; node debug Pods can be privileged by design.
-3. Drop debug copies and ephemeral sessions after the incident—do not leave toolbox containers lying around.
-4. Combine with audit logs: debugging is privileged access to process and network context.
+**Ownership:** Platform RBAC-scopes debug; app teams use it under change control in prod.
 
-> ⚠️ **Warning:** Sharing process namespace with a compromised workload can expose secrets in memory or environment. Debug on a need-to-know basis and rotate credentials if exposure is plausible.
+**Failure mode:** Unrestricted debug → lateral movement. Detect with audit on ephemeralcontainers. Mitigate with break-glass RoleBindings.
+
+| Do | Don't |
+|----|-------|
+| Break-glass debug RBAC | Cluster-wide debug permission |
+| Prefer ephemeral over docker.sock | Debug by shipping shells into every image |
+
+**Before you leave this section**
+
+- **Understand:** Ephemeral debug is powerful—scope with RBAC and audits.
+- **Try:** Debug a lab Pod with an ephemeral container.
+- **Watch in prod:** Broad pods/ephemeralcontainers grants.
+
 
 ---
 

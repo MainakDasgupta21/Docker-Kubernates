@@ -34,6 +34,10 @@ You cannot manage what you do not measure, and "is the site up?" is too crude to
 
 The error budget is the quiet genius of SRE. It turns "should we ship this risky change?" from an argument into arithmetic: if you have budget left, ship; if you've burned it, freeze features and fix reliability.
 
+SLIs measure user happiness; SLOs set targets; error budgets decide how much change risk you can afford. You might think 100% SLO is professional—it freezes change and ignores reality.
+
+> ⚠️ **Common Pitfall:** Burning budget with endless risky deploys while paging on vanity metrics.
+
 ### Under the hood
 
 Common SLIs, expressed as ratios of good events to valid events:
@@ -107,13 +111,23 @@ flowchart LR
 
 ### In production
 
-- **Set SLOs from the *user's* perspective, not the server's.** "CPU < 80%" is not an SLO; "checkout completes in < 2 s for 99% of users" is. Measure as close to the user as you can.
-- **Fewer, meaningful SLOs beat dozens of vanity metrics.** Pick the handful that reflect real user pain (availability + latency for the critical path) and defend them.
-- **Use the error budget as policy.** Agree in advance: budget healthy → teams ship features freely; budget exhausted → reliability work takes priority until it recovers. This aligns dev and ops without blame.
-- **Alert on burn rate, not on every blip.** Multi-window, multi-burn-rate alerts page humans only when the budget is genuinely at risk, cutting alert fatigue.
-- **100% is the wrong target.** Chasing 100% is infinitely expensive and removes the budget you need for shipping and maintenance. Choose the *lowest* SLO users won't notice.
+**Ownership:** Service owners own SLOs/budgets; platform provides measurement. Incident evidence includes budget burn charts.
 
-> 💡 **Tip:** Distinguish SLOs (internal targets, e.g. 99.95%) from **SLAs** (contractual promises to customers, e.g. 99.9%, with penalties). Always set your internal SLO *stricter* than any external SLA so you find trouble before customers — and lawyers — do.
+**Failure mode:** Ignored budgets → chronic outages. Detect with burn-rate alerts. Mitigate by freezing risky changes when budget is exhausted.
+
+| Do | Don't |
+|----|-------|
+| User-facing SLIs | CPU as the only SLO |
+| Budget-driven change freeze | 100% targets with no budget |
+
+**Before you leave this section**
+
+- **Understand:** Error budgets connect reliability to change safety.
+- **Try:** Write one SLI/SLO/budget for Task API availability.
+- **Watch in prod:** Deploying through exhausted budgets.
+
+> 🏭 **Production floor:** **Error budgets** gate change: when budget is exhausted, only risk-reducing changes ship. Paste burn rate, remaining budget, and decision (ship/freeze) into the change ticket and incident timeline.
+
 
 ---
 
@@ -124,6 +138,10 @@ flowchart LR
 Classic Kubernetes resources are simple counters: "this pod wants 2 CPUs and 4 GiB of memory." That model breaks down for modern accelerators. A GPU isn't just "one unit" — it has a model, a memory size, a driver version, sharing modes (time-slicing, MIG partitions), and topology constraints. **Dynamic Resource Allocation (DRA)** is the framework that lets workloads *describe* the hardware they need in rich detail, and lets specialized drivers *allocate* it intelligently — instead of pretending a GPU is just another integer in `resources.limits`.
 
 DRA is the way Kubernetes now does AI/GPU scheduling: the core DRA APIs are **stable** (GA) in the 1.34–1.35 window and remain the baseline in **1.36**, where the **DRA admin access** feature itself reached **GA** — giving cluster admins a secure, permanent way to reach devices already in use by other workloads for monitoring and maintenance.
+
+DRA models specialized resources (GPUs) more flexibly than classical Device Plugins alone—follow your 1.36 platform support. You might think requesting `nvidia.com/gpu: 1` is the whole story—drivers, isolation, and scheduling still matter.
+
+> ⚠️ **Common Pitfall:** Mixing classical GPU requests and DRA without a platform standard.
 
 ### Under the hood
 
@@ -222,13 +240,21 @@ Without that label (case-sensitive), the API server refuses the privileged reque
 
 ### In production
 
-- **Prefer DRA over the legacy device-plugin `nvidia.com/gpu: 1` counter for anything nuanced.** Fractional GPUs, MIG partitions, specific memory sizes, and topology-aware placement are what DRA expresses and the old counter cannot.
-- **Restrict `adminAccess` tightly.** Only label the specific namespace(s) your platform/GPU-ops team uses with `resource.kubernetes.io/admin-access: "true"`, and lock down RBAC so only admins can create claims there. It grants access to devices *other tenants are actively using*.
-- **Right-size and share expensive accelerators.** GPUs are the costliest thing in most AI clusters; use DRA's partitioning/consumable-capacity features (advancing in 1.36) plus quotas so one team's idle notebook doesn't hoard an A100.
-- **Watch driver/version skew.** DRA drivers, GPU drivers, and node images must be compatible; a driver mismatch shows up as claims stuck `Pending` with no allocation. Treat the DRA driver as a first-class, monitored component.
-- **Capacity-plan GPUs separately** from CPU/memory — they're scarce, slow to provision, and often the binding constraint for AI workloads (see next section).
+**Ownership:** Platform owns GPU/DRA enablement and node pools; ML app teams consume the published API.
 
-> ⚠️ **Common Pitfall:** Setting `adminAccess: true` in a normal namespace and expecting it to work. The API server rejects it unless the namespace carries the `resource.kubernetes.io/admin-access: "true"` label — a deliberate safeguard against privilege abuse in multi-tenant clusters.
+**Failure mode:** Fragmentation → Pending GPU jobs. Detect with GPU free/allocated metrics. Mitigate with pooling and clear request APIs.
+
+| Do | Don't |
+|----|-------|
+| One platform standard for GPU requests | Snowflake GPU YAML per team |
+| Monitor fragmentation | Overcommit GPUs silently |
+
+**Before you leave this section**
+
+- **Understand:** DRA/GPU needs a platform contract and fragmentation monitoring.
+- **Try:** Read whether your cluster exposes DRA/GPU resources.
+- **Watch in prod:** Pending GPU work from fragmentation.
+
 
 ---
 
@@ -237,6 +263,10 @@ Without that label (case-sensitive), the API server refuses the privileged reque
 ### In plain terms
 
 Capacity planning is answering three questions before your users answer them for you: *How much do we need? How much headroom for spikes and failures? How do we grow without overpaying?* Too little capacity means outages and throttling; too much means burning money on idle nodes. The art is deliberate headroom, not guesswork.
+
+Capacity is requests, limits, headroom for drains, and dependency limits—not only node count. You might think cluster autoscaler removes planning—you still plan quotas and max surge.
+
+> ⚠️ **Common Pitfall:** Autoscaling nodes while the database is the real bottleneck.
 
 ### Under the hood
 
@@ -286,27 +316,21 @@ Requests and limits are the foundation of all of it: the scheduler bin-packs by 
 
 ### In production
 
-- **Plan for N+1 (or N+2) node failures.** Keep enough headroom that losing a node (or a whole zone) doesn't cascade. `PodDisruptionBudget`s ensure voluntary disruptions (drains, upgrades) don't take too many replicas at once:
+**Ownership:** Platform owns cluster headroom; app teams own workload forecasts and dependency caps.
 
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: task-api
-  namespace: tasks
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: task-api
-```
+**Failure mode:** Surprise saturation → SLO burn. Detect with allocation vs allocatable and queue depth. Mitigate with seasonal forecasts and load tests.
 
-- **Right-size requests from data, not vibes.** Use VPA recommendations or historical percentiles (e.g. p95 usage) to set requests; review quarterly as traffic changes.
-- **Prefer scaling out to scaling up** for stateless services — more, smaller replicas spread risk and schedule faster than a few huge pods.
-- **Model growth and lead times.** If node provisioning takes minutes (or GPU nodes take *days* to procure), your autoscaler can't save you from a spike; pre-provision headroom for known events (launches, sales).
-- **Track utilization and cost together.** Tools like Kubecost or cloud cost dashboards, joined with your namespace labels from Chapter 31, tell you where money goes and which teams to right-size.
+| Do | Don't |
+|----|-------|
+| Plan drain headroom | 100% allocatable committed |
+| Load-test dependencies | Scale apps past DB capacity |
 
-> 💡 **Tip:** Set HPA `minReplicas` ≥ 2 (usually 3) for anything user-facing. `minReplicas: 1` means a single pod restart is a full outage, no matter how clever the autoscaling.
+**Before you leave this section**
+
+- **Understand:** Capacity planning includes headroom and dependencies.
+- **Try:** Compute % allocatable committed on a node pool.
+- **Watch in prod:** Autoscaler storms that overload DBs.
+
 
 ---
 
@@ -315,6 +339,10 @@ spec:
 ### In plain terms
 
 Disaster recovery (DR) is your answer to "the cluster (or region) is *gone* — now what?" It rests on two numbers you must choose *before* the disaster: **RTO (Recovery Time Objective)**, how long you can be down, and **RPO (Recovery Point Objective)**, how much data you can afford to lose. A backup you have never restored is not a backup; it's a hope. DR is the rehearsed ability to get back.
+
+DR is etcd + app data + registry artifacts + runbooks with tested RTO/RPO. You might think multi-AZ equals DR—regional loss needs a story.
+
+> ⚠️ **Common Pitfall:** etcd backups without app datastore restores.
 
 ### Under the hood
 
@@ -382,13 +410,23 @@ flowchart LR
 
 ### In production
 
-- **GitOps *is* your DR for cluster config.** If every manifest lives in Git and a controller (Argo CD/Flux) reconciles it, rebuilding a cluster is "point the controller at the repo." That covers desired state; you still need PV data and any imperative bits (etcd-only objects).
-- **Restore-test on a schedule.** A quarterly game day where you actually restore etcd/Velero into a scratch cluster is the only proof your DR works. Untested backups fail exactly when you need them.
-- **Store backups off the cluster and cross-region.** Backups on the same failure domain die with it. Encrypt them; they contain Secrets.
-- **Know who owns what on managed Kubernetes.** The provider backs up the control plane/etcd; *you* still own PV data and object-level backups (Velero). Don't assume "managed" means "backed up for me."
-- **Write RTO/RPO into the runbook** so on-call knows the target and the procedure, not just the theory.
+**Ownership:** Platform owns control-plane DR; app teams own data-plane RPO/RTO drills.
 
-> ⚠️ **Warning:** etcd snapshots contain **Secrets** (base64, and only encrypted at rest if you enabled encryption-at-rest). Treat backup files as top-secret: encrypt, restrict access, and audit who can read them.
+**Failure mode:** Untested DR → extended outage. Detect with drill cadence metrics. Mitigate with scheduled game days.
+
+| Do | Don't |
+|----|-------|
+| Game-day restores | Paper-only DR plans |
+| Separate etcd vs app data | Single-region hope as DR |
+
+**Before you leave this section**
+
+- **Understand:** DR requires tested restores for control plane and app data.
+- **Try:** List RTO/RPO for Task API and last drill dates.
+- **Watch in prod:** Backups never restored.
+
+> 🏭 **Production floor:** Tie DR to **etcd backup tested restores** plus application snapshot/restore evidence. Game days produce timestamps and owners in the ticket—not slideware.
+
 
 ---
 
@@ -397,6 +435,10 @@ flowchart LR
 ### In plain terms
 
 At 3 a.m., a paged engineer has adrenaline, not genius. A **runbook** is a pre-written, step-by-step guide for a specific alert or failure so the response is a *checklist*, not an improvisation. Good runbooks convert institutional knowledge (usually stuck in one senior engineer's head) into something anyone on-call can execute.
+
+Runbooks encode detect→mitigate→evidence. They name owners, blast radius, and first commands. You might think tribal knowledge is faster—until the primary is on a flight.
+
+> ⚠️ **Common Pitfall:** Runbooks that say “fix it” without commands, owners, or rollback.
 
 ### Under the hood
 
@@ -447,13 +489,21 @@ Note the order: **mitigate before you diagnose**. Rolling back a bad deploy to r
 
 ### In production
 
-- **Every paging alert should link to a runbook.** An alert with no runbook is a 3 a.m. research project. Put the runbook URL in the alert annotation (`runbook_url`).
-- **Mitigate, then investigate.** Prefer fast, reversible mitigations (rollback, scale out, feature flag off, shed load) over root-causing live. Restore service first.
-- **Run blameless postmortems.** Focus on *systems and processes* that let the failure happen, not on who typed the command. Blame kills the honesty that prevents repeats. Track action items to completion.
-- **Rehearse with game days / chaos engineering.** Deliberately kill a node, expire a cert, or fail a dependency in staging (or carefully in prod) to test runbooks and find gaps before real incidents do.
-- **Keep runbooks with the code and review them.** Stale runbooks (wrong command, renamed service) are worse than none. Treat them as living docs in the repo, updated after every incident.
+**Ownership:** Service owners maintain runbooks; platform maintains cluster-level ones. Link from alerts.
 
-> 💡 **Tip:** Define severity levels (SEV1/2/3) with clear criteria and expectations up front, so the person paged knows immediately whether to wake the VP or fix it and file a ticket. Ambiguous severity wastes the most precious incident resource: time.
+**Failure mode:** Missing runbook → slow MTTR. Detect with postmortems citing missing docs. Mitigate with alert→runbook URLs and quarterly reviews.
+
+| Do | Don't |
+|----|-------|
+| Alert links to runbook | Orphan alerts without owners |
+| Paste evidence templates | Heroics without timelines |
+
+**Before you leave this section**
+
+- **Understand:** Runbooks make detect→mitigate repeatable with evidence.
+- **Try:** Write a one-page runbook for Task API 5xx burn.
+- **Watch in prod:** Alerts without runbook links.
+
 
 ---
 

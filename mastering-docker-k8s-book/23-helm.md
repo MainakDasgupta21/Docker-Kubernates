@@ -33,6 +33,10 @@ Without Helm (or similar tooling), you drown in duplicated manifests across envi
 
 Learn five words thoroughly and Helm stops feeling magical: chart, values, release, repository, template.
 
+Charts package Kubernetes YAML; releases are installed instances; values configure them. You might think Helm replaces understanding manifests—it generates them; you still own the rendered objects.
+
+> ⚠️ **Common Pitfall:** Editing live objects with kubectl and wondering why the next `helm upgrade` fights you. Know what Helm manages.
+
 ### Under the hood
 
 | Term | Meaning |
@@ -63,9 +67,23 @@ flowchart LR
 
 ### In production
 
-1. Pin chart versions in CI; floating `latest` charts are supply-chain risk.
-2. Prefer `helm upgrade --install` with reviewed values files over ad-hoc `--set` chains.
-3. Diff before apply (`helm diff` plugin or rendered manifests in pull requests).
+**Ownership:** Platform may provide an approved chart museum; app teams own their chart values and release names per environment.
+
+**Failure mode:** Mystery diffs after upgrade → outages. Detect with `helm get manifest` vs live SSA managers. Mitigate with GitOps and freeze on kubectl edit for Helm-owned fields.
+
+> 🏭 **Production floor:** Never treat `kubectl edit` as the change record for a Helm-owned object. Paste chart version, release revision, and rendered digest into the incident ticket.
+
+| Do | Don't |
+|----|-------|
+| Treat rendered YAML as the contract | Hand-edit Helm-managed fields in prod |
+| One release name per env/app | Reuse release names across clusters carelessly |
+
+**Before you leave this section**
+
+- **Understand:** Chart / release / values are the core nouns; Helm renders Kubernetes objects.
+- **Try:** Run `helm list -A` and inspect one release’s chart version.
+- **Watch in prod:** Drift between Helm releases and kubectl edits.
+
 
 ---
 
@@ -74,6 +92,10 @@ flowchart LR
 ### In plain terms
 
 Treat a release like a versioned appliance install: install once, upgrade to change settings, roll back when an upgrade misbehaves, uninstall when done.
+
+Install creates a release; upgrade moves it forward; rollback returns to a prior revision. Revision history is incident evidence. You might think rollback undoes PVC data changes—it rolls workload config, not arbitrary volume contents.
+
+> ⚠️ **Common Pitfall:** Upgrading with untested values in prod without `--atomic` or a canary environment.
 
 ### Under the hood
 
@@ -115,9 +137,21 @@ $ helm upgrade --install task-api ./charts/task-api -n tasks -f values-prod.yaml
 
 ### In production
 
-1. Store values per environment in Git; promote by merging, not by editing live clusters.
-2. Practice rollback in staging—know which revision is “last known good.”
-3. Uninstall does not always delete PVCs or CRDs; read chart NOTES and hooks.
+**Ownership:** App teams own upgrade PRs; platform owns chart repo availability and RBAC for deployers.
+
+**Failure mode:** Bad upgrade → broken rollout. Detect with release status and workload SLIs. Mitigate with `--atomic`, staging soak, and known-good revision numbers in the ticket.
+
+| Do | Don't |
+|----|-------|
+| Stage values; use atomic upgrades | Skip `helm history` before rollback |
+| Paste revision + chart version in incidents | Force upgrades that leave failed releases |
+
+**Before you leave this section**
+
+- **Understand:** Upgrade/rollback are change-safety tools; history is evidence.
+- **Try:** Install a chart, upgrade values, rollback, and read `helm history`.
+- **Watch in prod:** Failed releases left uncleaned; untested prod values.
+
 
 ---
 
@@ -126,6 +160,10 @@ $ helm upgrade --install task-api ./charts/task-api -n tasks -f values-prod.yaml
 ### In plain terms
 
 A chart is a directory with metadata (`Chart.yaml`), default knobs (`values.yaml`), and a `templates/` folder full of Go templates that become real Kubernetes objects.
+
+Chart.yaml, values.yaml, templates/, and optionally charts/ dependencies. Keep templates dumb and values explicit. You might think huge default values equal flexibility—they hide unsafe defaults.
+
+> ⚠️ **Common Pitfall:** Shipping `latest` image tags as chart defaults for production profiles.
 
 ### Under the hood
 
@@ -202,9 +240,21 @@ flowchart TB
 
 ### In production
 
-1. Bump **chart** `version` when templates or value schemas change; set **appVersion** to the application release.
-2. Keep secrets out of committed `values.yaml`—use external secret tools or CI injection.
-3. Document required values in `README.md` / `NOTES.txt` for operators.
+**Ownership:** Chart authors own safe defaults (resources, securityContext); consumers override per env.
+
+**Failure mode:** Unsafe defaults → privileged Pods in prod. Detect with policy scans on rendered manifests. Mitigate with CI `helm template | kubeconform/kyverno`.
+
+| Do | Don't |
+|----|-------|
+| Safe production-ready defaults | Privileged defaults “for easier demos” |
+| Document required values | Undocumented required secrets in templates |
+
+**Before you leave this section**
+
+- **Understand:** Charts are files + templates + values; defaults are a security decision.
+- **Try:** Render a chart with `helm template` and read the Deployment.
+- **Watch in prod:** Charts with unsafe defaults reaching prod.
+
 
 ---
 
@@ -213,6 +263,10 @@ flowchart TB
 ### In plain terms
 
 Templates are fill-in-the-blank manifests. Helm merges chart defaults with your values, runs Go templates (plus Sprig helpers), and applies the result as one release.
+
+Go templates turn values into manifests. Prefer `_helpers.tpl` for names/labels. You might think complex logic belongs in templates—prefer values schemata and CI checks over Turing-complete charts.
+
+> ⚠️ **Common Pitfall:** Using `{{ randAlphaNum }}` for Secret data on every upgrade—rotates credentials unintentionally.
 
 ### Under the hood
 
@@ -381,9 +435,21 @@ flowchart LR
 
 ### In production
 
-1. Keep selectors stable across upgrades—changing label schemes orphans ReplicaSets.
-2. Use `helm template` / `helm lint` in CI before merge.
-3. Prefer `nindent` and `{{-` trimming to keep rendered YAML valid.
+**Ownership:** Chart authors own template correctness; CI owns schema validation (`values.schema.json`).
+
+**Failure mode:** Nondeterministic templates → endless diffs and credential rotation. Detect with helm diff plugins in PR. Mitigate by keeping templates deterministic.
+
+| Do | Don't |
+|----|-------|
+| Deterministic renders | Random IDs in Secrets on each upgrade |
+| helpers for labels/names | Copy-paste name logic across files |
+
+**Before you leave this section**
+
+- **Understand:** Templates must be deterministic and reviewable via `helm template`.
+- **Try:** Change one value and diff the rendered output.
+- **Watch in prod:** Nondeterministic upgrades causing churn.
+
 
 ---
 
@@ -392,6 +458,10 @@ flowchart LR
 ### In plain terms
 
 Scaffold, replace the sample app with Task API, dry-run until the YAML looks right, then install. Package the chart when you are ready to share it.
+
+Iterate with `helm template`, `lint`, and a scratch namespace before prod. Pin chart versions in GitOps. You might think floating chart versions track “security”—unpinned charts can change under you mid-incident.
+
+> ⚠️ **Common Pitfall:** Debugging only with `helm install` failures instead of rendering first.
 
 ### Under the hood
 
@@ -476,15 +546,35 @@ flowchart LR
 
 ### In production
 
-1. Add PDB, HPA, securityContext, and NetworkPolicy templates as the chart matures (Chapters 20–24).
-2. Render and review diffs in pull requests—never surprise-apply to prod.
-3. Sign and scan chart packages in regulated environments.
+**Ownership:** App teams ship chart version bumps via PR; platform may mirror approved charts.
+
+**Failure mode:** Unpinned chart dependency → surprise CVE or breaking change. Detect with lock files and SBOM of charts. Mitigate with version pins and staged rollouts.
+
+| Do | Don't |
+|----|-------|
+| Pin chart versions; review diffs | Float versions in prod GitOps |
+| lint + template in CI | First test in production |
+
+**Before you leave this section**
+
+- **Understand:** Render and lint before install; pin versions for change safety.
+- **Try:** Add a CI step that runs `helm lint` and `helm template`.
+- **Watch in prod:** Unpinned chart bumps during incidents.
+
 
 ---
 
 ## 23.7 Hooks and dependencies (briefly)
 
+### In plain terms
+
 Charts may declare **dependencies** in `Chart.yaml` (for example, a Redis subchart) and fetch them with `helm dependency update`. **Hooks** run Jobs annotated to execute before/after install or upgrade. Use hooks sparingly—they complicate GitOps and rollbacks.
+
+Dependencies solve “ship a known subchart version with my app.” Hooks solve “run a Job at a lifecycle point.” You might think hooks are free automation—failed hooks leave releases stuck and confuse GitOps reconciles.
+
+> ⚠️ **Common Pitfall:** Using hooks for ordinary Deployments that belong in the main chart templates—hooks should be exceptional.
+
+### Under the hood
 
 ```mermaid
 flowchart TB
@@ -496,7 +586,26 @@ flowchart TB
 
 *Figure 23.5: Subcharts are fetched as dependencies; hooks attach Jobs to install/upgrade phases—use both sparingly in GitOps flows.*
 
+Pin dependency versions in `Chart.lock`. What breaks if a hook Job hangs: the Helm release may sit in pending-install/upgrade until timeout—have a delete/cleanup path documented.
+
 > 📘 **Deep Dive (optional):** Helm is not the only packager—Kustomize, Jsonnet, and GitOps tools also manage manifests. Many teams render Helm in CI and apply the output, or use Helm inside Argo CD / Flux.
+
+### In production
+
+**Ownership:** Chart authors own dependency pins and any hooks; platform GitOps owners decide whether hooks are allowed at all.
+
+**Failure mode:** Stuck hook → blocked release. Detect with release status and Job logs. Mitigate by preferring Jobs/Controllers in-chart or external pipelines over hooks.
+
+| Do | Don't |
+|----|-------|
+| Pin deps with Chart.lock | Float dependency versions in prod |
+| Prefer CI Jobs over Helm hooks when possible | Rely on hooks for critical data migrations without runbooks |
+
+**Before you leave this section**
+
+- **Understand:** Dependencies pin subcharts; hooks attach lifecycle Jobs—both need change safety.
+- **Try:** Run `helm dependency update` on a chart with a subchart and inspect `charts/`.
+- **Watch in prod:** Releases stuck on failed hooks.
 
 ---
 

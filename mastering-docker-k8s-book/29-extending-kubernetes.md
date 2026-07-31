@@ -27,6 +27,10 @@ On Kubernetes **1.36**, declarative admission took a major step forward: **Mutat
 
 A **CustomResourceDefinition** teaches the API server a new noun. After you apply a CRD for `BackupSchedule`, `kubectl get backupschedules` works like `kubectl get pods`. The API stores your objects in etcd; it does not automatically *do* anything with them until a controller watches and reconciles.
 
+CRDs extend the API with new resource types. They are contracts—breaking schemas break controllers and users. You might think CRDs are “just YAML”—they are API surface with upgrade duties.
+
+> ⚠️ **Common Pitfall:** Shipping CRDs without conversion strategy when changing versions.
+
 ### Under the hood
 
 Minimal CRD for a namespaced `TaskBatch` in group `tasks.example.com`:
@@ -129,12 +133,21 @@ Versioning tips:
 
 ### In production
 
-1. Own CRDs like APIs: review schemas, publish docs, and avoid silent breaking changes.
-2. Use **status subresources** so controllers can update status without fighting users on `spec`.
-3. Gate who can create CRDs themselves (cluster-admin territory) versus who can create *instances*.
-4. Watch etcd size—chatty custom resources with huge specs add real cost.
+**Ownership:** Platform/extension owners own CRD lifecycle; app teams consume documented versions only.
 
-> 💡 **Tip:** Start with a CRD + a small controller. Only reach for aggregated API servers when you need non-standard storage, special verbs, or protocols CRDs cannot express cleanly.
+**Failure mode:** Breaking CRD change → controller mass failure. Detect with webhook/conversion errors. Mitigate with served versions and staged deprecation.
+
+| Do | Don't |
+|----|-------|
+| Version and convert carefully | Delete CRDs that still have CRs |
+| RBAC for new resources | Cluster-admin for every operator |
+
+**Before you leave this section**
+
+- **Understand:** CRDs are API contracts with upgrade and RBAC duties.
+- **Try:** Inspect a CRD’s versions and stored version.
+- **Watch in prod:** Breaking CRD upgrades without conversion.
+
 
 ---
 
@@ -143,6 +156,10 @@ Versioning tips:
 ### In plain terms
 
 An **operator** is a controller (often packaged with its CRDs) that encodes human operational knowledge: provision a database, rotate its certificates, take backups, fail over. Users declare *what* they want (`kind: PostgresCluster`); the operator continuously drives the cluster toward that desire.
+
+Operators reconcile desired CR state to reality. Bugs amplify with cluster-admin. You might think more operators always mean more automation—each adds failure domain and RBAC surface.
+
+> ⚠️ **Common Pitfall:** Operators running as cluster-admin “to get it working.”
 
 ### Under the hood
 
@@ -216,12 +233,21 @@ spec:
 
 ### In production
 
-1. **Level-triggered, idempotent** reconcile—retries are normal, not exceptional.
-2. Emit events and metrics; operators without observability are silent liability.
-3. Define upgrade contracts for both the operator Deployment *and* the CRD schema.
-4. Prefer mature operators (cert-manager, external-dns, cloud CSI helpers) over writing your own until the domain knowledge is truly yours.
+**Ownership:** Platform approves operators; owners on-call for their controllers.
 
-> ⚠️ **Common Pitfall:** Treating the operator Pod as the source of truth. The custom resource in etcd is the source of truth; the operator is a worker that may be rescheduled at any time.
+**Failure mode:** Reconcile loops gone wrong → cascading changes. Detect with leader metrics and audit of operator SA. Mitigate with least-privilege Roles and rate limits.
+
+| Do | Don't |
+|----|-------|
+| Least-privilege operator SA | cluster-admin operators |
+| On-call + runbook per operator | Install operators without upgrade plan |
+
+**Before you leave this section**
+
+- **Understand:** Operators are controllers with blast radius—privilege and on-call required.
+- **Try:** Map one operator’s SA and Role rules.
+- **Watch in prod:** Over-privileged operators.
+
 
 ---
 
@@ -230,6 +256,10 @@ spec:
 ### In plain terms
 
 CRDs extend the *same* apiserver process with new types. The **aggregation layer** lets you run a *separate* extension API server and register it so that `kubectl` and clients still talk to the front door (`kube-apiserver`), which proxies specific API groups to your backend.
+
+Aggregation mounts extension API servers behind the main API. Powerful and operationally heavy. You might think aggregation is required for every CRD—CRDs usually suffice.
+
+> ⚠️ **Common Pitfall:** Choosing aggregation when a CRD+controller would do.
 
 ### Under the hood
 
@@ -287,20 +317,21 @@ Front-proxy certificates (chapter 28’s `front-proxy-ca`) authenticate the apis
 
 ### In production
 
-1. Treat extension API servers as **control-plane critical**—if they hang, parts of `kubectl` hang.
-2. Use proper TLS and `caBundle`; avoid `insecureSkipTLSVerify` outside labs.
-3. Prefer CRDs unless you have a concrete aggregation requirement.
-4. Monitor `APIService` availability (`kubectl get apiservices`).
+**Ownership:** Platform owns aggregated API HA and authn wiring.
 
-```bash
-$ kubectl get apiservices | head
-NAME                                   SERVICE                      AVAILABLE   AGE
-v1.                                    Local                        True        40d
-v1.apps                                Local                        True        40d
-v1beta1.metrics.k8s.io                 kube-system/metrics-server   True        10d
-```
+**Failure mode:** Extension API down → clients fail for those resources. Detect with apiservice availability. Mitigate with HA extension servers and documented dependencies.
 
-> 📘 **Deep Dive (optional):** Aggregation is how some service-mesh and policy products expose rich APIs without merging into kubernetes/kubernetes core. Reading an `APIService` object is often the fastest way to discover which extension owns a given `apiGroup`.
+| Do | Don't |
+|----|-------|
+| Prefer CRDs unless you need aggregation | Snowflake extension API without HA |
+| Monitor APIServices | Ignore TLS/authn for extension servers |
+
+**Before you leave this section**
+
+- **Understand:** Aggregation is specialized; CRDs cover most extension needs.
+- **Try:** List APIServices and note unavailable ones.
+- **Watch in prod:** Unavailable aggregated APIs.
+
 
 ---
 
@@ -309,6 +340,10 @@ v1beta1.metrics.k8s.io                 kube-system/metrics-server   True        
 ### In plain terms
 
 Admission webhooks are **phone-a-friend** checks during API requests. After authentication and authorization, the apiserver can call your HTTPS endpoint to **mutate** (change) or **validate** (allow/deny) the object before it is persisted.
+
+Validating/mutating webhooks enforce policy at admit time. Failure policy and timeouts are production settings. You might think a down webhook only blocks bad objects—`Fail` can block the API for matching resources.
+
+> ⚠️ **Common Pitfall:** `failurePolicy: Fail` without HA webhooks on critical resources.
 
 ### Under the hood
 
@@ -356,13 +391,23 @@ Ordering and risk:
 
 ### In production
 
-1. Keep webhooks **highly available** and cheap; autoscale and watch p99 latency.
-2. Scope `rules` and `namespaceSelector` / `objectSelector` tightly—never “all resources” without extreme care.
-3. Set `sideEffects: None` when you can; it enables dry-run safety.
-4. Have a break-glass path (remove or ignore the webhook) documented for control-plane recovery.
-5. On Kubernetes 1.36, ask whether a **CEL admission policy** can replace the webhook entirely (next sections).
+**Ownership:** Platform owns webhook HA and failurePolicy; policy teams own rules.
 
-> ⚠️ **Warning:** A broken mutating webhook with `failurePolicy: Fail` can block Pod creation cluster-wide—including the webhook’s own repair Pods if you mismanage selectors. Always exclude critical system namespaces or the webhook’s namespace from match criteria when appropriate.
+**Failure mode:** Webhook outage → create/update failures cluster-wide for matched resources. Detect with webhook latency/error and API error rates. Mitigate with HA, timeouts, and careful namespace selectors.
+
+> 🏭 **Production floor:** A single-replica validating webhook with `failurePolicy: Fail` on Pods is a cluster-wide outage waiting to happen. Treat webhook HA like control-plane HA.
+
+| Do | Don't |
+|----|-------|
+| HA webhooks + sensible failurePolicy | Single-replica Fail webhooks on Pods |
+| Exclude kube-system carefully | Mutate without SSA awareness |
+
+**Before you leave this section**
+
+- **Understand:** Webhooks are on the admit path—HA and failurePolicy are safety.
+- **Try:** Inspect a validating webhook’s failurePolicy and namespaceSelector.
+- **Watch in prod:** Admit outages from Fail + down webhooks.
+
 
 ---
 
@@ -371,6 +416,10 @@ Ordering and risk:
 ### In plain terms
 
 A **ValidatingAdmissionPolicy** is a validating webhook written as **declarations and CEL expressions** inside the apiserver. No sidecar service, no TLS bundle rotation for your app, no extra Deployment to page on. You express rules like “every Pod must set `runAsNonRoot`” in CEL; the API server evaluates them in-process.
+
+In-process CEL policies reduce webhook sprawl for many validation cases (stable path on modern clusters). You might think CEL replaces all webhooks—complex side effects still need webhooks/operators.
+
+> ⚠️ **Common Pitfall:** Policies that deny broadly without warn/dry-run rollout.
 
 ### Under the hood
 
@@ -432,10 +481,21 @@ validations:
 
 ### In production
 
-1. Roll out with **Warn/Audit** first; switch to Deny when dashboards look clean.
-2. Keep expressions small and readable; complex policies belong in tests (Kubernetes provides policy test helpers in the ecosystem).
-3. Use bindings’ selectors to stage by namespace.
-4. Remember policies cannot replace every webhook—external data lookups and multi-step side effects still need services or operators.
+**Ownership:** Platform owns policy engine enablement; security owns policy content rollouts.
+
+**Failure mode:** Bad policy → mass deny. Detect with deny metrics and audit annotations. Mitigate with warn → enforce and staged namespace matchers.
+
+| Do | Don't |
+|----|-------|
+| warn/audit before enforce | Enforce global denies on day one |
+| Test CEL against sample objects | Unowned policies nobody can revert |
+
+**Before you leave this section**
+
+- **Understand:** CEL ValidatingAdmissionPolicy is in-process validation with staged rollout.
+- **Try:** Read one ValidatingAdmissionPolicy and its bindings.
+- **Watch in prod:** Sudden mass denies from new policies.
+
 
 ---
 
@@ -444,6 +504,10 @@ validations:
 ### In plain terms
 
 If ValidatingAdmissionPolicy is the bouncer who rejects bad outfits, **MutatingAdmissionPolicy** is the stylist who quietly adds the missing badge on the way in. As of Kubernetes **1.36**, MutatingAdmissionPolicy is **GA** (`admissionregistration.k8s.io/v1`), enabled by default—mutations via CEL without running a mutating webhook server.
+
+MutatingAdmissionPolicy (GA in **1.36**) mutates objects in-API with CEL-oriented policies—another way to enforce defaults without a webhook. You might think mutation order does not matter—managers and webhooks still interact.
+
+> ⚠️ **Common Pitfall:** Mutating the same fields from Helm, SSA, and policies without a field-owner story.
 
 ### Under the hood
 
@@ -535,13 +599,21 @@ Use match conditions so you do not stack duplicate sidecars on every update. Pol
 
 ### In production
 
-1. Prefer **MutatingAdmissionPolicy** for common label/annotation/defaulting work; reserve webhooks for complex external decisions.
-2. Set `reinvocationPolicy` deliberately (`IfNeeded` vs `Never`) when multiple mutators interact.
-3. Pair mutations with **ValidatingAdmissionPolicy** so required post-mutation shape is enforced.
-4. Treat policy YAML as critical config: code review, GitOps, and staged bindings.
-5. Load-test admission QPS after adding heavy CEL—cheap expressions stay cheap; pathological ones tax the apiserver.
+**Ownership:** Platform owns mutation policy rollout; document field ownership vs SSA managers.
 
-> 💡 **Tip:** On 1.36, a practical migration path is “inventory mutating webhooks → classify as pure CEL vs needs external data → replace the pure CEL set with MutatingAdmissionPolicy → keep a thin webhook for the rest.”
+**Failure mode:** Fighting managers → apply errors. Detect with SSA conflict metrics. Mitigate with clear owner per field and staged mutation.
+
+| Do | Don't |
+|----|-------|
+| Document who owns mutated fields | Silent mutations in prod without warn |
+| GA features still need soak | Mutate secrets into plaintext env carelessly |
+
+**Before you leave this section**
+
+- **Understand:** MutatingAdmissionPolicy (GA 1.36) needs field-ownership discipline.
+- **Try:** Compare a mutation policy to your SSA field managers.
+- **Watch in prod:** Apply conflicts after mutation policies ship.
+
 
 ---
 
