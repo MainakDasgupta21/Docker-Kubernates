@@ -4,19 +4,23 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Manage the full container lifecycle: create, start, stop, restart, pause, remove
-> - Debug with logs, logging drivers, `exec`, `docker debug`, inspect, and port mappings
-> - Apply CPU/memory limits and understand basic pressure symptoms
-> - Choose restart policies intentionally
-> - Distinguish ephemeral container filesystems from data you must persist
+> - Move a container through its whole life: create, start, stop, restart, pause, remove
+> - Find out why a container failed using logs, `inspect`, `exec`, `docker debug`, and port checks
+> - Set memory and CPU limits, and recognize what running out of each looks like
+> - Pick a restart policy on purpose instead of copying one
+> - Tell which files disappear when a container is removed, and which data you must keep
 
 ---
 
 ## 05.1 Pets, Cattle, and a Stubborn Process
 
-Old-school servers were pets: named, unique, nursed back to health. Containers work better as cattle: if one is sick, you check the logs, then replace it from the same image. The skill is not “SSH in and edit until it works”—it is **lifecycle control + diagnosis**.
+Old-school servers were pets. Each one had a name, its own quirks, and a team that nursed it back to health whenever it got sick.
 
-You already built `task-api:0.1.0` in Chapter 04. This chapter uses it (or `nginx:alpine` if you need a stand-in) to practice professional container operations on a single host.
+Containers work better as cattle. When one misbehaves, you read its logs, learn what went wrong, and replace it with a fresh copy from the same image. Nobody logs in to hand-repair it.
+
+That changes which skill matters. It is not “connect to the box and edit files until it works.” It is controlling the container’s life cycle and diagnosing failures from the outside.
+
+You built `task-api:0.1.0` in Chapter 04. This chapter uses it to practice real container operations on one machine. If you skipped that chapter, `nginx:alpine` works as a stand-in.
 
 ---
 
@@ -24,9 +28,13 @@ You already built `task-api:0.1.0` in Chapter 04. This chapter uses it (or `ngin
 
 ### In plain terms
 
-A container is born (created), can run, pause, stop, restart, and eventually be removed. `docker run` is a convenience that creates and starts in one step.
+The **container lifecycle** is the short list of states a container can be in, and the commands that move it from one to the next. It is created, then running, then possibly paused, then exited, and finally removed.
 
-Lifecycle fluency is what separates “I can follow a tutorial” from “I can operate a host.” Most outages are not exotic—they are exited containers, name conflicts, or restart storms that nobody inspected.
+Why memorize a state list? Because almost every question you will ask about a container is really a question about which state it is in. “Is it up?” “Why did it stop?” “Why can I not reuse this name?” Most small outages are not exotic. They are a container that quietly exited, a name still held by a dead container, or a container restarting in a loop that nobody looked at.
+
+One shortcut is worth knowing right away. `docker run` is not a separate state. It creates the container and starts it in a single step, which is why beginners rarely see the created state at all.
+
+> 💡 **In one line:** A container is always in exactly one state—created, running, paused, exited, or removed—and every command you type is just a move between two of them.
 
 ```mermaid
 stateDiagram-v2
@@ -45,15 +53,17 @@ stateDiagram-v2
 
 | State (simplified) | Meaning |
 |--------------------|---------|
-| Created | Config exists; process not started |
-| Running | Main process is alive |
-| Paused | Process frozen via cgroups freezer |
-| Exited / Stopped | Process ended (any exit code) |
-| Removed | No longer present on the daemon |
+| Created | Settings exist; the process has not started |
+| Running | The main process is alive |
+| Paused | The process is frozen in place by the kernel’s cgroup freezer |
+| Exited / Stopped | The process ended, with any exit code |
+| Removed | Gone from the daemon entirely |
 
-> ⚠️ **Common Pitfall:** Using `docker run` for every experiment without `--rm` or `--name`. Exited containers pile up and the next `run --name` fails with a conflict.
+> ⚠️ **Common Pitfall:** Running every experiment with plain `docker run`, without `--rm` or `--name`. Exited containers pile up invisibly, and the next `run --name` fails because a dead container still holds the name.
 
 ### Under the hood
+
+Here is the full lifecycle, one command at a time:
 
 ```bash
 $ docker create --name task-api -p 8000:8000 task-api:0.1.0
@@ -72,7 +82,7 @@ One-shot convenience:
 $ docker run --rm --name task-api -p 8000:8000 task-api:0.1.0
 ```
 
-`docker run` = create + start (plus pull if needed). `--rm` removes the container when it exits—great for experiments, wrong for something you want to `docker start` again later.
+`docker run` equals create plus start, and it pulls the image first if the machine does not have it. The `--rm` flag deletes the container the moment it exits. That is perfect for experiments and wrong for anything you want to `docker start` again later.
 
 List running versus all:
 
@@ -86,17 +96,17 @@ CONTAINER ID   IMAGE            COMMAND                  STATUS         PORTS   
 a1b2c3d4e5f6   task-api:0.1.0   "gunicorn --bind ..."    Up 2 minutes   0.0.0.0:8000->8000/tcp                        task-api
 ```
 
-**What breaks if you `docker rm` a container you still needed for logs:** the writable layer and its local log files (for `json-file`) may be gone. Collect `docker logs` before destructive cleanup when investigating.
+**What breaks if you `docker rm` a container whose logs you still needed:** the writable layer goes away, and with the `json-file` driver its log files go with it. Save `docker logs` output before you delete anything during an investigation.
 
 ### In production
 
-**Ownership:** whoever runs the host owns prune policy; app owners own naming and restart intent for their containers.
+**Ownership:** whoever runs the host decides the cleanup schedule. App owners decide their container names and whether a container should restart.
 
-Name containers deliberately in scripts (`--name`) and prefer `--rm` for CI one-shots. On shared daemons, exited containers accumulate and confuse name conflicts—prune on a schedule, not by panic.
+Give containers explicit names with `--name` in scripts, and use `--rm` for one-shot CI jobs. On a shared daemon, exited containers pile up and cause confusing name conflicts. Clean them on a schedule, not in a panic.
 
-**Failure mode:** disk full of exited containers and unbounded logs. **Detect:** `docker system df`; host disk alerts. **Mitigate:** scheduled prune + log rotation (§05.4).
+**Failure mode:** the disk fills with exited containers and log files that never rotate. **Detect:** `docker system df`, plus disk alerts on the host. **Mitigate:** a scheduled prune and log rotation (§05.4).
 
-**Do:** `docker ps -a` before assuming a name is free. **Don’t:** `rm -f` production containers without capturing exit code and logs.
+**Do:** run `docker ps -a` before assuming a name is free. **Don’t:** run `rm -f` on a production container before you have captured its exit code and logs.
 
 **Before you leave this section**
 
@@ -110,13 +120,17 @@ Name containers deliberately in scripts (`--name`) and prefer `--rm` for CI one-
 
 ### In plain terms
 
-Detached mode (`-d`) runs in the background—like starting a service. Attaching connects your terminal to the main process streams. Publishing ports (`-p`) is how the host reaches the app inside.
+Three separate things decide whether you can reach your app: whether it runs in the background, whether your terminal is connected to it, and whether a port is published.
 
-The misconception: “the container is Up, so the API must be reachable on localhost.” Up means the process is alive—not that you published the right port or that the app listens on `0.0.0.0`.
+**Detached mode** is the `-d` flag. It starts the container in the background and gives you your prompt back, the way starting a service does. **Attaching** connects your terminal to the container’s main process output. **Publishing a port** is the `-p` flag, and it is the only reason a request from your host can reach the app inside.
 
-> ⚠️ **Common Pitfall:** Forgetting `-p` then blaming the application. Listening inside the container is not the same as publishing to the host.
+Why separate them so carefully? Because of one very common misreading: “the container says Up, so the API must be on localhost.” Up only means the process is alive. It says nothing about whether you published the right port, or whether the app inside is listening on an address the outside world can reach.
+
+> ⚠️ **Common Pitfall:** Leaving out `-p` and then blaming the application. Listening inside the container is not the same as publishing to the host.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker run -d --name task-api -p 8000:8000 task-api:0.1.0
@@ -129,7 +143,7 @@ Attach to the main process streams:
 $ docker attach task-api
 ```
 
-Detach from an attached session without stopping the container: the default sequence is `Ctrl-P` then `Ctrl-Q` (not `Ctrl-C`, which may signal the process). Prefer `docker logs` for most debugging.
+To leave an attached session without stopping the container, press `Ctrl-P` then `Ctrl-Q`. Do not press `Ctrl-C`, which sends a signal to the process and often stops it. For most debugging, `docker logs` is the safer tool.
 
 ```bash
 $ docker port task-api
@@ -147,17 +161,17 @@ $ curl -s http://127.0.0.1:8000/healthz
 {"status":"ok"}
 ```
 
-If curl fails but `docker ps` shows Up, check: wrong host port, app bound to `127.0.0.1` inside the container (should be `0.0.0.0`), or firewall/Desktop port sharing issues.
+If curl fails while `docker ps` shows Up, check three things in order. You may have published the wrong host port. The app inside may be listening on `127.0.0.1`, which means “this machine only” and blocks published traffic, when it should listen on `0.0.0.0`. Or a firewall or Docker Desktop file-and-port sharing setting may be in the way.
 
-**What breaks if two containers publish the same host port:** the second `run` fails with a bind error. Pick another host port or stop the first container.
+**What breaks if two containers publish the same host port:** the second `run` fails, because only one process can hold a port. Choose a different host port, or stop the first container.
 
 ### In production
 
-**Ownership:** developers choose what to publish on laptops; platform restricts host-port publishing on shared servers in favor of overlay/user-defined networks.
+**Ownership:** developers decide what to publish on their own laptops. The platform team limits host-port publishing on shared servers and points teams at user-defined networks instead.
 
-Publish only what you must. Prefer user-defined networks for container-to-container traffic (Chapter 06) instead of publishing every service to the host. In Kubernetes later, Services and probes replace ad-hoc `-p` habits—but the “listen on 0.0.0.0 inside the container” lesson remains.
+Publish only what you must. For container-to-container traffic, put the containers on a user-defined network (Chapter 06) rather than publishing each one to the host. In Kubernetes, Services and probes replace the habit of adding `-p` to everything. The other lesson carries over unchanged: inside the container, listen on `0.0.0.0`.
 
-**Do:** verify with `docker port` + curl. **Don’t:** publish databases to `0.0.0.0` on a laptop that shares Wi-Fi without intent.
+**Do:** confirm with `docker port` and a curl before you debug anything else. **Don’t:** publish a database to `0.0.0.0` from a laptop on shared Wi-Fi.
 
 **Before you leave this section**
 
@@ -170,13 +184,17 @@ Publish only what you must. Prefer user-defined networks for container-to-contai
 
 ### In plain terms
 
-Applications should write to **stdout/stderr**. Docker’s logging driver decides where those streams go—local files, a journal, a log platform, or elsewhere. `docker logs` reads what the driver exposes for that container.
+In the container world, an app should print its logs to **stdout** and **stderr**—the two output streams every process already has, normally shown on your terminal. Docker captures both.
 
-If the app only writes to `/var/log/app.log` inside the container, operators looking at `docker logs` see silence—and then invent folklore. Containers standardize the *stream*; you still have to aim your logging at it.
+A **logging driver** is the piece that decides where Docker sends those captured streams: local files on the host, the system journal, or a central logging platform. The `docker logs` command shows you whatever the active driver keeps for that container.
 
-> ⚠️ **Common Pitfall:** Leaving `json-file` logs unbounded on busy hosts. Disk fills; then “mysterious” create/pull failures appear.
+Why does this matter more than it sounds? Because if the app writes only to a file such as `/var/log/app.log` inside the container, `docker logs` shows nothing at all. The operator sees silence, assumes the app is dead, and starts inventing theories. Containers standardize the output stream, but you still have to point your logging at it.
+
+> ⚠️ **Common Pitfall:** Leaving `json-file` logs with no size limit on a busy host. The disk fills, and then unrelated-looking failures appear when Docker cannot create containers or pull images.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 #### Everyday log commands
 
@@ -193,7 +211,7 @@ Exit codes matter:
 $ docker ps -a --filter name=task-api
 ```
 
-Non-zero `Exited (1)` means the process crashed or failed at startup—read logs before restarting in a loop.
+A status of `Exited (1)`, or any non-zero number, means the process crashed or failed while starting. Read the logs before you restart it again and again.
 
 #### Which driver is active?
 
@@ -202,7 +220,7 @@ $ docker info --format '{{.LoggingDriver}}'
 $ docker inspect -f '{{.HostConfig.LogConfig.Type}}' task-api
 ```
 
-The default driver is typically **`json-file`**, which stores JSON log files on the Docker host. Other common drivers include:
+The default driver is usually **`json-file`**, which writes JSON log files onto the Docker host. Other common drivers:
 
 | Driver | Role |
 |--------|------|
@@ -245,26 +263,26 @@ flowchart LR
 
 *Figure 05.2: Applications should log to stdout/stderr; the driver decides whether `docker logs` or an external platform is the reader.*
 
-If an app only writes to an internal file, you will not see it with `docker logs` unless you mount/copy that file—an anti-pattern for containers.
+If an app writes only to a file inside the container, `docker logs` will never show it unless you mount or copy that file out. Avoid that design; print to stdout and stderr instead.
 
-**What breaks if a remote driver does not support `docker logs`:** on-call muscle memory fails. Use the platform UI; document the driver in the runbook.
+**What breaks if a remote driver does not support `docker logs`:** the command that on-call reaches for first returns nothing. Use the logging platform’s own interface, and write the active driver into the runbook so nobody has to guess at 3 a.m.
 
 ### In production
 
-**Ownership:** platform sets default drivers and retention; app teams emit structured logs to stdout/stderr.
+**Ownership:** the platform team sets the default driver and how long logs are kept. App teams make sure their apps print structured logs to stdout and stderr.
 
-- Standardize on a driver strategy: local rotation for laptops; forwarding drivers or sidecars/agents for clusters.
-- Remember: some remote drivers **do not** support `docker logs` the same way—use your log platform’s UI.
-- Treat log volume as a capacity plan item alongside image storage (`docker system df`).
-- Dual-ship carefully (local + remote) only when you understand duplication and retention costs.
+- Pick one logging strategy and apply it consistently: local files with rotation on laptops, forwarding drivers or log agents in clusters.
+- Remember that some remote drivers do not serve `docker logs` the same way. Use the log platform’s interface there.
+- Plan for log volume the way you plan for image storage. `docker system df` shows both.
+- Send logs to two places at once only when you have accounted for the duplicate storage and the cost of keeping both.
 
-**Failure mode:** disk full from logs → node NotReady / daemon unhealthy. **Detect:** disk alerts; `docker system df`. **Mitigate:** rotation defaults; central logging; alert before 100% full.
+**Failure mode:** logs fill the disk, and the node goes NotReady or the daemon becomes unhealthy. **Detect:** disk alerts, plus `docker system df`. **Mitigate:** rotation on by default, central logging, and an alert that fires well before the disk is full.
 
-**Do:** set `max-size`/`max-file` on shared hosts. **Don’t:** `docker restart` without reading logs first.
+**Do:** set `max-size` and `max-file` on every shared host. **Don’t:** run `docker restart` before you have read the logs.
 
-> 🏭 **Production floor:** Unbounded container logs are a host-level blast radius—one chatty service can take down neighbors by filling the disk. Rotation is change-safety for storage, not a nice-to-have.
+> 🏭 **Production floor:** Container logs with no size limit are a host-wide risk. One chatty service can take down every neighbor by filling the disk. Rotation protects storage the way a change window protects a deploy; it is not optional.
 
-> 📘 **Deep Dive (optional):** The `local` driver is optimized for lower overhead than `json-file` while still supporting `docker logs`. See Docker’s logging driver docs when tuning high-churn services on a single host.
+> 📘 **Deep Dive (optional):** The `local` driver costs less overhead than `json-file` and still works with `docker logs`. Read Docker’s logging driver docs when you are tuning a busy service on a single host.
 
 **Before you leave this section**
 
@@ -278,13 +296,17 @@ If an app only writes to an internal file, you will not see it with `docker logs
 
 ### In plain terms
 
-`docker exec` starts a new process inside a *running* container’s namespaces—handy for a quick shell or one-liner. **`docker debug`** (Docker Desktop / supported subscriptions) goes further: it can give you a toolbox shell even when the image is slim or distroless and has no shell of its own.
+`docker exec` starts an extra process inside a container that is already running, so it sees the same files, network, and process list as the app. That is how you get a quick shell, or run a single command, inside a live container.
 
-The misconception: exec is how you configure production. It is forensics. Anything you install vanishes when the cattle container is replaced.
+**`docker debug`** goes further. It attaches a toolbox of debugging programs to a container even when the image itself contains no shell at all. That happens with **distroless** images, which ship only your app and its libraries, with no package manager and no `sh`. Docker Debug comes with Docker Desktop on supported subscriptions.
 
-> ⚠️ **Common Pitfall:** Believing `exec` installs survive image rebuilds. Bake fixes into a new image digest.
+Why the strong warning below? Because these are investigation tools, not configuration tools. A package you install with `exec` lives only in that one container. The moment it is replaced—by a deploy, a crash, a scale-up—your fix is gone.
+
+> ⚠️ **Common Pitfall:** Believing something installed with `exec` survives. It does not survive a restart from a new container, and it certainly does not survive a rebuild. Put the fix in a new image.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 #### Classic `exec`
 
@@ -305,7 +327,7 @@ $ docker exec task-api python -c "import app; print('ok')"
 $ docker exec task-api ps aux
 ```
 
-`exec` starts a **new** process in the container’s namespaces. It is for diagnosis, not for installing permanent packages—those belong in the image build.
+`exec` starts a **new** process next to the app, sharing the container’s isolated view of the system. Use it to look around, not to install packages. Packages belong in the image build.
 
 #### `docker debug`
 
@@ -325,26 +347,26 @@ Non-interactive command form:
 $ docker debug -c "curl -s http://127.0.0.1:8000/healthz" task-api
 ```
 
-Characteristics to remember:
+Things to remember about it:
 
-- Works as an alternative when `docker exec … bash` fails because the image has no shell
-- Ships a customizable toolbox (editors, `curl`, process tools, and more)
-- Available via Docker Desktop CLI/GUI for Pro / Team / Business subscriptions; not a built-in of every standalone Engine install
-- Prefer fixing images and runtime flags for lasting repairs—debug sessions are for investigation
+- It works when `docker exec … bash` fails because the image has no shell.
+- It brings its own toolbox—editors, `curl`, process tools—and you can customize what is in it.
+- It ships with the Docker Desktop CLI and GUI on Pro, Team, and Business subscriptions. It is not part of every standalone Engine install.
+- Use it to investigate. Lasting repairs go into the image or the runtime flags.
 
-> 💡 **Tip:** If `docker debug` is not a recognized command, you are likely on Engine-only Linux without the Desktop debug component—or without a licensed Desktop feature set. Fall back to `exec`, ephemeral `--entrypoint sh` containers, or distroless-friendly debug sidecar patterns.
+> 💡 **Tip:** If `docker debug` is not recognized, you are probably on Engine-only Linux without the Desktop debug component, or on a Desktop plan that does not include it. Fall back to `exec`, to a throwaway container started with `--entrypoint sh`, or to a debug sidecar next to a distroless container.
 
-**What breaks if the container is not running:** classic `exec` fails. Use logs/inspect, `docker debug` on the image, or `docker run --entrypoint` to reproduce.
+**What breaks if the container is not running:** plain `exec` fails, because there is no live process to join. Read the logs, run `docker inspect`, run `docker debug` against the image itself, or reproduce the start with `docker run --entrypoint`.
 
 ### In production
 
-**Ownership:** on-call uses exec/debug under change control; app teams turn findings into Dockerfile/runtime PRs.
+**Ownership:** on-call engineers use `exec` and `debug` under the normal change rules. App teams turn what they learn into a pull request against the Dockerfile or the runtime settings.
 
-Use `exec`/`debug` for forensics, not configuration management. Anything you install in a running container disappears when the container is replaced. Bake fixes into a new image tag/digest and redeploy.
+Use `exec` and `debug` to find out what happened, never to configure a service. Anything you install in a running container is gone the moment that container is replaced. Put the fix in a new image, tag it, and redeploy.
 
-**Failure mode:** snowflake host where “only this container” has the hotfix package. **Detect:** fresh instances fail; config drift reviews. **Mitigate:** rebuild image; redeploy all replicas.
+**Failure mode:** a host where only one container has the hotfix package, and nobody remembers installing it. **Detect:** newly created instances fail while the old one works, and configuration reviews turn up differences. **Mitigate:** rebuild the image and redeploy every replica.
 
-**Do:** capture commands you ran in the incident notes. **Don’t:** leave interactive roots in prod containers as the permanent fix.
+**Do:** write the commands you ran into the incident notes. **Don’t:** leave a hand-patched container running in production and call it fixed.
 
 **Before you leave this section**
 
@@ -358,11 +380,17 @@ Use `exec`/`debug` for forensics, not configuration management. Anything you ins
 
 ### In plain terms
 
-When docs, dashboards, and memory disagree, `docker inspect` shows what the engine actually configured. Dashboards lie by aggregation; inspect shows the object.
+`docker inspect` prints the engine’s own record of a container: every setting it was given, and its current state. It is not a summary. It is the configuration itself.
 
-> ⚠️ **Common Pitfall:** Scrolling megabytes of JSON under pressure instead of templated `-f` queries for the five fields that matter.
+Why lean on it so hard? Because during an incident, the documentation, the dashboard, and everyone’s memory will disagree. A dashboard shows an average across many things and can hide the one that is broken. Inspect shows this exact container, right now, and settles the argument.
+
+The trick is asking for specific fields instead of reading the whole thing. Under pressure, scrolling through megabytes of JSON is how you miss the one line that mattered.
+
+> ⚠️ **Common Pitfall:** Dumping the full JSON during an incident instead of pulling the five fields that matter with `-f`. The answer is usually in `State.Status`, `OOMKilled`, or `RestartCount`.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker inspect task-api
@@ -388,15 +416,15 @@ json-file
 172.17.0.2
 ```
 
-**What breaks if you ignore `OOMKilled`:** you keep raising restarts while the real issue is a memory limit or leak. Always check OOM before blaming application “flakiness.”
+**What breaks if you ignore `OOMKilled`:** you keep restarting a container that the kernel killed for using too much memory. The real problem is either a limit set too low or a memory leak. Check this flag before you call an app “flaky.”
 
 ### In production
 
-**Ownership:** on-call owns the inspect checklist; platform may wrap common `-f` queries in aliases/runbooks.
+**Ownership:** on-call owns the inspect checklist. The platform team may wrap the common `-f` queries into aliases or runbook snippets.
 
-Teach on-call a short inspect checklist: status, exit code, OOMKilled, RestartCount, mounts, port bindings, log driver, env (careful—secrets may appear). Prefer templated `-f` queries over scrolling megabytes of JSON under pressure.
+Give on-call a short checklist to run every time: status, exit code, `OOMKilled`, `RestartCount`, mounts, port bindings, and log driver. Environment variables are useful too, but read them carefully, because secrets can appear there. Ask for named fields with `-f` instead of scrolling raw JSON.
 
-**Do:** paste key inspect fields into the ticket. **Don’t:** paste entire env blocks with secrets into chat.
+**Do:** paste the key inspect fields into the ticket. **Don’t:** paste a full environment block into a chat channel, secrets and all.
 
 **Before you leave this section**
 
@@ -409,13 +437,17 @@ Teach on-call a short inspect checklist: status, exit code, OOMKilled, RestartCo
 
 ### In plain terms
 
-**Why:** A single runaway container can consume all memory and force the kernel to kill processes (OOM), or starve neighbors of CPU. Limits protect the host and other workloads.
+A **resource limit** is a ceiling you set on how much memory or CPU one container may use.
 
-Without limits, “dense packing” becomes “shared fate with the noisiest neighbor.” Limits are how cattle share a field without one bull flattening the fence.
+Why bother? Because containers on a host share one pool of memory and CPU. One container with a memory leak can eat everything, and then the kernel starts killing processes to survive. That is an **OOM kill**, short for out of memory, and the kernel does not care which container you needed most. A CPU-hungry container does something similar and slower: it starves its neighbors of processor time.
 
-> ⚠️ **Common Pitfall:** Raising memory forever without checking `OOMKilled` or fixing leaks. You trade a crash for a more expensive crash later.
+Without limits, packing many containers onto one machine means every service shares the fate of the worst-behaved one. Limits are the fence that lets them share the field safely.
+
+> ⚠️ **Common Pitfall:** Raising the memory limit again and again without checking `OOMKilled` or looking for a leak. You are trading a cheap crash today for an expensive one later.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker run -d --name task-api \
@@ -428,10 +460,10 @@ $ docker run -d --name task-api \
 
 | Flag | Effect |
 |------|--------|
-| `--memory` / `-m` | Hard memory limit |
-| `--memory-swap` | Total memory+swap ceiling (set equal to memory to disable swap use) |
-| `--cpus` | CPU time allowance (0.5 ≈ half a CPU) |
-| `--cpu-shares` | Relative weight when contending (soft) |
+| `--memory` / `-m` | Hard memory ceiling; exceeding it gets the process killed |
+| `--memory-swap` | Ceiling for memory plus swap; set it equal to `--memory` to forbid swap |
+| `--cpus` | How much CPU time the container may use (0.5 is about half a CPU) |
+| `--cpu-shares` | Relative priority when containers compete; a preference, not a hard cap |
 
 Watch live usage:
 
@@ -444,21 +476,21 @@ CONTAINER ID   NAME       CPU %     MEM USAGE / LIMIT     MEM %     NET I/O
 a1b2c3d4e5f6   task-api   0.12%     45MiB / 256MiB        17.5%     1.2kB / 648B
 ```
 
-If the app is OOM-killed, `docker inspect` shows `OOMKilled` true and logs may end abruptly—raise memory *or* fix a leak; do not only raise forever without understanding.
+When the kernel kills a container for memory, `docker inspect` reports `OOMKilled` as true, and the logs usually stop mid-sentence with no error. Then decide honestly: does the app genuinely need more memory, or is it leaking? Raising the number forever without answering that only delays the crash.
 
-**What breaks if swap is unlimited while memory is limited:** behavior becomes harder to reason about under pressure. Many production setups set `--memory-swap` equal to `--memory` to disable swap use for that container.
+**What breaks if swap is unlimited while memory is limited:** the container slows to a crawl instead of failing clearly, and the behavior under pressure becomes hard to predict. Many production setups set `--memory-swap` equal to `--memory`, which turns swap off for that container.
 
 ### In production
 
-**Ownership:** platform sets default limit policies on shared hosts; app teams size limits from load tests and `docker stats` / metrics.
+**Ownership:** the platform team sets default limit rules for shared hosts. App teams pick their actual numbers from load tests and from what `docker stats` and their metrics show.
 
-Never run shared-host workloads without memory limits. Set CPU limits where noisy neighbors matter. In Kubernetes you will express the same ideas as requests/limits—learn the symptoms now on Docker.
+Never run a workload on a shared host without a memory limit. Add CPU limits wherever one service can slow down others. Kubernetes expresses the same ideas as requests and limits, so learn the symptoms here first.
 
-**Failure mode:** one container OOMs the node. **Detect:** host OOM killer logs; multiple containers dying; `OOMKilled` true. **Mitigate:** memory limits on every workload; capacity headroom; find the leak.
+**Failure mode:** one container exhausts memory and takes the whole node with it. **Detect:** the host’s OOM killer messages, several containers dying at once, and `OOMKilled` set to true. **Mitigate:** a memory limit on every workload, spare capacity on the node, and time spent finding the leak.
 
-**Do:** ship with memory limits in Compose/run scripts. **Don’t:** run unlimited memory on shared CI or shared lab daemons.
+**Do:** put memory limits in your Compose files and run scripts from the start. **Don’t:** run without a memory limit on shared CI or a shared lab machine.
 
-> 🏭 **Production floor:** A missing memory limit is a blast-radius decision: you are allowing one service to endanger every other container on the kernel. Require limits in review the same way you require non-root.
+> 🏭 **Production floor:** Leaving out a memory limit is a decision about blast radius. You are allowing one service to endanger every other container on that kernel. Require limits in review exactly the way you require a non-root user.
 
 **Before you leave this section**
 
@@ -472,13 +504,17 @@ Never run shared-host workloads without memory limits. Set CPU limits where nois
 
 ### In plain terms
 
-Restart policies tell the **engine** what to do when the container exits—handy for daemons on a single host, dangerous when they turn a crash loop into a CPU furnace.
+A **restart policy** is a standing instruction to the engine about what to do when a container exits: leave it alone, or start it again.
 
-Restarts are not healing. They are retries. If the image is broken, `always` only automates pain.
+Why choose deliberately instead of copying whatever the tutorial used? Because the right policy keeps a service alive through a one-off crash, and the wrong one hides a broken deploy behind a container that restarts a hundred times a minute. That is a **restart storm**: the engine burns CPU starting a container that immediately dies, and the logs fill with the same error.
 
-> ⚠️ **Common Pitfall:** `always` on a container that crashes instantly creates a restart storm—CPU churn and log spam.
+Say this out loud once: restarting is not healing. It is retrying. If the image itself is broken, `always` does not fix anything. It only automates the failure.
+
+> ⚠️ **Common Pitfall:** Setting `always` on a container that crashes at startup. You get a restart storm—wasted CPU, flooded logs, and a dashboard that flickers between Up and Exited.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker run -d --name task-api \
@@ -489,10 +525,10 @@ $ docker run -d --name task-api \
 
 | Policy | Behavior |
 |--------|----------|
-| `no` | Do not restart (default) |
-| `on-failure[:max]` | Restart on non-zero exit, optional max retries |
-| `always` | Always restart; also starts after daemon reboot |
-| `unless-stopped` | Like `always`, unless you explicitly stopped it |
+| `no` | Never restart; this is the default |
+| `on-failure[:max]` | Restart only after a non-zero exit, with an optional retry limit |
+| `always` | Always restart, and start again after the daemon itself reboots |
+| `unless-stopped` | Same as `always`, except it stays down if you stopped it on purpose |
 
 Update an existing container’s policy:
 
@@ -504,17 +540,17 @@ $ docker update --restart=on-failure:5 task-api
 $ docker inspect -f '{{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}' task-api
 ```
 
-**What breaks if you never look at `RestartCount`:** dashboards may show “Up” during brief windows while the service is effectively down. Correlate restarts with logs.
+**What breaks if you never look at `RestartCount`:** a dashboard can show “Up” during the brief moments between crashes, while the service is effectively down the whole time. Read restart counts alongside the logs.
 
 ### In production
 
-**Ownership:** app owners choose policy intent; platform prefers orchestrator-level restarts for multi-service stacks.
+**Ownership:** app owners decide what the policy should be for their service. The platform team prefers restarts handled by the orchestrator once several services are involved.
 
-Pair restarts with healthy images and attention to `RestartCount`. Prefer orchestrator-level restarts (Compose, Swarm, Kubernetes) for multi-service apps. A tight `always` loop on a broken image is an availability illusion—traffic fails while the daemon churns.
+Pair a restart policy with a healthy image and a habit of checking `RestartCount`. For multi-service apps, let Compose, Swarm, or Kubernetes handle restarts. An `always` loop on a broken image is fake availability: requests fail while the daemon burns CPU.
 
-**Failure mode:** restart storm after a bad image promote. **Detect:** rising RestartCount; CPU spin; log spam. **Mitigate:** `docker stop` (explicit), pin previous digest, fix image, then bring back.
+**Failure mode:** a restart storm right after a bad image is promoted. **Detect:** `RestartCount` climbing, CPU spinning, and the same error repeating in the logs. **Mitigate:** stop the container explicitly, redeploy the previous digest, fix the image, then bring it back.
 
-**Do:** prefer `on-failure` with a max for fragile jobs. **Don’t:** equate continuous restarts with high availability.
+**Do:** use `on-failure` with a retry limit for jobs you expect to fail sometimes. **Don’t:** treat constant restarting as high availability.
 
 ```mermaid
 flowchart TD
@@ -543,41 +579,45 @@ flowchart TD
 
 ### In plain terms
 
-`docker stop` knocks politely (SIGTERM), waits, then forces. `docker kill` kicks the door in. Prefer polite.
+There are two ways to end a container, and the difference matters to whoever is using your app right now.
 
-Graceful stop is how you drain in-flight work. Kill is for stuck processes—not a default habit.
+`docker stop` is the polite one. It sends `SIGTERM`, a signal that means “please finish and exit,” waits a grace period, and only then forces the process to die. `docker kill` skips straight to `SIGKILL`, which the process cannot catch, ignore, or clean up after.
 
-> ⚠️ **Common Pitfall:** Shell-form PID 1 that never receives SIGTERM, so every stop becomes an effective kill after the grace period.
+Why prefer the polite one? Because during those grace seconds, your app can finish the requests it already accepted, flush its logs, and close its database connections. That is called **draining**. A forced kill in the middle of that shows up as broken responses to real users. Save `kill` for a process that is genuinely stuck.
+
+> ⚠️ **Common Pitfall:** A main process started through a shell, which never passes `SIGTERM` along. Every stop then waits out the full grace period and ends in a kill anyway. Exec-form `ENTRYPOINT` and `CMD` from Chapter 04 prevent this.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker stop task-api
 ```
 
-Sends the configured stop signal (`STOPSIGNAL` / default SIGTERM), waits a grace period (default 10s), then SIGKILL.
+This sends the container’s configured stop signal, which is whatever `STOPSIGNAL` says, or `SIGTERM` by default. It then waits a grace period of 10 seconds, and finally sends `SIGKILL`.
 
 ```bash
 $ docker kill task-api
 ```
 
-Sends SIGKILL immediately (unless you choose another signal). Prefer `stop` so Gunicorn workers can finish requests.
+This sends `SIGKILL` right away, unless you name a different signal. Prefer `stop`, so Gunicorn’s workers can finish the requests they are holding.
 
 ```bash
 $ docker stop -t 30 task-api
 ```
 
-Your app must handle SIGTERM—another reason exec-form `ENTRYPOINT`/`CMD` matters (Chapter 04).
+This waits 30 seconds instead of 10. Your app still has to listen for `SIGTERM` and act on it, which is one more reason exec-form `ENTRYPOINT` and `CMD` matter (Chapter 04).
 
-**What breaks if grace time is shorter than request drain:** clients see truncated responses and connection resets during deploys. Raise `-t` (and later `terminationGracePeriodSeconds`) to match reality.
+**What breaks if the grace period is shorter than the time it takes to drain:** clients get cut-off responses and reset connections during every deploy. Raise `-t` to match how long draining actually takes, and later do the same with `terminationGracePeriodSeconds` in Kubernetes.
 
 ### In production
 
-**Ownership:** app teams implement signal handling; operators tune grace periods to observed drain times.
+**Ownership:** app teams write the signal handling. Operators set grace periods based on how long draining actually takes in practice.
 
-Tune grace periods to match drain time (in-flight requests, connection cleanup). In Kubernetes, the same idea becomes `terminationGracePeriodSeconds` plus preStop hooks—practice good signal handling now.
+Measure the real drain time—finishing in-flight requests and closing connections—and set the grace period above it. In Kubernetes the same idea appears as `terminationGracePeriodSeconds` plus preStop hooks. Getting signal handling right now pays off there.
 
-**Do:** prefer `stop`; measure needed grace. **Don’t:** `kill` as the everyday deploy step.
+**Do:** use `stop`, and measure the grace period you need. **Don’t:** make `kill` part of your normal deploy.
 
 **Before you leave this section**
 
@@ -591,13 +631,17 @@ Tune grace periods to match drain time (in-flight requests, connection cleanup).
 
 ### In plain terms
 
-Remove containers you do not need. Prune carefully on shared machines. Copy files out when you need forensics.
+Cleanup means two related jobs: deleting containers you no longer need, and getting files out of a container before it disappears.
 
-Cleanup is operational hygiene. Panic pruning without checking volumes is how teams delete the only copy of data they thought was “just a container.”
+Why treat something this routine as a real topic? Because cleanup commands are the most destructive commands most engineers run casually. **Pruning**—deleting everything currently unused—is fast, quiet, and permanent. Teams have deleted the only copy of data they assumed was “just a container,” and only found out days later.
 
-> ⚠️ **Common Pitfall:** `docker system prune -a` on a shared builder mid-day without a change window.
+The other half is `docker cp`, which copies a file out of a container to your machine. Do that before you delete anything you might need to examine.
+
+> ⚠️ **Common Pitfall:** Running `docker system prune -a` on a shared build machine in the middle of the workday, with no change window and no warning to anyone else using it.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker rm task-api
@@ -611,21 +655,21 @@ $ docker container prune
 $ docker system prune
 ```
 
-`system prune` can delete unused networks and dangling images; add `-a` only when you intend to remove unused images too.
+`system prune` deletes unused networks and untagged images. Add `-a` only when you also mean to delete every image that no container is currently using.
 
 ```bash
 $ docker cp task-api:/app/app.py ./app.py.copied
 ```
 
-**What breaks if volumes are anonymous and you prune carelessly:** data you thought was in “the container” may be in a volume that prune policies touch differently—learn volumes in Chapter 07 before aggressive cleanup on stateful hosts.
+**What breaks if volumes are anonymous and you prune carelessly:** data you believed lived “in the container” may actually live in an unnamed **volume**, a separate storage area Docker manages, and prune rules treat those differently. Read Chapter 07 before running aggressive cleanup on any host that stores data.
 
 ### In production
 
-**Ownership:** platform schedules cleanup on CI; nobody freelances destructive prunes on production data nodes.
+**Ownership:** the platform team schedules cleanup on CI machines. Nobody runs destructive prunes on production data nodes on their own initiative.
 
-Schedule cleanup for CI agents. Never run destructive prunes on production nodes without confirming volumes and named resources you still need (Chapter 07).
+Put cleanup on a schedule for CI agents. Never run a destructive prune on a production node until you have confirmed which volumes and named resources are still needed (Chapter 07).
 
-**Do:** `docker system df` before prune. **Don’t:** prune production without a ticket and volume check.
+**Do:** run `docker system df` before any prune. **Don’t:** prune production without a ticket and a volume check.
 
 **Before you leave this section**
 
@@ -639,13 +683,15 @@ Schedule cleanup for CI agents. Never run destructive prunes on production nodes
 
 ### In plain terms
 
-Follow a fixed order so you do not thrash: status → logs → inspect → exec/debug → reproduce → fix the image or flags.
+A debugging loop is a fixed order of steps you follow every time a container misbehaves: check the status, read the logs, inspect the settings, look inside, reproduce the failure, then fix the image or the flags.
 
-The loop is the product. Random tool flipping under stress is how incidents get longer.
+Why insist on a fixed order? Because under stress, people jump between tools at random, and each jump costs minutes. Following the same six steps every time means you never skip the cheap check that would have answered the question. The order is the skill; the commands are easy.
 
-> ⚠️ **Common Pitfall:** Using `docker restart` as the only fix without reading logs—you may restart forever into the same crash.
+> ⚠️ **Common Pitfall:** Reaching for `docker restart` as the only move, without reading the logs. You can restart into the same crash all afternoon and learn nothing.
 
 ### Under the hood
+
+Here is the loop in full.
 
 When a container misbehaves:
 
@@ -660,12 +706,12 @@ flowchart TD
 
 *Figure 05.4: A fixed debugging order prevents thrashing — status, logs, inspect, then controlled reproduce.*
 
-1. **`docker ps -a`** — Is it running, restarting, or exited? Exit code?
-2. **`docker logs`** — App error, missing module, bind failure? (Confirm logging driver supports this.)
-3. **`docker inspect`** — OOMKilled, env vars, mounts, port bindings, RestartCount?
-4. **`docker exec` or `docker debug`** — Only if still running (or via debug-on-image); check files, DNS, local curl.
-5. **Reproduce** with `docker run --rm -it --entrypoint sh image` to debug startup.
-6. **Fix the image or runtime flags**, do not “hotfix” a running cattle container as the long-term solution.
+1. **`docker ps -a`** — Is it running, restarting, or exited? What is the exit code?
+2. **`docker logs`** — An application error, a missing module, a failure to bind a port? Confirm the logging driver actually supports this command.
+3. **`docker inspect`** — Was it `OOMKilled`? Check environment variables, mounts, port bindings, and `RestartCount`.
+4. **`docker exec` or `docker debug`** — Only while it is still running, or against the image with debug. Check files, DNS, and a local curl from inside.
+5. **Reproduce** the startup with `docker run --rm -it --entrypoint sh image` so you can try the command by hand.
+6. **Fix the image or the runtime flags.** Patching a running container is never the long-term answer.
 
 Interactive override example:
 
@@ -673,15 +719,15 @@ Interactive override example:
 $ docker run --rm -it --entrypoint /bin/sh task-api:0.1.0
 ```
 
-**What breaks if you skip platform/arch checks:** `exec format error` looks like a mysterious startup failure until you inspect Architecture.
+**What breaks if you skip the CPU architecture check:** `exec format error` looks like a baffling startup failure until you inspect `Architecture` and realize the image was built for a different CPU.
 
 ### In production
 
-**Ownership:** on-call follows the loop; app teams close the loop with a digest bump.
+**Ownership:** on-call follows the loop. App teams close it out by shipping a new image digest.
 
-Write this loop into your runbook. Add “check disk for log growth” and “check platform/arch” (`exec format error`) as standing items. Escalate to orchestrator events once you move to Kubernetes (Part II).
+Put this loop in your runbook. Add two standing checks to it: look at disk usage for log growth, and check the CPU architecture whenever you see `exec format error`. Once you move to Kubernetes in Part II, add cluster events to the same loop.
 
-**Do:** name which step failed in the ticket. **Don’t:** restart-as-step-zero forever.
+**Do:** say which step failed in the ticket. **Don’t:** make restarting your permanent first move.
 
 **Before you leave this section**
 
@@ -695,32 +741,36 @@ Write this loop into your runbook. Add “check disk for log growth” and “ch
 
 ### In plain terms
 
-Writes to the container’s writable layer vanish when the container is removed. Treat the container disk like a whiteboard in a rented room.
+**Ephemeral** means short-lived and disposable. Everything a container writes to its own filesystem is ephemeral: it lives in the thin writable layer, and it is deleted along with the container.
 
-The misconception: “the database files are in the container, so redeploying is fine.” Redeploying removes the room—and the whiteboard.
+Why is this the section people learn the hard way? Because the container’s disk feels like a normal disk. Files save, directories persist, restarts keep working. Then the container is replaced during a routine deploy, and the files are simply gone.
 
-> ⚠️ **Common Pitfall:** Accidental reliance on the writable layer for durable state—leading cause of “we lost data when we redeployed.”
+Think of the container disk as a whiteboard in a rented room. You can write on it all week. The moment you give up the room, the whiteboard is wiped. “Our database files are inside the container, so redeploying is fine” is the sentence that precedes the incident. Redeploying gives up the room.
+
+> 💡 **In one line:** Anything a container writes to its own filesystem dies with that container—if the data must outlive the container, it belongs in a volume or an external store.
+
+> ⚠️ **Common Pitfall:** Depending on the writable layer for data you actually need to keep. This is the single most common cause of “we lost data when we redeployed.”
 
 ### Under the hood
 
-For the Task API’s in-memory task list, data already resets on process restart. For databases and uploads you will need **volumes** (Chapter 07). Until then, treat container disks as temporary.
+The Task API keeps its task list in memory, so that data already disappears whenever the process restarts. Databases and uploaded files need **volumes**, which are storage areas that live outside the container and survive it (Chapter 07). Until then, treat every container disk as temporary.
 
 ```bash
 $ docker run --rm task-api:0.1.0 python -c "open('/tmp/x','w').write('hi')"
 # container removed: /tmp/x is gone with it
 ```
 
-**What breaks if you store uploads only in the writable layer:** the next replaceable instance has empty storage; users see missing files after a routine redeploy.
+**What breaks if you store user uploads only in the writable layer:** the next container that replaces this one starts with empty storage, and users find their files missing after a deploy that looked completely routine.
 
 ### In production
 
-**Ownership:** app architects decide ephemeral vs volume vs external store; platform provides volume classes later.
+**Ownership:** whoever designs the application decides, per data path, whether it is throwaway, a volume, or an external store. The platform team supplies the storage options later.
 
-Decide explicitly for every path: ephemeral, bind mount (dev), or named volume (data). Accidental reliance on the writable layer is a leading cause of “we lost the database when we redeployed.”
+Make that decision explicitly for every path the app writes to: ephemeral, a bind mount for development, or a named volume for real data. Depending on the writable layer by accident is a leading cause of “we lost the database when we redeployed.”
 
-**Do:** document data paths before go-live. **Don’t:** discover durability requirements during the first rollback.
+**Do:** write down every data path before go-live. **Don’t:** find out what needed to be durable during your first rollback.
 
-> 🏭 **Production floor:** Before promoting any stateful container, write the data path decision in the change ticket: ephemeral, volume, or managed service. Ambiguity here is how routine deploys become data incidents.
+> 🏭 **Production floor:** Before promoting any container that stores data, record the data path decision in the change ticket: ephemeral, volume, or managed service. Leaving it unstated is how a routine deploy turns into a data incident.
 
 **Before you leave this section**
 
@@ -824,12 +874,16 @@ Without limits, one container can consume available memory, cause OOM conditions
 
 ## 05.16 Key Takeaways
 
-- Master lifecycle commands: `run`, `ps`, `stop`, `start`, `restart`, `pause`, `rm`.
-- Debug in order: status → logs → inspect → exec/debug → controlled reproduce.
-- Configure logging drivers and rotation; apps must log to stdout/stderr.
-- Publish ports explicitly; use `docker stats` and memory/CPU flags to protect the host.
-- Pick restart policies deliberately; avoid restart storms on broken images.
-- Container filesystems are ephemeral—persist important data with volumes (Chapter 07).
+- A container is always in **one state**: created, running, paused, exited, or removed. `run` = create + start.
+- Debug in a **fixed order**: status, logs, inspect, exec or debug, reproduce, fix the image.
+- **Apps log to stdout and stderr.** A log file inside the container is invisible to `docker logs`.
+- **Always rotate logs.** Unbounded logs fill the disk and take the whole host down.
+- **Up does not mean reachable.** Check `-p`, and make sure the app listens on `0.0.0.0`.
+- **`inspect` is the truth.** Check `OOMKilled` and `RestartCount` before blaming the app.
+- **Always set a memory limit** on a shared host. One leak can kill every neighbor.
+- **Restarting is retrying, not healing.** A broken image restarts just as broken.
+- **`stop` drains, `kill` cuts.** Give the app enough grace time to finish its requests.
+- **The container filesystem dies with the container.** Real data needs a volume (Chapter 07).
 
 ---
 

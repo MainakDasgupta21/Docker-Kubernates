@@ -524,17 +524,17 @@ $ docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 $ docker history --human --no-trunc myapp:1.0
 ```
 
-**What breaks if you delete caches in a later layer than you created them:** the fat layer still exists underneath; final size barely shrinks. Cleanup must happen in the same `RUN` that dirtied the filesystem.
+**What breaks if you delete caches in a later layer than the one that created them:** the heavy layer is still there underneath, and the final image barely shrinks. A layer can only add to the stack; a later delete just hides files. Clean up inside the same `RUN` that made the mess.
 
 ### In production
 
-**Ownership:** app teams keep final stages lean; platform may enforce soft size budgets in CI.
+**Ownership:** app teams keep the final build stage lean. The platform team may set size budgets that CI checks.
 
-Track image size in CI as a soft budget. Investigate sudden size jumps—they often mean a debug toolchain or cache directory leaked into the final stage.
+Track image size in CI as a budget, not a hard rule. Investigate sudden jumps. They usually mean a debug toolchain or a package cache leaked into the final stage.
 
-**Failure mode:** a 1.5 GB debug image promoted because “it worked.” **Detect:** size delta alerts; history shows compilers in final stage. **Mitigate:** multi-stage; block promote over budget without waiver.
+**Failure mode:** a 1.5 GB debug image promoted to production because “it worked.” **Detect:** alerts on size changes between builds, and `docker history` showing compilers in the final stage. **Mitigate:** use multi-stage builds, and block promotion above the budget unless someone signs off.
 
-**Do:** budget size next to CVE policy. **Don’t:** optimize Alpine micro-savings while shipping build-essential in runtime.
+**Do:** treat size budgets as seriously as your vulnerability policy. **Don’t:** shave megabytes off the base image while still shipping `build-essential` in the runtime image.
 
 **Before you leave this section**
 
@@ -625,13 +625,15 @@ They let one name (tag) resolve to architecture-specific image variants—for ex
 
 ## 03.12 Key Takeaways
 
-- Images are immutable layered templates plus config; containers add a writable layer.
-- Read references as registry/repository:tag and prefer digests for immutable identity.
-- `pull`, `images`, `inspect`, `history`, `tag`, and `rmi` are your daily image toolkit.
-- Layer caching and sharing explain build speed and disk behavior.
-- Multi-platform awareness (and buildx) prevents “works on my Mac, fails on the server” surprises.
-- Avoid relying on `latest` for anything you care about reproducing.
-- In production, promote digests, mirror registries for CI, and treat size + CVE budgets as first-class gates.
+- An image is **read-only layers plus config**. The container adds one thin writable layer on top.
+- **Tags move. Digests do not.** Humans read tags; deploys pin digests.
+- Read a name in parts: `registry/namespace/repository:tag`, or `…@sha256:…`.
+- Five daily commands: `pull`, `images`, `inspect`, `history`, `tag`, and `rmi`.
+- **Change a step and every step after it rebuilds.** That is why stable work goes first.
+- A **cache hit is not a security patch.** Rebuild bases on a schedule.
+- One tag can hide **one image per CPU type**. Build for the architecture you deploy to.
+- Never let `latest` be the only name for something you must reproduce.
+- Size is **download time, disk, and attack surface**—clean up in the same `RUN` that made the mess.
 
 ---
 

@@ -4,11 +4,11 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain why Services exist when Pod IPs are ephemeral
-> - Configure ClusterIP, NodePort, LoadBalancer, ExternalName, and headless Services
-> - Read EndpointSlices and Service DNS as the discovery dataplane
-> - Apply dual-stack IPs, `internalTrafficPolicy`, and topology-aware routing / `trafficDistribution`
-> - Choose Service types deliberately and avoid externalIPs footguns on Kubernetes 1.36
+> - Say why Services exist, given that Pod IP addresses keep changing
+> - Set up ClusterIP, NodePort, LoadBalancer, ExternalName, and headless Services
+> - Read EndpointSlices and Service DNS names to see where traffic really goes
+> - Use both IP families, keep traffic on the local node, and send traffic to nearby Pods with `trafficDistribution`
+> - Pick each Service type on purpose, and stay away from `externalIPs` on Kubernetes 1.36
 
 ---
 
@@ -16,13 +16,19 @@
 
 ### In plain terms
 
-Pod IPs are hotel room numbers: fine while you stay, useless as a business card. A **Service** gives your app a stable name and virtual IP (or DNS) that tracks whichever Pods currently match a selector. The problem this solves is discovery under churn—Deployments replace Pods constantly, and clients must not chase IPs.
+A **Service** is a fixed name and a fixed IP address that always points at whichever Pods are currently healthy. You aim your clients at the Service, and the Service handles the changing set of Pods behind it.
 
-You might think "I'll just put the Pod IP in an env var and update it on deploy." That recreates the 3 a.m. clipboard: every consumer needs a push when any Pod moves. Services make the cluster own that chase via selectors and EndpointSlices.
+You need this because a Pod IP address does not last. Every Pod gets its own IP when it starts, and that IP is gone forever when the Pod is replaced. And Pods get replaced constantly: every deploy, every crash, every node drain. A Pod IP is like a hotel room number. It works while you are there, and it is useless on a business card.
+
+You might think you can put the Pod IP in an environment variable and update it on each deploy. That puts you back at the 3 a.m. clipboard from Chapter 11. Every single client would need a push whenever any Pod moved. The Service moves that chore into the cluster, using label selectors and EndpointSlices to keep the list current.
+
+> 💡 **In one line:** Pod IPs die with the Pod; a Service is the address that does not change, so clients never have to know which Pods are alive.
 
 > ⚠️ **Common Pitfall:** Handing partners a raw Pod IP from `kubectl get pod -o wide` "temporarily." Temporary becomes contractual, then breaks on the next node drain.
 
 ### Under the hood
+
+Here is the churn, made visible:
 
 ```bash
 $ kind create cluster --name svc --image kindest/node:v1.36.0
@@ -36,7 +42,7 @@ task-api-7d9f8c5b64-8m2xp   1/1     Running   10.244.1.9   mastering-k8s-worker
 task-api-7d9f8c5b64-q4tzn   1/1     Running   10.244.2.4   mastering-k8s-worker2
 ```
 
-Delete a Pod and its IP vanishes. Clients that cached that IP break. Services fix this with a selector-driven set of backends and cluster DNS.
+Delete either Pod and its IP is gone for good. Any client that remembered that address now fails. A Service fixes this two ways: a label selector keeps the backend list current, and cluster DNS gives clients one name to use forever.
 
 ```mermaid
 flowchart LR
@@ -57,7 +63,7 @@ flowchart LR
 
 **Ownership:** app teams own Service selectors and ports; platform owns kube-proxy/CNI dataplane and CoreDNS SLOs.
 
-Never hand clients raw Pod IPs for durable integrations. Use Services (or Gateway API later) as the contract. Publish DNS names, not ephemeral addresses, in docs and configs.
+Never give a client a raw Pod IP for anything that has to keep working. The Service — or later the Gateway API — is the address you promise. Put DNS names in your docs and configs, never the short-lived addresses.
 
 **Do:** document `task-api.namespace.svc.cluster.local` as the dial-tone. **Don't:** commit ClusterIPs into application config.
 
@@ -73,9 +79,11 @@ Never hand clients raw Pod IPs for durable integrations. Use Services (or Gatewa
 
 ### In plain terms
 
-**ClusterIP** allocates a virtual IP reachable inside the cluster. Other Pods call `http://task-api` and land on a healthy backend. The problem it solves is east-west traffic without exposing every microservice to the internet—or paying for a load balancer per app.
+**ClusterIP** is the default Service type. It gets an IP address that only works *inside* the cluster. Another Pod calls `http://task-api` and lands on one of the healthy copies.
 
-You might think every Service should be LoadBalancer "so we can curl it from the laptop." That expands attack surface and cost. Prefer ClusterIP plus port-forward, Ingress, or Gateway for deliberate north-south entry.
+This is what you want for almost everything. Most services in a system are only ever called by other services in the same system. Traffic between them is often called **east-west traffic**, as opposed to **north-south traffic** coming in from outside. ClusterIP handles east-west without putting anything on the internet and without paying for a load balancer per app.
+
+You might think every Service should be a LoadBalancer so you can curl it from your laptop. That gives every service a public address, which costs money and widens your attack surface. Use ClusterIP plus `kubectl port-forward` while you work, and let a deliberate Ingress or Gateway handle real outside traffic.
 
 > ⚠️ **Common Pitfall:** Mismatching `targetPort` with the container's listen port. The Service and Pod look healthy; connections refuse on the backend.
 
@@ -106,7 +114,7 @@ $ kubectl run curl --rm -it --image=curlimages/curl:8.11.1 --restart=Never -- \
     curl -sS http://task-api.default.svc.cluster.local/healthz
 ```
 
-kube-proxy (or a CNI dataplane) programs forwarding from the ClusterIP to Pod IPs. `targetPort` may be a number or a named port on the Pod.
+Note the two ports. `port` is the port clients dial on the Service. `targetPort` is the port your container actually listens on. kube-proxy — or your CNI's own forwarding layer — programs the node so packets sent to the ClusterIP arrive at a Pod IP. `targetPort` can be a number or the name of a port declared on the Pod.
 
 **What breaks if the selector labels do not match the Pod template:** ClusterIP is allocated, DNS resolves, but EndpointSlices stay empty—classic "Service is up, app is unreachable."
 
@@ -114,7 +122,7 @@ kube-proxy (or a CNI dataplane) programs forwarding from the ClusterIP to Pod IP
 
 **Ownership:** app teams create ClusterIP Services alongside Deployments; security teams add NetworkPolicies (Chapter 19).
 
-ClusterIP is the default for east-west traffic. Combine with NetworkPolicies (Chapter 19). Do not type: LoadBalancer for every microservice—most should stay internal.
+Make ClusterIP your default for traffic between services, and add NetworkPolicies on top (Chapter 19). Do not set `type: LoadBalancer` on every microservice. Most of them should never be reachable from outside.
 
 **Do:** name ports (`http`) so policy and Gateway refs stay readable. **Don't:** expose admin debug ports on the same Service as public HTTP without thought.
 
@@ -130,9 +138,15 @@ ClusterIP is the default for east-west traffic. Combine with NetworkPolicies (Ch
 
 ### In plain terms
 
-The Service is the front desk list. **EndpointSlices** are the pages of room numbers currently occupied by ready Pods. The problem they solve is scaling discovery: the legacy Endpoints object stuffed every address into one object and woke every watcher on every change; slices shard that work.
+An **EndpointSlice** is the actual list of Pod IP addresses and ports that a Service currently sends traffic to. A controller keeps it in sync: matching label, passing readiness, in the list.
 
-You might think "if `kubectl get svc` shows a ClusterIP, backends must exist." The VIP is allocated at Service create time; backends appear only when matching Pods pass readiness.
+This is the object you check first when traffic disappears. The Service is the front desk; the EndpointSlice is the page of room numbers for guests who are actually in. If that page is empty, the front desk has nowhere to send anyone.
+
+Why "slice" and not just one list? Because the older `Endpoints` object crammed every address for a Service into a single object. Change one Pod in a 2,000-Pod Service and every watcher in the cluster got the whole list again. EndpointSlices break the list into pages so a change only wakes up the readers who need it.
+
+You might think a ClusterIP showing up in `kubectl get svc` proves there are backends. It does not. The IP is assigned the moment you create the Service. Backends only appear once matching Pods pass their readiness probe.
+
+> 💡 **In one line:** A Service can have an IP address and no Pods behind it — so when traffic vanishes, read the EndpointSlice before you blame DNS.
 
 > ⚠️ **Common Pitfall:** Debugging DNS for hours while EndpointSlices are empty. Always `kubectl get endpointslices -l kubernetes.io/service-name=…` before blaming CoreDNS.
 
@@ -154,7 +168,7 @@ Endpoints:
   10.244.2.4   ready
 ```
 
-EndpointSlices scale better than the legacy Endpoints object by sharding addresses. Not-ready Pods (failing readiness) are omitted from serving endpoints (or marked unready depending on publish settings).
+Read the `ready` markers carefully. A Pod that is failing its readiness probe is left out of the serving list, or listed as not ready, depending on the publish settings below.
 
 ```mermaid
 flowchart TB
@@ -171,7 +185,7 @@ flowchart TB
 publishNotReadyAddresses: true
 ```
 
-Headless Services still create EndpointSlices—clients resolve Pods directly via DNS.
+Headless Services create EndpointSlices too. The difference is that clients look up the Pod addresses directly through DNS instead of going through one shared IP.
 
 **What breaks if you set `publishNotReadyAddresses: true` without understanding it:** traffic can hit Pods that are still starting or draining—useful for some StatefulSet peer discovery, harmful for HTTP frontends.
 
@@ -179,7 +193,7 @@ Headless Services still create EndpointSlices—clients resolve Pods directly vi
 
 **Ownership:** the EndpointSlice controller (control plane) owns slice objects; app teams own selectors and readiness that feed them.
 
-When traffic blackholes, inspect EndpointSlices before blaming DNS. Empty slices almost always mean selector mismatch or failed readiness. Prefer EndpointSlice API awareness in custom controllers; Endpoints is legacy compatibility.
+When traffic vanishes, read the EndpointSlices before you suspect DNS. An empty slice almost always means one of two things: the selector does not match your Pod labels, or readiness is failing. Write new controllers against the EndpointSlice API; `Endpoints` only exists for backward compatibility.
 
 **Do:** include EndpointSlice checks in your incident runbook's first five minutes. **Don't:** build new controllers that only watch Endpoints.
 
@@ -195,9 +209,11 @@ When traffic blackholes, inspect EndpointSlices before blaming DNS. Empty slices
 
 ### In plain terms
 
-**NodePort** opens the same high port on every node and forwards to the Service. **LoadBalancer** asks infrastructure for an external IP that fronts that Service (cloud CCM or MetalLB-class tooling). The problem they solve is north-south entry without installing a full Ingress/Gateway stack—useful for labs, simple TCP services, and cloud VIPs.
+**NodePort** opens the same port number on *every* node and forwards whatever arrives to your Service. **LoadBalancer** goes one step further and asks your infrastructure for a real external IP address that fronts the Service.
 
-You might think LoadBalancer on kind will magically get an EXTERNAL-IP. Without a cloud controller or MetalLB-style add-on, it stays `<pending>` forever—that is expected, not a broken Service.
+These two are how outside traffic gets in when you have not installed an Ingress or Gateway yet. They are a good fit for labs, for plain TCP services that have no HTTP routing rules, and for cloud load balancers you want managed for you.
+
+You might think a LoadBalancer Service on kind will eventually show an `EXTERNAL-IP`. It will not. Something has to actually create the load balancer — a cloud controller manager, or an add-on like MetalLB. With neither installed, the field stays `<pending>` forever. That is the expected result, not a broken Service.
 
 > ⚠️ **Warning:** Service `spec.externalIPs` is a long-standing footgun (see CVE-2020-8554 class issues) and is **deprecated in Kubernetes 1.36**. Prefer LoadBalancer, NodePort, or Gateway API—not hand-assigned externalIPs.
 
@@ -218,7 +234,7 @@ spec:
       nodePort: 30080   # optional; allocated if omitted
 ```
 
-On kind, LoadBalancer often stays `<pending>` without an add-on. NodePort works for labs:
+On kind, that Service usually sits at `<pending>` unless you add MetalLB or the kind Cloud Provider. NodePort works in a lab with nothing extra installed:
 
 ```yaml
 type: NodePort
@@ -248,7 +264,7 @@ task-api-public   LoadBalancer   10.96.10.20   <pending>     80:30080/TCP
 
 **Ownership:** platform owns cloud LB provisioning and firewall rules for NodePorts; app teams choose Service type deliberately in review.
 
-Use cloud LoadBalancer Services for simple north-south entry, or Gateway/Ingress for HTTP routing at scale. Lock down NodePort exposure with firewalls; every node advertising the port expands the attack surface.
+Use a cloud LoadBalancer Service for simple entry from outside, and an Ingress or Gateway once you need HTTP routing across many services. Put firewall rules in front of any NodePort. Remember that every node in the cluster answers on that port, so each node you add widens the attack surface.
 
 **Do:** prefer one shared edge (Chapter 16) over dozens of public LoadBalancers. **Don't:** use deprecated `externalIPs` on 1.36.
 
@@ -264,9 +280,11 @@ Use cloud LoadBalancer Services for simple north-south entry, or Gateway/Ingress
 
 ### In plain terms
 
-**ExternalName** is a DNS CNAME alias to something outside the cluster. **Headless** (`clusterIP: None`) skips the virtual IP so DNS returns Pod IPs (or external endpoints) directly—essential for StatefulSets. The problem they solve is two different discovery shapes: "point at an external hostname" versus "give me the members themselves."
+These are the two Service types that do *not* give you a load-balanced IP address. **ExternalName** is a DNS alias pointing at a hostname outside the cluster. **Headless** (`clusterIP: None`) has no IP of its own, so a DNS lookup returns the individual Pod addresses instead.
 
-You might think ExternalName proxies traffic through the cluster. It does not—it only answers DNS. Packets still go from the client to the external name on whatever path routing allows.
+They exist because "find me a service" sometimes means two different things. Sometimes you want to reach a system that lives outside the cluster under a friendly in-cluster name. Other times you want the list of members themselves, one address each — which is exactly what a StatefulSet's peers need in order to find each other.
+
+You might think ExternalName sends traffic through the cluster. It does not. It only answers a DNS question. Your packets go straight from the client to that external host over whatever network path exists, with no cluster hop and no cluster policy applied.
 
 > ⚠️ **Common Pitfall:** Using a headless Service for a stateless HTTP API and then wondering why clients see multiple A records and behave oddly. Prefer ClusterIP for single VIP load balancing.
 
@@ -310,7 +328,7 @@ Address: 10.244.2.8
 
 **Ownership:** app teams own headless Services with their StatefulSets; platform reviews ExternalName use because it can bypass expected egress controls if DNS alone is trusted.
 
-ExternalName does not proxy packets—it only answers DNS. TLS and network path still must reach the external name. Headless Services require clients that can handle multiple A/AAAA records (or use ordinal DNS).
+ExternalName answers DNS and nothing else. Your TLS certificates and your network route still have to work all the way to the external host. A headless Service needs a client that can handle several A or AAAA records at once, or one that dials specific Pods by their numbered names.
 
 **Do:** pair headless Services with StatefulSets deliberately. **Don't:** use ExternalName as a poor man's egress proxy.
 
@@ -326,15 +344,17 @@ ExternalName does not proxy packets—it only answers DNS. TLS and network path 
 
 ### In plain terms
 
-CoreDNS implements predictable names so manifests can hardcode service hostnames safely. The problem it solves is discovery without a separate consul/etcd catalog for every cluster—DNS is the contract Pods already speak.
+Every Service gets a predictable DNS name, served by **CoreDNS**, the DNS server that runs inside your cluster. Because the name is predictable, you can safely write it into a manifest before the Service even exists.
 
-You might think short names always work. They resolve only within the same namespace (via search domains). Cross-namespace calls need `service.namespace` or the FQDN.
+This is why Kubernetes needs no separate service catalog. Every language and every library already knows how to resolve a hostname, so DNS becomes the one lookup mechanism everything shares.
+
+You might think a short name like `task-api` always works. It only works from inside the same namespace, because the short form relies on search domains in the Pod's resolver config. To call across namespaces you need `service.namespace` or the full name.
 
 > ⚠️ **Common Pitfall:** Embedding ClusterIPs in ConfigMaps because "DNS is slow." You trade a rare lookup for a guaranteed outage on Service recreate.
 
 ### Under the hood
 
-Forms you will use constantly:
+Here are the three name forms you will type constantly:
 
 | Name | Meaning |
 |------|---------|
@@ -352,7 +372,7 @@ coredns-7c9d5f8b46-8xk2m   1/1     Running   0          1h
 coredns-7c9d5f8b46-l4vqt   1/1     Running   0          1h
 ```
 
-Search domains in Pods come from `/etc/resolv.conf` generated by kubelet.
+The search domains that make short names work come from `/etc/resolv.conf`, which the kubelet writes into every Pod.
 
 ```mermaid
 flowchart LR
@@ -372,7 +392,7 @@ flowchart LR
 
 **Ownership:** platform owns CoreDNS capacity and config; app teams own which names they publish in docs.
 
-Prefer FQDNs in cross-team docs. Avoid embedding ClusterIPs in configs—they change on recreate. For multi-cluster, look to Gateway API and service meshes later—not ad-hoc `/etc/hosts`.
+Use full names in any document another team will read. Never put a ClusterIP in a config file, because it changes whenever the Service is recreated. For traffic between clusters, wait for the Gateway API and service meshes later in the book. Do not hand-edit `/etc/hosts`.
 
 **Do:** publish FQDNs in runbooks. **Don't:** hardcode ClusterIPs.
 
@@ -388,15 +408,17 @@ Prefer FQDNs in cross-team docs. Avoid embedding ClusterIPs in configs—they ch
 
 ### In plain terms
 
-**Dual-stack** means a Service can carry IPv4 and IPv6 addresses so clients on either family reach the same app. The problem it solves is clusters and clients that are not all on one IP family—especially as IPv6-only node pools appear.
+**Dual-stack** means one Service carries both an IPv4 address and an IPv6 address, so clients on either kind of network reach the same app. An **IP family** is just which of the two you mean.
 
-You might think flipping `ipFamilyPolicy` on a default kind cluster is enough. Dual-stack requires the cluster to have been created with dual-stack Pod/Service CIDRs; otherwise the API rejects or quietly stays single-stack.
+You need this when not everything speaks the same family. IPv4 addresses are running out, IPv6-only node pools are appearing, and some clients can only use one or the other. Dual-stack lets both work without running the app twice.
+
+You might think you can set `ipFamilyPolicy` on any cluster and be done. You cannot. The *cluster* has to have been created with address ranges for both families. Without them, the API either rejects your Service or quietly leaves it on one family only.
 
 > ⚠️ **Common Pitfall:** Assuming Ingress controllers and NetworkPolicies "just work" on both families without testing. Half the dataplane may still be IPv4-only.
 
 ### Under the hood
 
-Clusters must be started with dual-stack networking. Service fields:
+The cluster must be created with dual-stack networking first. Then these Service fields apply:
 
 ```yaml
 apiVersion: v1
@@ -415,14 +437,14 @@ spec:
       targetPort: 8000
 ```
 
-`ipFamilyPolicy` values: `SingleStack`, `PreferDualStack`, `RequireDualStack`.
+`ipFamilyPolicy` takes three values. `SingleStack` uses one family. `PreferDualStack` asks for both and accepts one if that is all the cluster offers. `RequireDualStack` fails if both are not available.
 
 ```bash
 $ kubectl get svc task-api-dual -o yaml
 # status.loadBalancer / clusterIPs may list both families when supported
 ```
 
-kind dual-stack requires explicit cluster config; default kind is often IPv4-only—treat dual-stack as a configured feature, not a freebie.
+Dual-stack on kind needs explicit cluster configuration, and a default kind cluster is usually IPv4-only. Treat dual-stack as something you turn on deliberately, not something you get for free.
 
 **What breaks if you `RequireDualStack` on an IPv4-only cluster:** Service creation fails or never becomes ready—catch it in staging with the same kind/cloud networking mode as prod.
 
@@ -430,7 +452,7 @@ kind dual-stack requires explicit cluster config; default kind is often IPv4-onl
 
 **Ownership:** platform designs CIDRs and CNI dual-stack mode before day one; app teams only set `ipFamilyPolicy` when the platform supports it.
 
-Plan Pod and Service CIDRs for both families before day one. Test probes, NetworkPolicies, and ingress controllers on both stacks. Document which family is primary for egress NAT.
+Plan the Pod and Service address ranges for both families before you build the cluster. Test probes, NetworkPolicies, and ingress controllers on both families, not just one. Write down which family is primary for outbound NAT, because that decision affects firewall rules everywhere else.
 
 **Do:** decide primary family for egress NAT early. **Don't:** enable dual-stack Service fields without a dual-stack cluster.
 
@@ -446,9 +468,11 @@ Plan Pod and Service CIDRs for both families before day one. Test probes, Networ
 
 ### In plain terms
 
-By default, a Service may send traffic to Pods on *any* node. Sometimes you want "prefer local" to cut hops and keep zone traffic cheap. Kubernetes exposes this with **internalTrafficPolicy** and topology-aware mechanisms including **`trafficDistribution`**. The problem they solve is unnecessary cross-node and cross-AZ hairpinning when a local or nearby backend exists.
+By default a Service will send a request to any healthy Pod, on any node, in any zone. Two settings let you narrow that: **`internalTrafficPolicy`** keeps in-cluster traffic on the same node, and **`trafficDistribution`** asks for nearby Pods, usually meaning the same zone.
 
-You might think `Local` means "always succeeds somehow." If there is no backend on the same node, traffic is dropped—not forwarded. That is correct and sharp-edged.
+Two reasons to care. Latency, because a request that crosses a node or a zone takes longer. And money, because most cloud providers charge for traffic between availability zones. If a perfectly good Pod is running on the same node, sending the request across the data center is pure waste.
+
+You might read `Local` as "prefer local, fall back if needed." It does not mean that. If there is no backend on the client's own node, the traffic is **dropped**, not forwarded. That behavior is intentional, and it is sharp enough to cut you.
 
 > ⚠️ **Common Pitfall:** Setting `externalTrafficPolicy: Local` for client-IP preservation without scheduling Pods on every node the LB targets—intermittent blackholes that depend on which node receives the packet.
 
@@ -475,9 +499,9 @@ spec:
       targetPort: 8000
 ```
 
-**externalTrafficPolicy: Local** (for NodePort/LoadBalancer) preserves client source IP and skips cross-node hop—at the cost of imbalanced load if Pods are uneven.
+**externalTrafficPolicy: Local**, which applies to NodePort and LoadBalancer Services, keeps the real client IP address visible to your app and skips the extra node hop. The cost is uneven load whenever Pods are spread unevenly across nodes.
 
-**Topology-aware routing / trafficDistribution** hints the dataplane to prefer same-zone endpoints when possible:
+**`trafficDistribution`** asks the forwarding layer to prefer endpoints in the same zone when it can:
 
 ```yaml
 apiVersion: v1
@@ -493,7 +517,7 @@ spec:
       targetPort: 8000
 ```
 
-Exact hint semantics evolve with the dataplane (kube-proxy iptables/ipvs, eBPF CNIs). EndpointSlices carry topology hints for consumers. Always verify behavior on *your* CNI/proxy mode.
+Treat `PreferClose` as a hint, not a rule. Exactly how it is honored depends on your forwarding layer — kube-proxy in iptables or IPVS mode, or an eBPF-based CNI — and that behavior keeps evolving. The hints themselves travel inside EndpointSlices. Always test what happens on *your* CNI and proxy mode.
 
 ```mermaid
 flowchart TB
@@ -513,10 +537,10 @@ flowchart TB
 
 **Ownership:** platform documents which dataplane honors which hints; app teams opt in for node-local agents and multi-zone cost control.
 
-1. Use `internalTrafficPolicy: Local` for node-local agents and caches that must not hairpin across the fabric.
-2. Use `externalTrafficPolicy: Local` when you need real client IPs and can schedule enough Pods per node/zone.
-3. Enable topology-aware distribution for multi-zone clusters to reduce cross-AZ spend—monitor for hotspotting.
-4. Never assume hints override readiness; unhealthy local Pods still must not receive traffic.
+1. Use `internalTrafficPolicy: Local` for node-local agents and caches that must never send traffic across the network.
+2. Use `externalTrafficPolicy: Local` when you need the real client IP, and only if you can keep enough Pods on every node and zone.
+3. Turn on topology-aware distribution in multi-zone clusters to cut cross-zone charges, and watch for one zone getting overloaded.
+4. Never assume these hints override readiness. An unhealthy local Pod must still receive no traffic.
 
 > 💡 **Tip:** Topology-aware routing annotations of older versions gave way to clearer Service fields such as `trafficDistribution`. Prefer the documented field for 1.36+ manifests.
 
@@ -532,9 +556,11 @@ flowchart TB
 
 ### In plain terms
 
-Sometimes you want the same client to stick to the same Pod briefly (sticky sessions). Services can do coarse affinity—but sticky sessions often signal a design smell. The problem affinity "solves" is in-memory session state; the durable fix is shared storage.
+**Session affinity**, also called sticky sessions, sends the same client back to the same Pod for a while instead of load balancing every request.
 
-You might think ClientIP affinity survives Pod replacement. When the Pod dies, stickiness cannot save the session—the next Pod is empty unless state lived elsewhere.
+Teams reach for it when an app keeps something in memory — a shopping cart, a login session — that only exists on one Pod. Affinity papers over that, so the client keeps hitting the Pod that remembers it. Be honest about what that is: a workaround, not a fix.
+
+You might think affinity survives a Pod being replaced. It cannot. When that Pod dies, its memory dies with it, and the next Pod has never heard of your client. The real fix is to keep session state somewhere shared, like Redis or a database.
 
 > ⚠️ **Common Pitfall:** Building cart/session state only in Pod memory, then adding `sessionAffinity: ClientIP` and calling it HA.
 
@@ -547,7 +573,7 @@ sessionAffinityConfig:
     timeoutSeconds: 10800
 ```
 
-This is not a full application session store. Prefer shared caches/databases for true session continuity.
+This setting routes packets. It does not store sessions. For real session continuity, put the session in a shared cache or database.
 
 **What breaks during a rolling update with affinity:** clients stick to terminating Pods until timeout, amplifying errors—combine with readiness and shorter affinity timeouts if you must use it.
 
@@ -555,7 +581,7 @@ This is not a full application session store. Prefer shared caches/databases for
 
 **Ownership:** app teams own session architecture; platform rarely enables affinity by default.
 
-Favor stateless apps behind Services. If you need affinity, document failure modes when Pods roll.
+Keep apps stateless behind a Service wherever you can. If you must use affinity, write down what happens to users during a rollout, so nobody is surprised on release day.
 
 **Do:** store sessions in Redis/DB. **Don't:** treat Service affinity as high availability.
 
@@ -577,7 +603,7 @@ Favor stateless apps behind Services. If you need affinity, document failure mod
 | **ExternalName** | DNS alias to external hostname | N/A (CNAME only) | Does not proxy packets |
 | **Headless** (`clusterIP: None`) | Direct Pod DNS (StatefulSet, client-side LB) | No VIP | Returns Pod IPs / external endpoints |
 
-North-south HTTP with host/path rules belongs in Chapter 16 (Ingress / Gateway API), often in front of ClusterIP Services.
+Routing outside HTTP traffic by hostname or URL path is Chapter 16's job (Ingress and the Gateway API). Those sit in front of ordinary ClusterIP Services.
 
 > 🏭 **Production floor:** Default new microservices to **ClusterIP**. Justify every public LoadBalancer or NodePort in the same review that covers NetworkPolicy and ownership of the VIP. Prefer a shared Ingress/Gateway edge for HTTP.
 
@@ -661,11 +687,15 @@ The field has serious historical security issues and is deprecated in 1.36. Use 
 
 ## 15.14 Key takeaways
 
-- Services give stable discovery over ephemeral Pods; EndpointSlices list live backends.
-- ClusterIP dominates east-west; NodePort/LoadBalancer open north-south; headless serves identity-aware clients.
-- **Dual-stack**, **internalTrafficPolicy**, and **trafficDistribution** refine IP families and locality.
-- DNS names—not ClusterIPs—are the contract you should publish.
-- Skip deprecated **externalIPs**; prefer modern exposure paths.
+- Pod IPs die with the Pod. A Service is the address that stays.
+- An **EndpointSlice** is the live list of Pods behind a Service. Check it first when traffic disappears.
+- An empty EndpointSlice means a selector mismatch or a failing readiness probe. Almost always one of those two.
+- **ClusterIP** is the default and the right answer for traffic between services.
+- **NodePort** and **LoadBalancer** let outside traffic in. A LoadBalancer on kind stays `<pending>` on purpose.
+- **Headless** Services return Pod addresses. **ExternalName** only answers DNS and proxies nothing.
+- Publish DNS names, never ClusterIPs. A ClusterIP changes when the Service is recreated.
+- `Local` traffic policy *drops* traffic when no local Pod exists. `PreferClose` is only a hint.
+- Never use `externalIPs`. It is deprecated in 1.36 and has a bad security history.
 
 ---
 

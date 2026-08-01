@@ -4,25 +4,29 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Apply ResourceQuotas and LimitRanges to protect namespaces
-> - Configure PodDisruptionBudgets with correct expectations about voluntary vs involuntary disruptions
-> - Use Horizontal Pod Autoscaling and understand Vertical Pod Autoscaling’s role
-> - Explain garbage collection via owner references, and how Leases support leader election and heartbeats
-> - Describe the cloud controller manager’s role on managed and self-managed clouds
-> - Plan node maintenance, etcd backup/restore, cluster upgrades, and HA patterns
-> - Walk a practical production readiness checklist
+> - Use ResourceQuotas and LimitRanges so one team cannot use up the whole cluster
+> - Write PodDisruptionBudgets, and know exactly which failures they do and do not cover
+> - Set up Horizontal Pod Autoscaling, and know when Vertical Pod Autoscaling helps instead
+> - Explain how Kubernetes cleans up child objects, and what Leases are used for
+> - Describe what the cloud controller manager does for you, managed or self-run
+> - Plan node maintenance, etcd backups, cluster upgrades, and surviving the loss of a zone
+> - Walk a real production readiness checklist and score your own service against it
 
 ---
 
 ## 24.1 From lab cluster to airline operations
 
-A weekend lab cluster is like a bicycle: if it breaks, you walk. A production cluster is like an airline: schedules, redundancy, maintenance windows, black boxes, and checklists. The Kubernetes API is the same; the **operational discipline** is not.
+A weekend lab cluster is a bicycle. If it breaks, you walk home. A production cluster is an airline. There are schedules, spare aircraft, maintenance windows, flight recorders, and a checklist for everything.
 
 ![Airline operations center for production cluster operations](assets/analogy-airline-ops.png)
 
 *Figure 24.A: Production ops look more like a control room than a laptop demo.*
 
-This chapter gathers the controls you reach for when real users depend on you: quotas, disruption budgets, autoscaling, garbage collection, leases, cloud integration, backups, upgrades, and HA. None of these replace good application design—but without them, even great apps fail messily.
+The Kubernetes API is identical in both cases. What changes is the discipline around it. An airline does not fly better aircraft than a hobbyist; it flies the same physics with procedures, redundancy, and people who rehearse the bad day before it arrives.
+
+This chapter collects the controls you reach for once real users depend on you. Limits so one team cannot starve the others. Budgets so maintenance does not take your service down. Autoscaling. Cleanup. Backups. Upgrades. Surviving the loss of a data center.
+
+None of it replaces writing good software. But a well-written app with no disruption budget and no tested backup still fails badly, and it fails in ways that take hours to understand.
 
 ---
 
@@ -30,13 +34,19 @@ This chapter gathers the controls you reach for when real users depend on you: q
 
 ### In plain terms
 
-**ResourceQuota** is a shared apartment’s breaker panel—no single roommate can pull enough amps to black out the building. **LimitRange** is the rule that every appliance must declare a sane default wattage so nothing plugs in as “unlimited.”
+A **ResourceQuota** sets a ceiling on how much a whole namespace may use: total CPU, total memory, how many Pods, how many load balancers. A **LimitRange** works one level down, on each individual container, setting a default size and a maximum size.
 
-Quotas cap a namespace’s aggregate usage; LimitRanges set defaults/min/max per Pod. Together they stop one team from eating the cluster. You might think quotas replace requests—without requests, scheduling and quotas both fail you.
+Why do you need both? Because they catch different problems. Without a quota, one team's runaway deployment can consume every node and starve everyone else. Without a LimitRange, containers arrive with no resource request at all, which means the scheduler cannot place them fairly and the quota cannot count them properly.
+
+Think of a shared apartment. The ResourceQuota is the breaker panel: no roommate can draw enough power to black out the building. The LimitRange is the house rule that every appliance must state its wattage, so nothing plugs in claiming to need nothing.
+
+That is why the two go together. A quota on `requests.cpu` only means something if every container actually declares a CPU request, and the LimitRange is what makes sure they do.
 
 > ⚠️ **Common Pitfall:** Setting quotas without LimitRange defaults—Pods with no requests may still schedule unfairly until quota reckoning surprises you.
 
 ### Under the hood
+
+Here is a namespace ceiling and the per-container defaults that make it work:
 
 ```yaml
 apiVersion: v1
@@ -103,9 +113,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform owns quota classes per namespace tier; app teams stay inside them and request increases via change tickets.
+**Ownership:** The platform team defines quota sizes for each tier of namespace. App teams stay inside them and ask for an increase through a change ticket rather than raising it themselves.
 
-**Failure mode:** Hit quota → create/update denied mid-rollout. Detect with API errors and quota used/hard metrics. Mitigate with headroom and clear dashboards.
+**Failure mode:** Hitting the quota rejects new Pods in the middle of a rollout, which is the worst possible moment. Detect it through the Forbidden errors in the API and through metrics comparing used against the limit. Prevent it by leaving headroom and by putting used-versus-limit on a dashboard the team actually looks at.
 
 | Do | Don't |
 |----|-------|
@@ -125,13 +135,21 @@ flowchart LR
 
 ### In plain terms
 
-A **PodDisruptionBudget** limits *voluntary* disruptions—actions that politely evict Pods through the Eviction API—such as `kubectl drain`, cluster autoscaler scale-down, and many upgrade tools. It does **not** stop node crashes, power loss, or `kubectl delete pod`.
+A **PodDisruptionBudget**, or **PDB**, is an object that says how many replicas of a workload must stay running while somebody is doing planned maintenance. If an eviction request would break that promise, the API server refuses it.
 
-PDBs limit voluntary disruptions so drains and upgrades do not take all replicas at once. They are availability contracts, not immortality. You might think PDB stops OOM kills—only voluntary/API eviction paths honor them.
+Why does maintenance need protecting? Because a cluster upgrade drains nodes one after another, and nothing naturally stops it from draining every node your three replicas happen to sit on. A PDB makes the drain wait. It turns "we upgraded the cluster and the service went down for ninety seconds" into "the upgrade took longer and nobody noticed."
+
+Here is the boundary that must be clear. A PDB only governs **voluntary disruption** — a deliberate action, sent through the eviction API, by a human or a tool. `kubectl drain` is voluntary. The cluster autoscaler removing an underused node is voluntary. A node losing power is not. A kernel panic is not. Neither is `kubectl delete pod`.
+
+> 💡 **In one line:** A PDB slows down planned maintenance so it cannot take all your replicas at once — it has no power over crashes, power loss, or a direct pod delete.
+
+Which leads to the trap. Write `minAvailable` equal to your replica count and you have not made the service safer; you have made every drain block forever, and a stuck drain during a security patch is its own kind of incident.
 
 > ⚠️ **Common Pitfall:** `minAvailable: 100%` on a single-replica Deployment—blocks all voluntary drains forever.
 
 ### Under the hood
+
+Here is a budget that keeps two of three replicas serving during any drain:
 
 ```yaml
 apiVersion: policy/v1
@@ -169,9 +187,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** App teams own PDB for their workloads; platform owns drain automation that respects them.
+**Ownership:** App teams write the PDB for their own workloads, because only they know how many replicas must stay up. The platform team owns the drain automation that honors those budgets.
 
-**Failure mode:** Too-tight PDB → stuck node upgrades. Detect with drain timeouts and PDB allowed disruptions = 0. Mitigate with replica headroom before maintenance.
+**Failure mode:** A budget that is too strict stops node upgrades entirely. Detect it through drain timeouts and by watching for a PDB whose `ALLOWED DISRUPTIONS` sits at zero. Prevent it by adding replica headroom before the maintenance window opens, not during it.
 
 | Do | Don't |
 |----|-------|
@@ -193,13 +211,19 @@ flowchart TB
 
 ### In plain terms
 
-**HPA** adds or removes *replicas* when load changes—hire more cashiers when the line grows. **VPA** recommends or adjusts *CPU/memory requests* so each cashier has the right-sized station. They solve different problems; combining them carelessly on the same metric fights itself.
+There are two ways to give a workload more capacity, and Kubernetes has a tool for each. **HPA**, the **Horizontal Pod Autoscaler**, changes how *many* replicas run. **VPA**, the **Vertical Pod Autoscaler**, changes how *big* each replica is by adjusting its CPU and memory requests.
 
-HPA scales replicas from metrics; VPA recommends or sets resources. Both need correct metrics and resource requests. You might think max replicas equals safety—without PDBs and dependency capacity you amplify load on databases.
+Why does the difference matter? Picture a supermarket. When the line gets long, you open more checkout lanes; that is HPA. When one cashier's station is too cramped to work in, you make the station bigger; that is VPA. Opening more lanes does not help if each station is broken, and a bigger station does not help if you only have one.
+
+Both depend on two things being correct: working metrics, and resource requests on your containers. HPA measures usage as a percentage *of the request*, so a container with no request gives the autoscaler nothing to divide by.
+
+One caution about scaling up. Raising `maxReplicas` feels like buying safety. It is not free. Ten replicas open ten times as many database connections, and the autoscaler will happily scale your app right into overwhelming a dependency that cannot scale with it. Set the ceiling based on what your dependencies can take.
 
 > ⚠️ **Common Pitfall:** HPA on CPU while the app is I/O bound—scales the wrong signal.
 
 ### Under the hood
+
+Here is an autoscaler that keeps average CPU near 70% of the request:
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -246,9 +270,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** App teams own HPA/VPA policies; platform owns metrics pipelines they depend on.
+**Ownership:** App teams own their autoscaling settings. The platform team owns the metrics pipeline those settings depend on.
 
-**Failure mode:** Flapping HPA → churn and cost. Detect with replica oscillation metrics. Mitigate with stabilization windows and custom metrics tied to SLIs.
+**Failure mode:** An autoscaler that reacts too quickly oscillates — scaling up, then down, then up again — which churns Pods and costs money without helping anyone. Detect it by graphing replica count over time and looking for the sawtooth. Fix it with a stabilization window that makes the autoscaler wait before reversing, and by scaling on a signal your users actually feel.
 
 | Do | Don't |
 |----|-------|
@@ -268,13 +292,19 @@ flowchart LR
 
 ### In plain terms
 
-Kubernetes cleans up dependent objects the way a theater removes stage props when the show closes—**if** those props are tagged as belonging to the show. **Owner references** link children to parents. When you delete a Deployment, its ReplicaSets and Pods go too (cascading garbage collection). Orphaned objects without owners linger until someone deletes them by hand.
+An **owner reference** is a field on an object that names its parent. A Pod created by a ReplicaSet carries an owner reference pointing at that ReplicaSet, and the ReplicaSet carries one pointing at the Deployment. **Garbage collection** is the cluster process that reads those links and deletes children when their parent goes away.
 
-Owner references make Kubernetes delete dependents when owners go. Understanding GC prevents orphan cost and surprise deletes. You might think deleting a Namespace is light—it cascades broadly; know the blast radius.
+Why should you care about a background cleanup process? Because it explains both of the surprising outcomes you will eventually hit. Delete a Deployment and its Pods vanish too, which is usually what you wanted. Delete a namespace and *everything* inside it vanishes, which is a far larger blast radius than people expect. And an object with no owner reference is never cleaned up automatically, so it sits there costing money until a human notices.
+
+Think of a theater striking the set after closing night. Anything tagged as belonging to the show gets carried out. Anything untagged stays in the wings for years.
+
+This is exactly why storage deserves care during teardown. A PVC left with no owner keeps its cloud disk alive and billing. Meanwhile, a cascade you did not expect can remove a claim you meant to keep. Know which one you are triggering before you press enter.
 
 > ⚠️ **Common Pitfall:** Orphaning PVCs by deleting workloads without a reclaim plan—or conversely, unexpected cascades.
 
 ### Under the hood
+
+Here is how to see the links and control what happens on delete:
 
 ```bash
 $ kubectl get pod task-api-6d7f8c9b5d-xk2m9 -o yaml | findstr /C:"ownerReferences" /C:"name:" /C:"kind:"
@@ -305,9 +335,9 @@ Custom controllers should set owner references on objects they create so namespa
 
 ### In production
 
-**Ownership:** App teams understand owners for their objects; platform monitors orphaned PVCs/LoadBalancers for cost.
+**Ownership:** App teams need to know which of their objects have owners and which do not. The platform team watches for orphaned PVCs and load balancers, because those quietly cost money forever.
 
-**Failure mode:** Orphans → cost leak; cascades → data loss. Detect with orphan reports. Mitigate with deletion policies and change checklists.
+**Failure mode:** Orphans leak money. Unexpected cascades destroy data. Detect both with a scheduled report of objects nothing references. Prevent both with an explicit deletion policy and a teardown checklist that names what should survive.
 
 | Do | Don't |
 |----|-------|
@@ -327,13 +357,19 @@ Custom controllers should set owner references on objects they create so namespa
 
 ### In plain terms
 
-A **Lease** is a short-lived “talking stick” in etcd. Controllers and kubelets use leases to say “I am still alive” or “I am the active leader.” Without leases, leader election and node heartbeats would be noisier and harder to reason about.
+A **Lease** is a small object that one component holds for a short time and must keep renewing. If it stops renewing, the lease expires and someone else can take it. Think of it as a talking stick with a timer.
 
-Leases coordinate leaders (controllers, operators). Broken lease timing causes flapping leaders or split brains. You might think lease objects are “just config”—they are liveness for control loops.
+Why does the cluster need this? Two reasons, and they are the same mechanism used twice. First, heartbeats: every node renews a lease to say "I am still here," and a lease that stops being renewed is how the cluster concludes a node has gone away. Second, leader election: when you run three copies of a controller for redundancy, all three must not act at once, so they compete for one lease and only the holder does the work.
+
+You will almost never create a Lease yourself. What you will do is run an operator with several replicas and rely on this mechanism to keep exactly one of them active.
+
+Two things break it, and both are worth knowing. If the clocks on your machines drift apart, holders and challengers disagree about when the lease expired. If the lease duration is very short, a brief spike in API latency looks like a dead leader, and leadership bounces between replicas under load — exactly when you least want the churn.
 
 > ⚠️ **Common Pitfall:** Clock skew and too-aggressive lease durations causing leadership flaps under load.
 
 ### Under the hood
+
+Here are the leases already running in your cluster:
 
 ```bash
 $ kubectl get leases -n kube-node-lease
@@ -366,9 +402,9 @@ You rarely create Leases by hand for apps; you configure operator replicas and e
 
 ### In production
 
-**Ownership:** Platform/operators own lease health for controllers; app teams rarely touch leases directly.
+**Ownership:** The platform team and operator authors own lease health for their controllers. App teams almost never touch a Lease directly.
 
-**Failure mode:** Leader flap → control-plane thrash. Detect with leader change rate. Mitigate with sane durations and NTPM monitoring.
+**Failure mode:** Leadership bouncing between replicas makes controllers restart their work over and over. Detect it by counting leader changes per hour and alerting when that number climbs. Prevent it with lease durations that tolerate a slow moment, and by monitoring that every node's clock stays synchronized.
 
 | Do | Don't |
 |----|-------|
@@ -388,15 +424,17 @@ You rarely create Leases by hand for apps; you configure operator replicas and e
 
 ### In plain terms
 
-On cloud clusters, someone must translate Kubernetes wishes into cloud API calls: create a load balancer for a Service, attach the right routes, label nodes with zone information, delete cloud disks when told. The **cloud controller manager (CCM)** is that translator. It moved *out* of the core `kube-controller-manager` so cloud logic can evolve with the provider.
+The **cloud controller manager**, usually shortened to **CCM**, is the component that turns Kubernetes objects into cloud API calls. You create a Service of type LoadBalancer; the CCM is what actually asks Amazon or Google for a load balancer and writes its address back into the object.
 
-CCM integrates cloud LBs, nodes, and routes. Misconfigured CCM looks like “Services stuck Pending.” You might think CCM is optional on cloud—without it many LoadBalancer Services never provision.
+Why is it a separate component? Because cloud APIs change on their own schedule, and Kubernetes should not have to release a new version every time a provider adds a feature. Splitting it out lets each cloud ship its own controller.
+
+Why should you know it exists? Because its failures do not look like its failures. When the CCM cannot create a load balancer, what you see is a Service whose external address stays `<pending>` — with no error in your application, no error in your Deployment, and nothing wrong with your YAML. Teams lose entire afternoons to this before checking the Service's Events and finding an exhausted cloud quota or a missing permission.
 
 > ⚠️ **Common Pitfall:** Debugging app Networking for hours when the cloud LB quota is exhausted.
 
 ### Under the hood
 
-Typical CCM responsibilities:
+Here is everything the CCM is responsible for:
 
 - **Service / LoadBalancer** controller — provision and reconcile cloud LBs
 - **Node** controller — sync cloud VM lifecycle with Node objects (and related taints)
@@ -429,9 +467,9 @@ spec:
 
 ### In production
 
-**Ownership:** Platform owns CCM and cloud quotas; app teams own Service annotations within documented allow-lists.
+**Ownership:** The platform team owns the CCM and the cloud quotas it consumes. App teams set Service annotations, but only ones from a documented list.
 
-**Failure mode:** LB Pending forever → external outage. Detect with Service events and cloud quota metrics. Mitigate with quota headroom and annotation policies.
+**Failure mode:** A load balancer that never finishes provisioning is an outage for everyone outside the cluster. Detect it by reading Service Events and by tracking how close you are to your cloud quotas. Prevent it by keeping quota headroom and by rejecting annotations nobody has verified.
 
 | Do | Don't |
 |----|-------|
@@ -451,15 +489,19 @@ spec:
 
 ### In plain terms
 
-Cordon, drain, patch, uncordon—the change-safe node lifecycle. Combine with PDBs and capacity checks. You might think deleting a VM is faster—skipping drain strands volumes and breaks PDBs’ purpose.
+Node maintenance is the routine for taking a machine out of service safely. It has four steps and they always happen in the same order: **cordon**, **drain**, do the work, **uncordon**.
 
-Node maintenance is a controlled blast-radius change: one failure domain at a time, with replacement capacity verified first. Treat console “terminate instance” as an incident, not a shortcut.
+Why the ceremony? Because a node full of running Pods cannot simply be rebooted. Cordon marks it unschedulable so no new Pods land on a machine you are about to take away. Drain then moves the existing Pods off, one eviction at a time, honoring every PodDisruptionBudget along the way. Uncordon at the end tells the scheduler it may use the machine again.
+
+Skipping the ceremony has a name in most companies: an incident. Terminating the instance from the cloud console is faster in the sense that a fire is faster than a stove. Volumes are left attached, replicas disappear together, and the disruption budget you carefully wrote never gets consulted.
+
+Two rules govern the whole procedure. Take one failure domain at a time, never several in parallel. And confirm there is somewhere for the evicted Pods to go before you start, because draining into a cluster with no spare capacity just moves the outage.
 
 > ⚠️ **Common Pitfall:** Draining without replacement capacity in other zones during a zonal event—or force-deleting Pods to “hurry” a drain and bypass PDBs.
 
 ### Under the hood
 
-Safe worker maintenance loop:
+Here is the loop, exactly as you would run it:
 
 ```bash
 $ kubectl cordon worker-2
@@ -491,9 +533,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform owns node maintenance SOP; app teams provide PDBs and tolerate brief reschedules.
+**Ownership:** The platform team owns the written maintenance procedure and follows it every time. App teams supply the PDBs and build services that survive a Pod moving.
 
-**Failure mode:** Unsafe drain → multi-replica outage. Detect with error budget burn during maintenance windows. Mitigate with capacity checks and surge nodes.
+**Failure mode:** A drain done without checks takes several replicas at once and the service goes down. Detect it by watching your error budget during maintenance windows, not after. Prevent it by checking capacity first and by adding temporary extra nodes before large drains.
 
 | Do | Don't |
 |----|-------|
@@ -514,13 +556,19 @@ flowchart LR
 
 ### In plain terms
 
-**etcd** holds cluster state. Lose etcd without a backup and you may rebuild from scratch. Application data (databases on PVs) is a separate backup story—etcd restore brings back object definitions, not necessarily every byte on every volume.
+**etcd** is the database where Kubernetes keeps every object: every Deployment, Secret, Service, and namespace. If etcd is lost and there is no backup, the cluster's entire definition is gone and you rebuild from whatever is left in Git.
 
-Backups without tested restores are fiction. You might think volume snapshots of control-plane disks are enough—practice an API-consistent etcd restore into a scratch control plane and time it as RTO evidence.
+Why treat this differently from your other backups? Because of what an etcd restore does and does not give you. It brings back the *definitions* of your objects. It does not bring back the contents of your volumes. Restore etcd and your database Deployment exists again, pointing at a PVC — but the rows inside that database came from a disk, and that is a separate backup you have to have taken separately.
+
+Now the rule that this whole section exists for. A backup you have never restored is not a backup. It is a file you hope is correct. The failure is always discovered at the worst moment: the snapshot was truncated, the encryption key rotated, or nobody knows the restore procedure and it takes six hours to work out.
+
+Restoring for real is version-sensitive and fiddly — you stop the API servers, load the snapshot, and bring members back in a specific order. Rehearse it on a throwaway cluster and time it. That measured duration is the only honest answer you have when someone asks how long recovery takes.
 
 > ⚠️ **Common Pitfall:** Backing up etcd but never testing restore. Untested backups are fiction.
 
 ### Under the hood
+
+Here is how you take a snapshot and confirm it is readable:
 
 ```bash
 $ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
@@ -538,9 +586,9 @@ On **managed Kubernetes**, the provider usually backs up the control plane—ver
 
 ### In production
 
-**Ownership:** Platform owns etcd backup schedules, encryption keys, and restore drills; app teams own application data backups separately.
+**Ownership:** The platform team owns the etcd backup schedule, the encryption keys, and running the restore drills. App teams own backing up their own application data, which etcd does not cover.
 
-**Failure mode:** Untested backup → prolonged control-plane loss. Detect with backup job success *and* restore-drill cadence. Mitigate with quarterly restore to a non-prod control plane.
+**Failure mode:** An untested backup turns a control-plane loss into a multi-day rebuild. Detect the risk by tracking two numbers, not one: whether the backup job succeeded, and how long ago someone last completed a restore drill. Close the gap by restoring into a non-production control plane every quarter.
 
 | Do | Don't |
 |----|-------|
@@ -561,15 +609,19 @@ On **managed Kubernetes**, the provider usually backs up the control plane—ver
 
 ### In plain terms
 
-Upgrades are controlled blast-radius changes: stay within the supported version window (**1.33–1.36** for this book’s baseline era), minimize downtime, avoid surprise API removals. You might think skip-level upgrades or all-nodes-at-once waves “save time”—they expand blast radius and violate skew.
+A cluster upgrade moves the control plane and then the nodes to a new Kubernetes version. The whole art is doing it in an order that keeps the cluster working the entire time.
 
-Typical goals: control plane first, then nodes, with drain+PDB and capacity. Read release notes before the change window.
+Why is order so important? Because Kubernetes only supports a limited difference between component versions, called **version skew**. Nodes may run a version or two behind the control plane, but never ahead of it. That single rule dictates the sequence: control plane first, then workers in batches, and never a jump that skips a release the vendor did not test.
+
+The other risk is the API surface itself. Kubernetes removes old API versions on a published schedule. Your cluster may upgrade perfectly and then your next deployment fails, because a manifest in Git still asks for something that no longer exists. Scan your manifests against the target version before the change window, not after.
+
+Two shortcuts to refuse. Upgrading all nodes at once looks like it saves an evening; what it really does is drain every replica simultaneously. And skipping the staging rehearsal means production is where you discover which of your workloads had a problem. Stay within the supported window — **1.33 through 1.36** for this book's baseline — and move one wave at a time.
 
 > ⚠️ **Common Pitfall:** Upgrading all nodes in parallel to “save time,” or skipping staging soak.
 
 ### Under the hood
 
-Common approaches:
+Here are the three approaches teams use, and the rules that apply to all of them:
 
 1. **Surges / rolling node pools** — add new nodes on target version, drain old, delete
 2. **In-place upgrades** — upgrade control plane first, then workers in batches
@@ -602,9 +654,9 @@ What breaks if removed APIs still exist in GitOps: the upgrade succeeds while th
 
 ### In production
 
-**Ownership:** Platform owns upgrade waves and skew policy; app teams provide PDBs and soak tests.
+**Ownership:** The platform team plans the waves and enforces the version skew policy. App teams supply PDBs and run their soak tests before the window opens.
 
-**Failure mode:** Bad upgrade → partial API skew outage. Detect with component version matrix and error budget during waves. Mitigate with canary node pools and pause points.
+**Failure mode:** A partial upgrade leaves components at incompatible versions, and only some requests fail. Detect it with a table of which component is on which version, and by watching the error budget during each wave. Reduce the risk with a small canary node pool first and a deliberate pause between waves.
 
 | Do | Don't |
 |----|-------|
@@ -623,13 +675,19 @@ What breaks if removed APIs still exist in GitOps: the upgrade succeeds while th
 
 ### In plain terms
 
-HA means surviving loss of a failure domain: multi control-plane, etcd quorum, zoned workers, PDBs. You might think replica count alone is HA—three replicas on one node or one zone still share a fate.
+**High availability**, or **HA**, means the service keeps working when one part of the infrastructure fails. Not when nothing fails — that is easy. When a machine dies, or a whole data center loses power.
 
-Platform owns control-plane/etcd HA; app teams own workload spread. Verify SLAs on managed control planes in writing.
+Why does that need saying? Because "we run three replicas" is the answer most teams give, and it is not an answer. Three replicas on one node die together when that node dies. Three replicas in one availability zone die together when that zone goes dark. HA is arithmetic about **failure domains** — the set of things that fail as a unit — not about replica count.
+
+The same arithmetic applies to the control plane. etcd stays available by majority vote, which is why you run an odd number of members, three or five. Two members cannot form a majority when one is lost, so a two-member setup is worse than a single one. And three members sharing one disk or one rack is really one failure domain wearing a disguise.
+
+If you use managed Kubernetes, the provider handles the control plane. Read the availability commitment they actually publish rather than assuming it covers what you need.
 
 > ⚠️ **Common Pitfall:** Three replicas all on one node or one zone, or even-sized etcd that cannot form quorum cleanly.
 
 ### Under the hood
+
+Here is what has to be true at each layer.
 
 ### Control plane
 
@@ -655,9 +713,9 @@ What breaks if etcd members share a disk or rack: one failure takes quorum—map
 
 ### In production
 
-**Ownership:** Platform owns control-plane/etcd HA; app teams own workload spread and PDBs.
+**Ownership:** The platform team owns control-plane and etcd availability. App teams own how their own replicas are spread and the PDBs that protect them.
 
-**Failure mode:** Zone loss → total outage despite replicas. Detect with topology skew dashboards. Mitigate with topology spread and multi-zone node pools.
+**Failure mode:** A zone goes down and the whole service goes with it, even though the replica count looked healthy. Detect the exposure ahead of time with a dashboard showing how replicas are distributed across zones. Fix it with topology spread constraints and node pools that actually span more than one zone.
 
 | Do | Don't |
 |----|-------|
@@ -796,13 +854,17 @@ Provider-specific control loops such as provisioning **LoadBalancers** for Servi
 
 ## 24.17 Key takeaways
 
-- Quotas and LimitRanges keep multi-tenant clusters fair and predictable.
-- PDBs make planned maintenance safer; they do not stop crashes or deletes.
-- HPA scales replicas; VPA rightsizes requests and is usually an add-on.
-- Owner references drive garbage collection; Leases power heartbeats and leader election.
-- The cloud controller manager (or managed equivalent) bridges Kubernetes objects and cloud APIs.
-- Drain/cordon, etcd backups, and staged upgrades are non-negotiable for self-managed clusters.
-- HA is topology + replicas + backups + runbooks, not a single YAML object.
+- A quota caps the namespace. A LimitRange sizes each container. You need both.
+- A PDB protects planned maintenance only. Crashes and `kubectl delete` ignore it.
+- Never set `minAvailable` equal to your replica count. Drains will block forever.
+- HPA adds replicas. VPA makes each one bigger. Both need resource requests to work.
+- Cap `maxReplicas` at what your database can survive, not at what looks generous.
+- Children are deleted with their parent. Objects with no parent are never cleaned up.
+- Leases are how nodes say "still here" and how controllers pick one leader.
+- A pending load balancer is usually a cloud quota or permission problem, not your YAML.
+- Cordon, drain, work, uncordon. Terminating the instance instead is an incident.
+- A backup you have never restored is a file you hope is correct.
+- Availability is arithmetic about failure domains, not a replica count.
 
 ---
 

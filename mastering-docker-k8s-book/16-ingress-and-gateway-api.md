@@ -4,11 +4,11 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain why LoadBalancer-per-Service does not scale for HTTP applications
-> - Deploy path- and host-based routing with the Ingress API and an Ingress controller
-> - Terminate TLS at the edge using Secrets and certificate workflows
-> - Model the same traffic with Gateway API (`GatewayClass`, `Gateway`, `HTTPRoute`)
-> - Choose Gateway API for new platforms while operating existing Ingress responsibly on Kubernetes 1.36
+> - Say why giving every HTTP app its own load balancer stops working
+> - Route by hostname and URL path using the Ingress API and an Ingress controller
+> - Handle HTTPS at the cluster edge, using Secrets to hold certificates
+> - Describe the same routing with the Gateway API (`GatewayClass`, `Gateway`, `HTTPRoute`)
+> - Choose the Gateway API for new work while still running your existing Ingress safely on Kubernetes 1.36
 
 ---
 
@@ -16,19 +16,23 @@
 
 ### In plain terms
 
-Cloud load balancers are pricey elevators. If every microservice demands its own elevator, the lobby becomes a mall of VIP doors. **Ingress** and **Gateway API** put one (or a few) elevators in front of many apps and route by hostname and path. The problem they solve is north-south HTTP at scale: TLS, host-based routing, and shared edge policy without a billable VIP per Service.
+**Ingress** and the **Gateway API** are two ways to put one shared front door in front of many apps. Traffic arrives at a single address, and the front door decides which app gets it, based on the hostname and the URL path.
 
-You might think "LoadBalancer is simpler so we will add Ingress later." Later rarely comes, and you inherit dozens of public IPs, certificate sprawl, and no central place for WAF rules. Start with a shared edge when you have more than a couple of public HTTP apps.
+You need this because a cloud load balancer is expensive and slow to manage. Give each microservice its own and you end up with dozens of public IP addresses, dozens of certificates to renew, and no single place to add a firewall rule or a rate limit. Think of load balancers as elevators: one lobby with a few elevators works, and a lobby with forty private elevators does not.
+
+You might think a LoadBalancer Service is simpler and you will add Ingress later. Later rarely arrives. By then you have inherited the public IPs, the scattered certificates, and no shared place to enforce anything. Once you have more than a couple of public HTTP apps, start with a shared front door.
 
 > ⚠️ **Common Pitfall:** Creating a LoadBalancer Service *and* an Ingress for the same app without documenting which VIP clients should use—split traffic and split outages.
 
 ### Under the hood
 
+Here is the full path a request takes:
+
 ```text
 Internet → LoadBalancer / Node IP → Ingress or Gateway controller → ClusterIP Services → Pods
 ```
 
-You keep Services as ClusterIP and attach HTTP routing rules at the edge. One external IP can serve `api.example.com` and `admin.example.com` with different backends.
+Notice what does *not* change. Your Services stay ClusterIP, exactly as Chapter 15 left them. All you add is HTTP routing rules at the edge. One external IP can then serve `api.example.com` and `admin.example.com` from completely different Pods.
 
 ```bash
 $ kind create cluster --name edge --image kindest/node:v1.36.0
@@ -53,7 +57,7 @@ flowchart TB
 
 **Ownership:** platform owns the shared VIP, controller capacity, and TLS defaults; app teams own routes (Ingress/HTTPRoute) to their ClusterIP Services.
 
-Centralize TLS, WAF, and rate limits at the edge layer. Chargeback per LoadBalancer IP gets ugly fast—prefer shared ingress gateways with clear route ownership.
+Handle TLS certificates, web application firewall rules, and rate limits in one place at the edge. Billing per public IP address gets ugly fast, so share one gateway and make route ownership explicit instead.
 
 **Do:** default public HTTP through one Gateway/Ingress class per environment. **Don't:** mint a new cloud LB for every microservice PR.
 
@@ -69,15 +73,19 @@ Centralize TLS, WAF, and rate limits at the edge layer. Chargeback per LoadBalan
 
 ### In plain terms
 
-An **Ingress** object is a wish list ("send `/api` to the Task API Service"). An **Ingress controller** is software that reads wishes and programs a proxy (NGINX, HAProxy, Traefik, cloud L7, and others). The problem this split solves is portability of *intent* while allowing different proxies underneath—but only if you keep annotations honest.
+The word "Ingress" means two different things, and mixing them up costs beginners hours. An **Ingress object** is a request you write down: "send `/api` to the Task API Service." An **Ingress controller** is a running program that reads those requests and configures a real proxy — NGINX, HAProxy, Traefik, or a cloud load balancer.
 
-You might think applying an Ingress YAML is enough to get an ADDRESS. Without a controller watching that IngressClass, the object sits inert forever. That is the most common lab confusion.
+Why split it in two? So that your routing rules stay the same no matter which proxy your company runs. You describe what you want; whoever operates the cluster decides what implements it.
+
+> 💡 **In one line:** An Ingress object is just a request written down. Nothing happens until an Ingress controller is running and claims it.
+
+You might think applying Ingress YAML is enough to get an address. It is not. If no controller is watching that IngressClass, the object sits there doing nothing, forever, with an empty `ADDRESS` column. This is the single most common source of confusion in a lab cluster.
 
 > ⚠️ **Warning:** Controllers differ in annotation dialects. An annotation that works on one vendor's Ingress may be ignored or harmful on another. Prefer portable fields, then document required annotations per platform.
 
 ### Under the hood
 
-Without a controller, Ingress objects do nothing. Install one that matches your platform—many kind tutorials use a documented Ingress NGINX manifest, but treat controller choice as an ops decision. On Kubernetes **1.36**, platform teams are actively steered toward **Gateway API** for new designs; Ingress remains widely deployed.
+So install a controller first. Pick one that suits your platform — many kind tutorials use the documented Ingress NGINX manifest — and treat that choice as an operations decision, not a detail. On Kubernetes **1.36**, new designs are steered toward the **Gateway API**, while Ingress remains widely deployed.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -111,7 +119,7 @@ NAME       CLASS   HOSTS        ADDRESS   PORTS   AGE
 task-api   nginx   task.local             80      5s
 ```
 
-`IngressClass` names which controller should honor the object when several coexist.
+Note the empty `ADDRESS`. An **IngressClass** names which controller should pick up this object, which matters as soon as a cluster runs more than one.
 
 ```mermaid
 flowchart LR
@@ -129,7 +137,7 @@ flowchart LR
 
 **Ownership:** platform owns the Ingress *controller* (Deployment, Service, version, CVE response, default certificate); app teams own Ingress *objects* and must not install a second controller "just for their app" without review.
 
-Pin controller versions; watch CVE advisories for proxies. Prefer `ingressClassName` over deprecated class annotations. Document that removing the controller orphans every Ingress.
+Pin the controller version and follow security advisories for the proxy it runs. Always set `ingressClassName`; the old class annotation is deprecated. Write down clearly that removing the controller leaves every Ingress object stranded and every hostname dark.
 
 > 🏭 **Production floor:** Name the on-call owner of the Ingress controller in the platform catalog. App teams escalate routing/TLS edge outages to that owner—not by editing controller ConfigMaps ad-hoc. Treat controller upgrades like shared database upgrades: change window, blast radius = every hostname on that class.
 
@@ -147,9 +155,11 @@ Pin controller versions; watch CVE advisories for proxies. Prefer `ingressClassN
 
 ### In plain terms
 
-**Hosts** are virtual doors (`api.example.com` vs `assets.example.com`). **Paths** are hallways behind one door (`/api` vs `/admin`). The problem they solve is multiplexing many apps on one VIP without rewriting every client to a new port.
+Routing rules come in two kinds. A **host** rule matches the domain name the client asked for, such as `api.example.com` versus `assets.example.com`. A **path** rule matches the part of the URL after the domain, such as `/api` versus `/admin`.
 
-You might think path order in the YAML is always longest-prefix-wins everywhere. Controllers differ—`ImplementationSpecific` and rewrite annotations are where portability dies. Test on the controller you actually run.
+Together they let one IP address serve many apps. Hosts are separate doors into the same building. Paths are the hallways behind one door. Without them, each app would need its own port, and every client would need reconfiguring.
+
+You might think the most specific path always wins. Do not count on it. Behavior differs between controllers, especially with `ImplementationSpecific` path types and rewrite annotations, and that is exactly where portability breaks down. Test the rules on the controller you actually run.
 
 > ⚠️ **Common Pitfall:** A catch-all `path: /` Prefix rule that steals traffic from a more specific path because of controller merge behavior you did not test.
 
@@ -192,7 +202,7 @@ spec:
                   number: 80
 ```
 
-`pathType`: `Exact`, `Prefix`, or `ImplementationSpecific`. Order and longest-prefix behavior can be controller-specific—test rewrites carefully.
+`pathType` has three values. `Exact` matches the whole path. `Prefix` matches anything starting with it. `ImplementationSpecific` hands the decision to the controller. Rule order and longest-prefix behavior vary by controller, so test any rewrite carefully.
 
 **What breaks if the backend Service port number is wrong:** Ingress shows an address; curl gets 503 or connection refused from the proxy—check `kubectl describe ingress` backends and EndpointSlices.
 
@@ -200,7 +210,7 @@ spec:
 
 **Ownership:** app teams own host/path rules for their apps; platform may reserve `*.platform.example.com` and require DNS proof before attaching.
 
-Keep public admin hosts behind SSO and NetworkPolicies. Avoid regex spaghetti in annotations when a second Ingress/Gateway is clearer. Load-test path routing before big launches—some controllers evaluate rules differently under scale.
+Put every public admin hostname behind single sign-on and NetworkPolicies. When a rule needs a tangle of regular expressions in annotations, use a second Ingress or Gateway instead — it is easier to read and easier to review. Load-test your path routing before a big launch, because some controllers evaluate rules differently under heavy traffic.
 
 **Do:** prefer host-based isolation for admin vs public. **Don't:** encode auth only in an Ingress annotation no other controller understands.
 
@@ -216,9 +226,11 @@ Keep public admin hosts behind SSO and NetworkPolicies. Avoid regex spaghetti in
 
 ### In plain terms
 
-Browsers speak HTTPS to the edge. The Ingress controller presents a certificate and can forward HTTP to Services inside the cluster. The problem this solves is central TLS: one place to renew certs, enforce HTTPS, and keep private keys out of application images.
+**TLS termination** means the edge is where HTTPS stops. The browser makes an encrypted connection to the Ingress controller, the controller presents the certificate and decrypts, and it then forwards plain HTTP to your Service inside the cluster.
 
-You might think putting `tls.crt` in the app container is "simpler." It multiplies key copies, complicates rotation, and skips the edge policy point. Terminate at the edge unless you have a deliberate mTLS story to the Pod.
+You want this in one place for one reason: certificates expire. Every certificate is a renewal you can forget, and every copy of a private key is a copy that can leak. Terminating at the edge means one place to renew, one place to require HTTPS, and no private keys inside application images.
+
+You might think putting `tls.crt` in the app container is simpler. It is not. Now every app has its own key copy, its own renewal schedule, and no shared place to apply edge rules. Terminate at the edge unless you have a deliberate plan for encrypting all the way to the Pod.
 
 > ⚠️ **Common Pitfall:** TLS Secret in the wrong namespace—or wrong `secretName`—so the controller serves a default fake cert and browsers scream while the Ingress looks Ready.
 
@@ -257,7 +269,7 @@ spec:
                   number: 80
 ```
 
-cert-manager (ecosystem) can automate issuance into TLS Secrets. Redirect HTTP→HTTPS via controller settings.
+Notice the Secret type: `kubernetes.io/tls`, holding exactly `tls.crt` and `tls.key`. You rarely create these by hand. **cert-manager**, a widely used add-on, requests certificates and writes them into Secrets for you, then renews them before they expire. Redirecting plain HTTP to HTTPS is a controller setting.
 
 ```mermaid
 flowchart LR
@@ -275,7 +287,7 @@ flowchart LR
 
 **Ownership:** platform often runs cert-manager and default certificates; app teams own hostname requests and may own app-specific Secrets when self-managed.
 
-Prefer short-lived automated certs. Restrict who can read TLS Secrets (RBAC). Decide where you terminate TLS (edge only vs re-encrypt to Pods) and document trust boundaries.
+Use short-lived certificates that renew automatically. Restrict who can read TLS Secrets with RBAC, the same way you would for a database password. Decide deliberately whether traffic stays plain inside the cluster or gets re-encrypted to the Pod, and write that decision down so nobody has to guess.
 
 > 🏭 **Production floor:** Never commit TLS private keys to git—even in "lab" folders that later get copied. Issue via ACME/cert-manager or your enterprise PKI into Secrets; rotate on a schedule; paste the Secret name and notary/issuance id into incident tickets, not the PEM.
 
@@ -293,15 +305,21 @@ Prefer short-lived automated certs. Restrict who can read TLS Secrets (RBAC). De
 
 ### In plain terms
 
-**Gateway API** splits responsibilities the way real organizations work: infrastructure teams own **Gateways** (listeners, ports, TLS), app teams own **Routes** (attach paths/hosts to Services). It is more expressive and role-oriented than Ingress. The problem it solves is the Ingress annotation swamp and unclear ownership when every team edits the same edge object.
+The **Gateway API** does the same job as Ingress, but it splits one object into two. A **Gateway** holds the front door itself: the ports it listens on, the protocols, and the TLS certificates. An **HTTPRoute** holds one app's routing rules and points at that Gateway.
 
-You might think Gateway API is "Ingress renamed." Attachment rules, weighted backends, header matches, and ReferenceGrant cross-namespace controls are first-class—migration is a design change, not a find-replace.
+That split exists because two different teams were fighting over one file. With Ingress, the person who owns the certificates and the person who owns `/api` edit the same object. With the Gateway API, the platform team owns the Gateway, each app team owns its own HTTPRoute, and the Gateway states which namespaces are allowed to attach.
+
+The second reason is that Ingress ran out of room. Anything Ingress could not express — splitting traffic by weight, matching a header, timeouts — had to be written as vendor-specific annotations. Those annotations are not portable and are not validated. The Gateway API makes those features real fields.
+
+> 💡 **In one line:** Ingress is one object owned by everyone; the Gateway API splits it into a Gateway the platform team owns and HTTPRoutes each app team owns.
+
+You might think the Gateway API is Ingress with new names. It is not. Attachment permissions, weighted backends, header matching, and cross-namespace grants are all built in. Moving over is a design change, not a search and replace.
 
 > ⚠️ **Common Pitfall:** Creating an HTTPRoute whose `parentRefs` point at a Gateway that does not allow the route's namespace—status conditions say Accepted=False while curl fails and DNS looks fine.
 
 ### Under the hood
 
-Core kinds:
+Here are the object types you will actually write:
 
 | Kind | Role |
 |------|------|
@@ -370,7 +388,7 @@ NAMESPACE         NAME   CLASS    ADDRESS   PROGRAMMED
 gateway-system    edge   cilium   10.0.…    True
 ```
 
-Gateway API is **not** "Ingress with new names"—attachment, weighting, header matching, and cross-namespace grants are first-class.
+Read the two objects together. The Gateway's `allowedRoutes` says which namespaces may attach, and the HTTPRoute's `parentRefs` says which Gateway it wants. Both sides must agree, which is the whole point: neither team can change the edge alone.
 
 ```mermaid
 flowchart TB
@@ -388,12 +406,12 @@ flowchart TB
 
 **Ownership:** platform owns GatewayClass + Gateway listeners; app teams own HTTPRoutes; security reviews ReferenceGrant sprawl.
 
-1. Standardize on one GatewayClass per environment.
-2. Use `allowedRoutes` and ReferenceGrant so app teams cannot hijack listeners.
-3. Migrate route-by-route from Ingress; run both during transition.
-4. On 1.36+, treat Gateway API as the default for *new* north-south HTTP; keep Ingress where controllers and muscle memory still dominate.
+1. Settle on one GatewayClass per environment.
+2. Use `allowedRoutes` and ReferenceGrant so no app team can take over a listener it does not own.
+3. Move one route at a time from Ingress, and run both edges during the move.
+4. On 1.36 and later, make the Gateway API your default for *new* public HTTP. Keep Ingress where the controller and your team's habits are already solid.
 
-> 💡 **Tip:** Many CNIs and mesh projects ship Gateway API controllers. Pick based on platform strategy, not blog hype—prove TLS, timeouts, and observability in a pilot.
+> 💡 **Tip:** Many CNIs and service mesh projects ship a Gateway API controller. Choose one based on your platform strategy, not on a blog post. Prove out TLS, timeouts, and observability in a pilot first.
 
 **Before you leave this section**
 
@@ -407,13 +425,17 @@ flowchart TB
 
 ### In plain terms
 
-Ingress is the older, flatter API everyone knows. Gateway API is the modern, role-aware toolkit. You may run both for years. The problem this comparison solves is choosing without rewriting working production on a Friday.
+So which one should you use? Ingress is the older, simpler API that everyone already knows. The Gateway API is the newer one, built around who owns what. Most companies will run both for years, and that is fine.
 
-You might think you must migrate everything before 1.36 support ends. Kubernetes still serves Ingress; the strategic shift is for *new* platforms and greenfield routes, not emergency rewrites.
+Here is the decision, plainly. For a new platform or a new public hostname, choose the Gateway API. For an Ingress that works today and nobody is complaining about, leave it alone and move it when you have a reason.
+
+You might think Ingress is being switched off soon and you must rush. It is not. Kubernetes 1.36 still serves the Ingress API, and there is no deadline forcing your hand. The shift is about where you put *new* work.
 
 > ⚠️ **Common Pitfall:** Forklifting every annotation feature into Gateway filters in one weekend. Migrate route-by-route with a rollback Ingress kept ready.
 
 ### Under the hood
+
+Here is the side-by-side comparison:
 
 | Concern | Ingress | Gateway API |
 |---------|---------|-------------|
@@ -427,7 +449,7 @@ You might think you must migrate everything before 1.36 support ends. Kubernetes
 
 **Ownership:** platform publishes the migration policy; app teams move their routes when ready.
 
-Freeze net-new Ingress for greenfield if Gateway is ready. Do not rewrite working Ingress on Friday before a holiday. Train app teams on `HTTPRoute` ownership and promotion rules.
+Once your Gateway setup is ready, stop creating new Ingress objects for new work. Never rewrite a working Ingress on the Friday before a holiday. Teach app teams what owning an `HTTPRoute` means, and how a route gets promoted between environments.
 
 ```mermaid
 flowchart LR
@@ -452,15 +474,17 @@ flowchart LR
 
 ### In plain terms
 
-Same app, two eras: ClusterIP Service stays; only the edge object changes. The problem this section solves is connecting Chapters 14–15 to a real hostname without re-architecting the workload.
+Now you connect everything: the Deployment from Chapter 14, the Service from Chapter 15, and a real hostname on the internet.
 
-You might think edge health checks replace Pod readiness. They do not—edge checks the Service/endpoints; readiness still decides which Pods are in the slice. Configure both.
+The reassuring part is how little changes. Your Deployment stays the same. Your ClusterIP Service stays the same. Whether you pick Ingress or the Gateway API, only the edge object differs. Nothing about the workload needs redesigning.
+
+You might think the edge's health check replaces your Pod readiness probe. It does not. The edge checks whether the Service has any endpoints at all. Readiness decides which Pods get to be endpoints. You need both, and they answer different questions.
 
 > ⚠️ **Common Pitfall:** Debugging DNS at the laptop while the Gateway never programmed the listener. Always compare `kubectl describe` status conditions on Gateway/HTTPRoute with curl failures.
 
 ### Under the hood
 
-Prerequisites: Deployment + ClusterIP `task-api` from Chapters 14–15. Then either Ingress or HTTPRoute as above. Validate:
+You need the Deployment and the ClusterIP `task-api` Service from Chapters 14 and 15, plus either the Ingress or the HTTPRoute shown above. Then check each hop:
 
 ```bash
 $ kubectl get svc task-api
@@ -479,7 +503,7 @@ $ curl -sS https://task.example.com/healthz
 {"status":"ok"}
 ```
 
-On kind, follow your controller's documented port-mapping approach (NodePort, `extraPortMappings`, or cloud-provider emulation).
+On kind, getting traffic from your laptop into the cluster takes one extra step. Follow whichever approach your controller documents: a NodePort, kind's `extraPortMappings`, or a cloud-provider emulator.
 
 **What breaks if edge retries are aggressive and the app is overloaded:** retries amplify load (retry storms)—align Gateway/Ingress timeouts with app SLOs and budgets.
 
@@ -487,7 +511,7 @@ On kind, follow your controller's documented port-mapping approach (NodePort, `e
 
 **Ownership:** app teams own the route object and Service; platform owns DNS to the VIP and controller SLOs.
 
-Health checks must hit readiness-backed Services. Configure timeouts and retries at the Gateway/Ingress *and* keep app SLOs honest—edge retries can amplify load.
+Point edge health checks at Services whose endpoints come from real readiness probes. Set timeouts and retries on the Gateway or Ingress, and keep them in line with what the app actually promises. Retries at the edge multiply load on an app that is already struggling.
 
 **Do:** verify EndpointSlices before blaming the edge. **Don't:** set infinite retries on non-idempotent POSTs.
 
@@ -573,11 +597,14 @@ No. Routes still forward to Services (or advanced backends). Services remain the
 
 ## 16.11 Key takeaways
 
-- One edge VIP with host/path routing beats a LoadBalancer per microservice.
-- Ingress needs a controller; portability ends where annotations begin.
-- TLS belongs at the edge with tightly RBAC'd Secrets (often automated).
-- **Gateway API** splits platform vs app concerns and is the strategic choice for new designs on **1.36**.
-- Migrate deliberately; Services underneath stay the same.
+- One shared front door, routing by hostname and path, beats one load balancer per app.
+- An Ingress object does nothing until a matching controller is running. Empty `ADDRESS` means no controller.
+- Annotations are where portability ends. If it is an annotation, it is vendor-specific.
+- Terminate TLS at the edge. Keep certificates in Secrets, automate renewal, and lock down who can read them.
+- The **Gateway API** splits the edge in two: the platform owns the **Gateway**, app teams own **HTTPRoutes**.
+- A route only attaches when both sides agree: `allowedRoutes` on the Gateway and `parentRefs` on the route.
+- Choose the Gateway API for new work on **1.36**. Leave working Ingress alone until you have a reason.
+- Whichever you use, the ClusterIP Service underneath does not change.
 
 ---
 

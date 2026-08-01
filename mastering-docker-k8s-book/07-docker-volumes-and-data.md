@@ -285,7 +285,7 @@ flowchart TB
 
 ## 07.7 Image storage: containerd image store vs overlay2
 
-Volumes hold the data you deliberately persist. Image layers and the container's writable layer are managed by Docker's **image/storage backend** — a different concern that changed significantly in **Docker Engine 29.x**.
+Volumes hold the data you deliberately keep. Image layers and the container's writable layer are a separate matter, handled by Docker's **image/storage backend** — and that part changed significantly in **Docker Engine 29.x**.
 
 ### In plain terms
 

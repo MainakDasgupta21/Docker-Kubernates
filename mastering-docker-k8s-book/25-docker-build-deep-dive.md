@@ -4,20 +4,22 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Create and select Buildx builders backed by appropriate drivers
-> - Define repeatable multi-target builds with `docker-bake.hcl`
-> - Publish one image reference that supports multiple CPU architectures
-> - Choose local, registry, inline, and CI-oriented cache backends
-> - Generate and preserve SBOM and provenance attestations
-> - Diagnose common BuildKit output, emulation, and cache failures
+> - Create Buildx builders and pick the right driver for where your builds should run
+> - Describe several related builds once in `docker-bake.hcl` instead of repeating commands
+> - Publish one image name that works on more than one kind of CPU
+> - Choose where reusable build work is stored, locally or in a registry or in CI
+> - Produce and keep the records that say what is in an image and how it was built
+> - Work out why a build produced no image, ran slowly, or reused the wrong cache
 
 ## 25.1 From Recipe to Build Factory
 
-A Dockerfile is a recipe, but a modern image pipeline is a factory. The recipe describes steps; the factory decides where those steps execute, how many architectures are produced, where reusable work is stored, and which evidence accompanies the result.
+A Dockerfile is a recipe. A production image pipeline is a factory. The recipe lists the steps. The factory decides where those steps run, how many kinds of machine the result must work on, which work gets saved for next time, and what paperwork ships alongside the finished product.
 
-Docker Engine 29.x uses BuildKit for builds, and Buildx is the Docker CLI interface to BuildKit's advanced capabilities. This separation matters. A developer can send the same build definition to the Engine-integrated builder, a dedicated BuildKit container, a Kubernetes-backed builder, or a remote BuildKit service.
+Two pieces of software do this work in Docker Engine 29.x. **BuildKit** is the engine that actually performs a build. **Buildx** is the part of the `docker` command that talks to it. Keeping them separate is what makes the rest of this chapter possible: the same build definition can be sent to the builder inside your local Docker daemon, to a dedicated container, to a set of Pods in Kubernetes, or to a shared build service somewhere else entirely.
 
-The build output is also broader than "an image on my laptop." It may be a multi-platform image index in a registry, an OCI archive, a cache export, and signed or unsigned metadata describing contents and origin. A production build therefore has four concerns:
+The output is also bigger than "an image on my laptop." One build can produce images for several CPU types, a cache other builds will reuse, and machine-readable records of what went into the result.
+
+That gives a production build four separate concerns:
 
 1. **Execution** — which builder and driver perform the work?
 2. **Coordination** — which targets, variables, and platforms belong together?
@@ -28,9 +30,11 @@ The build output is also broader than "an image on my laptop." It may be a multi
 
 ### In plain terms
 
-A builder is a BuildKit worker, or a group of workers, available to your Docker client. A driver is the arrangement used to host or reach that worker.
+A **builder** is a BuildKit worker your Docker client can send work to. A **driver** is how that worker is hosted and reached — inside the Docker daemon, in its own container, in Kubernetes, or over the network.
 
-Think of Buildx as a dispatcher. The familiar default builder is convenient for local work. A named builder gives you an isolated build environment that can be configured, upgraded, shared, or removed without changing the application Dockerfile.
+Why does this need to be configurable? Because the default builder cannot do everything. It is fine for building an image for your own laptop. It struggles when you need images for two CPU types, or a cache shared with your CI system, or a build machine larger than the one on your desk. Choosing a different driver changes what is possible, and it never requires touching the Dockerfile.
+
+Think of Buildx as a dispatcher at a depot. The work order stays the same. The dispatcher decides which crew does the job and where.
 
 The principal drivers are:
 
@@ -59,13 +63,15 @@ flowchart LR
 
 *Figure 25.1: Buildx dispatches one build definition to workers hosted by four different driver topologies.*
 
-Buildx runs BuildKit builds via builders (docker, docker-container, kubernetes, remote). Choose drivers for cache and multi-platform needs. You might think the default docker driver is enough for multi-arch—often you need a container driver or remote builders.
+One assumption is worth correcting now. People expect the default `docker` driver to handle everything, then hit a wall when they ask for two CPU architectures or an external cache. For those jobs you usually need the `docker-container` driver or a remote builder.
+
+There is also a bookkeeping trap. Once a team has several builders, different CI jobs quietly start using different ones. Each has its own cache, so builds get slower for no visible reason, and a build that works in one pipeline fails in another. Write down which job uses which builder.
 
 > ⚠️ **Common Pitfall:** Mixing builder instances without documenting which CI job uses which—cache misses and “works on my machine.”
 
 ### Under the hood
 
-List the available builders and inspect the selected one:
+Here is how you see what you have and create something better. List the available builders and inspect the selected one:
 
 ```bash
 $ docker buildx ls
@@ -107,9 +113,9 @@ $ docker buildx build --push -t registry.example.com/team/task-api:1.0 .
 
 ### In production
 
-**Ownership:** Platform/CI owns shared builders and their security; app teams use approved builders.
+**Ownership:** The platform or CI team owns shared builders and keeps them secure. App teams use the approved builders rather than creating their own.
 
-**Failure mode:** Builder outage → red pipelines. Detect with builder health checks. Mitigate with redundant builders and pinned BuildKit versions.
+**Failure mode:** A builder going down turns every pipeline red at once. Detect it with a health check against the builder itself, not just a failing job. Reduce the impact by having more than one builder available and by pinning the BuildKit version so an unexpected upgrade cannot break everyone at once.
 
 | Do | Don't |
 |----|-------|
@@ -127,17 +133,19 @@ $ docker buildx build --push -t registry.example.com/team/task-api:1.0 .
 
 ### In plain terms
 
-Bake is a build orchestrator included with Buildx. Instead of repeating a long command for every image, you describe targets and shared settings in a file. Bake resolves dependencies, deduplicates common work, and can run independent targets in parallel.
+**Bake** is a tool included with Buildx that reads a file describing several builds and runs them together. Each build it describes is called a **target**.
 
-It plays a role similar to a build-system file: the Dockerfile still defines image construction, while Bake defines the build matrix.
+Why not just run the build command several times? Because real projects build more than one image, and each command grows a long tail of flags: tags, platforms, cache settings, output destinations. Repeat that four times in a shell script and you have four places to update and four chances to get one wrong. Bake puts the shared settings in one place, and lets independent targets run at the same time.
 
-Bake files declare multiple targets (images, matrices) as one build graph—like a Makefile for BuildKit. You might think bash loops are equivalent—Bake shares cache and provenance more cleanly.
+There is a clean division of labor here. The Dockerfile says how *one* image is built. Bake says which images exist, what they are called, which CPU types they cover, and where the result goes.
+
+A shell loop can technically do the same thing, but it re-runs the build machinery from scratch each time. Bake keeps one build graph, so shared work is done once and cache is used properly across targets.
 
 > ⚠️ **Common Pitfall:** Duplicating tags across Bake targets so one target overwrites another’s tag.
 
 ### Under the hood
 
-Create `docker-bake.hcl` at the repository root:
+Here is a real file. Create `docker-bake.hcl` at the repository root:
 
 ```hcl
 variable "REGISTRY" {
@@ -210,9 +218,9 @@ Bake can read HCL, JSON, and Compose build definitions. HCL is especially useful
 
 ### In production
 
-**Ownership:** App teams own bake files in repo; CI invokes pinned targets.
+**Ownership:** App teams own the Bake file in their repository. CI names the exact targets it builds rather than building whatever is there.
 
-**Failure mode:** Wrong target promoted → bad digest in prod. Detect with bake target naming + digest logs. Mitigate with explicit target lists in CI.
+**Failure mode:** The wrong target gets promoted and an unintended image reaches production. Detect it by logging the resulting digest for every target you build and comparing it against what you meant to ship. Prevent it by listing target names explicitly in the CI job.
 
 | Do | Don't |
 |----|-------|
@@ -230,17 +238,19 @@ Bake can read HCL, JSON, and Compose build definitions. HCL is especially useful
 
 ### In plain terms
 
-An image tagged `task-api:1.0` can represent several platform-specific images. When a client pulls it, the registry and runtime select the matching variant, such as `linux/amd64` for many servers or `linux/arm64` for ARM systems.
+A **multi-platform image** is one image name that covers several kinds of CPU. Pull `task-api:1.0` on an Intel server and you get the `linux/amd64` build. Pull the same name on an ARM machine and you get `linux/arm64`. The name is identical; the bytes are not.
 
-The shared reference points to an OCI image index. Each entry in that index points to a normal image manifest with its own layers and configuration.
+Why does this come up? Because your laptop and your servers increasingly disagree about CPU architecture. Apple silicon is ARM. Many cloud node pools are now ARM for cost reasons. Build only for your own machine and the image will fail to start on half the cluster, with an unhelpful "exec format error" that says nothing about architecture.
 
-Multi-platform images ship manifests for amd64/arm64/etc. Emulation works; native builders are faster. You might think one local arch proves all platforms—test at least one VM per critical arch.
+The mechanism is a small index file. The tag points to an **image index**, a short list that says "for amd64 use this manifest, for arm64 use that one." Each entry underneath is an ordinary image with its own layers. The runtime picks the right entry automatically.
+
+Two things to know before you rely on it. Building for another architecture through emulation works but can be dramatically slower, because the compiler itself is being emulated. And building for an architecture is not the same as testing on it — run at least a smoke test on real hardware for every platform you claim to support.
 
 > ⚠️ **Common Pitfall:** Shipping a single-arch image to an arm64 node pool and wondering about Exec format errors.
 
 ### Under the hood
 
-Build and push two Linux variants:
+Here is how to build, publish, and verify both variants:
 
 ```bash
 $ docker buildx build \
@@ -292,9 +302,9 @@ ENTRYPOINT ["task-api"]
 
 ### In production
 
-**Ownership:** App teams declare platforms; platform provides builders that can produce them.
+**Ownership:** App teams declare which platforms their image supports. The platform team supplies builders capable of producing them.
 
-**Failure mode:** Missing arch → CrashLoop on new node pools. Detect with image index inspection in CI. Mitigate with required platforms in gate checks.
+**Failure mode:** A missing architecture puts Pods into CrashLoopBackOff the moment someone adds a node pool with different CPUs. Detect it by inspecting the published image index in CI and confirming every required platform is present. Prevent it by making that check a gate the pipeline cannot skip.
 
 | Do | Don't |
 |----|-------|
@@ -312,17 +322,19 @@ ENTRYPOINT ["task-api"]
 
 ### In plain terms
 
-Build cache is saved work. BuildKit calculates whether an operation's inputs match previous inputs; if they do, it can reuse the result instead of running that step again.
+**Build cache** is saved work from previous builds. Before running any step, BuildKit checks whether it has already run that exact step with those exact inputs. If so, it reuses the old result instead of doing the work again.
 
-An internal builder cache is fast but tied to one builder. An external cache lets fresh CI runners import previous work and lets a completed build publish cache for the next build.
+Why give this a whole section? Because of where your builds run. A cache kept inside one builder is fast, but a CI runner is usually a fresh machine with nothing on it, so every build starts cold and installs every dependency from scratch. An **external cache** fixes that: a finished build writes its reusable work somewhere shared, and the next build on a brand-new runner reads it back.
 
-Cache mounts and registry/gha cache backends cut build time. Cache correctness matters more than max hit rate. You might think caching apt packages without keys is fine—stale caches produce surprise CVE drift.
+The layout of your Dockerfile decides whether any of this helps. BuildKit invalidates a step and everything after it as soon as an input changes. Put `COPY . .` near the top and every commit changes an input, so every step after it re-runs and the cache buys you nothing. Copy the dependency list first, install dependencies, then copy the source. Now a code change only invalidates the last few steps.
+
+One correctness warning. A faster build is not automatically a better build. Cache a package installation with no key tying it to the package list, and you will keep reusing a months-old set of packages, quietly missing security fixes you believe you installed. Correct beats fast.
 
 > ⚠️ **Common Pitfall:** Caching `COPY . .` layers before dependency install—destroying cache on every commit.
 
 ### Under the hood
 
-The main external backends are:
+Here are the places BuildKit can store cache:
 
 - **Inline** — embeds minimal cache metadata in the image; simple but limited.
 - **Registry** — stores a separate cache artifact in an OCI registry.
@@ -367,9 +379,9 @@ The cache mount accelerates package downloads without copying the package-manage
 
 ### In production
 
-**Ownership:** CI owns cache backend reliability; app teams structure Dockerfiles for cache hygiene.
+**Ownership:** The CI team keeps the cache backend available and bounded. App teams order their Dockerfiles so the cache actually works.
 
-**Failure mode:** Poisoned/stale cache → broken artifacts. Detect with reproducible digest checks. Mitigate with mode=max carefully and periodic cache bust pins.
+**Failure mode:** A stale or corrupted cache produces an artifact that does not match its source, and nothing in the build log says so. Detect it by rebuilding from clean periodically and comparing digests. Reduce the risk by using `mode=max` deliberately rather than everywhere, and by forcing the cache to be rebuilt on a schedule.
 
 | Do | Don't |
 |----|-------|
@@ -387,17 +399,21 @@ The cache mount accelerates package downloads without copying the package-manage
 
 ### In plain terms
 
-An SBOM answers, "What software is in this image?" Provenance answers, "How and from what inputs was this image built?" An attestation associates such a statement with an image.
+An **SBOM** is a **Software Bill of Materials**: a machine-readable list of every package and library inside an image. **Provenance** is a separate record describing how the image was built — which source commit, which builder, which build steps. An **attestation** is the general term for attaching a statement like this to a specific image.
 
-These records are evidence, not a guarantee. An SBOM can be incomplete, and provenance can faithfully describe an unsafe process. Their value comes from generation, preservation, verification, and policy use together.
+Why produce these? Because of the question that arrives the morning after a vulnerability is announced. Somebody asks which of your running images contain the affected library. Without an SBOM you find out by rebuilding and grepping, service by service, for hours. With one, it is a query. Provenance answers the second question that always follows: where did this image come from, and can we prove nobody built it by hand on a laptop?
 
-SBOMs list dependencies; provenance attestations record how/where an image was built. Together they support promote-by-digest trust. You might think a tag is enough evidence—tags move; attestations bind to digests.
+> 💡 **In one line:** An SBOM lists what is inside the image; provenance records how the image was made. One answers "am I affected," the other answers "can I trust this."
+
+Be honest about their limits. These are evidence, not guarantees. An SBOM can miss things a scanner did not recognize. Provenance can accurately describe a build process that was insecure. They become valuable only when you generate them, keep them, check them, and refuse to deploy without them.
+
+That last part is where most teams stop short. Generating an SBOM that nobody ever reads and no gate ever checks is paperwork, not security. And note what the evidence attaches to: an immutable **digest**, the content hash of the image. A tag can be moved to point at different bytes tomorrow. A digest cannot.
 
 > ⚠️ **Common Pitfall:** Generating SBOMs but never gating deploy on them—theater without policy.
 
 ### Under the hood
 
-Generate SBOM and maximum-detail provenance while pushing:
+Here is how to produce both while pushing:
 
 ```bash
 $ docker buildx build \
@@ -442,9 +458,9 @@ Be careful with `mode=max`: it provides stronger traceability but may expose bui
 
 ### In production
 
-**Ownership:** Security/platform own attestation policy; app teams enable BuildKit attestations in CI.
+**Ownership:** The security and platform teams decide what evidence is required. App teams turn the attestations on in their CI builds.
 
-**Failure mode:** Missing provenance → cannot prove what shipped. Detect with registry attestation presence checks. Mitigate by failing promote jobs without attestations.
+**Failure mode:** Without provenance you cannot prove what shipped, which turns an audit or an incident into guesswork. Detect the gap by checking the registry for attestations on each digest. Close it by making the promotion job fail when they are missing, rather than warn.
 
 > 🏭 **Production floor:** Promote by digest only. Mutable tags are pointers for humans; the gate that ships to prod must fail closed without SBOM/provenance on that digest.
 
@@ -531,12 +547,15 @@ No. They ask BuildKit to generate and attach evidence. Signing and identity veri
 
 ## 25.10 Key takeaways
 
-- Buildx decouples the Docker client from named BuildKit builders.
-- Driver choice controls configuration, scale, output behavior, and operational responsibility.
-- Bake makes multi-target build policy repeatable and reviewable.
-- Multi-platform publication creates an image index containing platform-specific manifests.
-- External caches speed ephemeral CI runners, but require isolation, retention, and careful Dockerfile design.
-- SBOM and provenance attestations become useful when preserved, verified, and enforced against immutable digests.
+- BuildKit does the building. Buildx is how you talk to it and choose where it runs.
+- The default driver cannot do multi-platform or external cache. Create a builder that can.
+- With a container driver, nothing lands locally unless you say `--load` or `--push`.
+- Bake describes several builds in one file so CI and your laptop run the same thing.
+- One image name can cover several CPU types. Ship every architecture your cluster runs.
+- Building for an architecture is not testing on it. Smoke test each one.
+- Cache order matters more than cache size. Dependencies first, source last.
+- An SBOM says what is inside. Provenance says how it was made.
+- Evidence attaches to a digest, not a tag, and it only counts if a gate checks it.
 
 ## 25.11 Official documentation map
 

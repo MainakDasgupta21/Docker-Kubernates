@@ -4,38 +4,44 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Identify whether Engine uses the containerd image store or a classic storage driver
-> - Plan an Engine 29.x image-store transition without mistaking hidden data for deleted data
-> - Select and operate storage and logging backends
-> - Compare rootless mode with `userns-remap` and recognize their constraints
-> - Use Docker contexts to target local and remote Engines safely
-> - Explain the Engine API and official SDK interaction model
-> - validate and roll out `daemon.json` changes
-> - Evaluate the experimental nftables firewall backend
+> - Check whether a host stores images the new way or the classic way
+> - Change image stores without thinking your images were deleted when they were only hidden
+> - Pick where container data and container logs are kept, and keep both from filling the disk
+> - Compare rootless mode with `userns-remap`, and know what each one cannot do
+> - Point the Docker CLI at a remote engine without deploying to the wrong one
+> - Explain how the Docker CLI, the Engine API, and the SDKs relate
+> - Check a `daemon.json` change before it takes a host offline
+> - Decide whether the experimental nftables firewall backend is worth trying yet
 
 ## 27.1 The Daemon Is Production Infrastructure
 
-The Docker CLI makes container operations feel local and immediate, but most commands are API requests to a long-running daemon. That daemon owns image and container state, starts runtimes, programs networks, collects logs, and exposes a security boundary.
+Typing `docker run` feels like running a program. It is not. Almost every Docker command is a request sent to a background service called the **daemon**, named `dockerd`, which does the actual work.
 
-Operating Docker Engine therefore means more than keeping `dockerd` running. You must understand which data backend is active, where bytes accumulate, how logs rotate, which identities can control the API, and how a configuration change affects existing workloads.
+That daemon is a serious piece of infrastructure. It owns every image and container on the host. It starts the runtimes. It writes firewall rules. It collects your logs. And anyone who can talk to it can generally do anything on the machine.
 
-Docker Engine 29.x also marks an important storage transition: the containerd image store is the default for fresh Engine 29.0 and later installations. Systems upgraded from earlier versions generally retain their classic storage driver until an operator migrates them. Two hosts reporting the same Engine version can consequently have different storage behavior.
+So operating Docker means more than keeping the process alive. You need to know which storage backend is active, where the disk is filling up, whether logs are being rotated, who can reach the API, and what a configuration change will do to containers that are already running.
+
+Docker Engine 29.x adds a wrinkle worth flagging now. A fresh installation of 29.0 or later uses the **containerd image store** by default. A host upgraded from an older version normally keeps its old storage driver until somebody deliberately moves it. Two machines can report the same Engine version and behave differently. Always check the host in front of you.
 
 ## 27.2 Containerd Image Store
 
 ### In plain terms
 
-The image store keeps pulled and built image content plus writable container snapshots. Engine 29.x uses containerd's content store and snapshotters by default on fresh installations.
+The **image store** is where the daemon keeps every layer it has pulled or built, plus the writable layer belonging to each running container. It is the single biggest consumer of disk on most Docker hosts.
 
-Older Engine installations commonly use a classic graph driver such as `overlay2`. Upgrading the Engine package does not automatically mean the host changed stores. This preserves compatibility, but it makes inspection essential.
+Why does the store matter to you? Two reasons. Disk is finite, and images accumulate silently until something breaks. And there are now two different implementations, so the answer to "where did my disk go" depends on which one this host uses.
 
-Modern Docker Engine uses containerd’s image store; understand where images live and how GC works. You might think `docker system prune` is harmless on a shared builder—know blast radius for cached layers.
+Fresh Engine 29.x installations use containerd's content store, which keeps image data under `/var/lib/containerd`. Older hosts use a classic graph driver, usually `overlay2`, under `/var/lib/docker`. Installing the new Engine package does not move you between them. That is deliberate, so upgrades do not disturb running systems, and it is exactly why you inspect rather than assume.
+
+> 💡 **In one line:** Switching image stores hides your old images from `docker images`, but the bytes are still on the disk.
+
+One caution before you go cleaning up. `docker system prune` on a shared build machine deletes cached layers other people's builds depend on. Nothing is lost permanently, but every build afterward starts cold, and on a busy team that is felt immediately.
 
 > ⚠️ **Common Pitfall:** Filling the disk with images until kubelet/docker disk pressure kills workloads.
 
 ### Under the hood
 
-Inspect the active backend:
+Here is how to find out which store a host is running. Inspect the active backend:
 
 ```bash
 $ docker info --format '{{json .DriverStatus}}'
@@ -88,9 +94,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** Platform owns engine disk SLOs on nodes/builders; developers avoid unbounded local tag sprawl.
+**Ownership:** The platform team owns disk targets on nodes and build machines. Developers avoid leaving hundreds of locally tagged images behind.
 
-**Failure mode:** Disk full → node pressure. Detect with disk metrics and prune jobs. Mitigate with scheduled GC and image retention policy.
+**Failure mode:** The disk fills, and the node starts evicting workloads that had nothing to do with the images. Detect it with disk usage metrics rather than waiting for the eviction. Prevent it with cleanup that runs on a schedule and a written rule for how long images are kept.
 
 | Do | Don't |
 |----|-------|
@@ -108,15 +114,19 @@ flowchart TB
 
 ### In plain terms
 
-Container images are stacks of read-only layers plus a writable layer for each container. A storage backend decides how those layers are represented and combined.
+An image is a stack of read-only layers. When a container starts, the engine adds one **writable layer** on top, and every file the container creates or modifies goes there. The storage backend is the machinery that stacks those layers and presents them as one filesystem.
 
-The writable layer is designed for ephemeral container changes. Databases and durable application state belong in volumes or external storage, regardless of the active image store.
+Why care about the difference? Because that writable layer is disposable by design. It exists for the lifetime of one container and is thrown away with it. It is also slower for heavy writes than a plain disk, because every change has to be recorded as a difference against the layers underneath.
 
-Graph drivers and volumes decide performance and durability for engine-local data. Prefer volumes for writable state. You might think container writable layers are fine for databases—layer IO and lifecycle say otherwise.
+That makes a **volume** the right home for anything you need to keep. A volume is storage the engine manages separately from any container's layers, so it survives the container being removed, replaced, or upgraded.
+
+Two habits follow. Put database files and uploads in named volumes, never in the writable layer. And remember that volumes have their own lifecycle: deleting a container leaves its named volume behind, while `docker system prune --volumes` will delete volumes nothing currently references.
 
 > ⚠️ **Common Pitfall:** Binding critical data to a container’s writable layer on Docker 29.x hosts.
 
 ### Under the hood
+
+Here is what each backend uses and how to see where the space went.
 
 With the Engine 29.x containerd image store, snapshotters perform layer operations; `overlayfs` is the normal Linux snapshotter. Classic Engine stores use graph drivers, with `overlay2` being the established Linux choice on supported filesystems.
 
@@ -143,9 +153,9 @@ Removing a container does not automatically remove a named volume. Conversely, `
 
 ### In production
 
-**Ownership:** Platform owns storage driver choice; app teams use named volumes or external stores.
+**Ownership:** The platform team chooses the storage driver for each operating system in the fleet. App teams keep their data in named volumes or in an external store.
 
-**Failure mode:** Driver issues → container start failures. Detect with dockerd logs and volume plugin health. Mitigate with tested drivers and backups for volume data.
+**Failure mode:** A storage driver problem stops containers from starting at all. Detect it in the daemon's own logs and in the health of any volume plugin you use. Reduce the risk by staying on drivers your OS vendor tests, and by backing up volume data separately from anything Docker manages.
 
 | Do | Don't |
 |----|-------|
@@ -163,17 +173,19 @@ Removing a container does not automatically remove a named volume. Conversely, `
 
 ### In plain terms
 
-A logging driver decides where a container's standard output and standard error go. Docker can keep logs in local files or forward them to systems such as journald, syslog, Fluentd, GELF, or cloud logging services.
+A **logging driver** decides where everything a container prints actually goes. It can be written to files on the host, handed to the system journal or syslog, or forwarded straight to a collector such as Fluentd or a cloud logging service.
 
-Logging is a capacity decision. An application that emits unlimited logs can fill the host and stop unrelated workloads.
+Why is this an operations topic rather than a developer one? Because logs consume disk, and the disk belongs to the host, not to the container that filled it. One chatty application with debug logging left on can fill a machine overnight and take down every other container on it. Logging is a capacity decision.
 
-Logging drivers ship container logs to json-file, journald, syslog, vendors. On Kubernetes nodes, prefer the cluster log pipeline; on pure Docker hosts, choose deliberately. You might think json-file without rotation is fine—disks fill.
+The important setting is **rotation**: a limit on file size and how many old files to keep. The `local` driver rotates by default. The widely used `json-file` driver does not, unless you tell it to. That single default is behind a large share of "the disk is full" incidents.
+
+Two more things to know before you choose. Changing the daemon's default only affects containers created afterward, so existing ones keep the old driver until recreated. And some remote drivers will block your application when the collector is unreachable, which turns a logging outage into an application outage.
 
 > ⚠️ **Common Pitfall:** Unlimited json-file logs on production Docker hosts.
 
 ### Under the hood
 
-Inspect the default driver:
+Here is how to check and set it. Inspect the default driver:
 
 ```bash
 $ docker info --format '{{.LoggingDriver}}'
@@ -222,9 +234,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform owns default logging driver and rotation; app teams avoid logging secrets.
+**Ownership:** The platform team sets the default logging driver and rotation limits for the fleet. App teams keep secrets and tokens out of log lines.
 
-**Failure mode:** Log disk fill → host failure. Detect with disk alerts. Mitigate with max-size/max-file or central drivers.
+**Failure mode:** Container logs fill the disk and the whole host fails, not just the noisy container. Detect it with disk alerts that fire well before the disk is full. Prevent it by setting `max-size` and `max-file`, or by shipping logs off the host entirely.
 
 | Do | Don't |
 |----|-------|
@@ -242,20 +254,24 @@ flowchart LR
 
 ### In plain terms
 
-The ordinary Docker daemon runs as root, and access to its control socket is effectively root-level authority. Rootless mode runs both daemon and containers without root privileges. `userns-remap` keeps a rootful daemon but maps container user IDs, including container root, to unprivileged host IDs.
+These are two different ways to stop a container escape from turning into a full takeover of the host. **Rootless mode** runs the daemon and the containers as an ordinary user, with no root privileges at all. **`userns-remap`** keeps the normal root daemon but translates user IDs, so root inside a container is actually a harmless unprivileged user on the host.
+
+Why bother? Because by default the daemon runs as root, and anyone who can reach its socket effectively has root on the machine. If a container breaks out, or an image turns out to be malicious, there is nothing left between it and the host. Both features insert a layer there.
 
 They reduce risk in different places:
 
 - **Rootless** reduces daemon and runtime privilege.
 - **`userns-remap`** reduces the host privilege represented by users inside containers.
 
-Neither makes an untrusted container harmless, and both have host-kernel and feature constraints.
+Think of rootless mode as hiring a caretaker who never holds the master key, and `userns-remap` as keeping the master key but giving every visitor a badge that only opens one room.
 
-Rootless and userns-remap reduce blast radius of container breakout toward host root. Not every workload fits. You might think rootless equals “secure enough for multi-tenant prod”—still combine with other controls.
+Be clear about the limits. Neither one makes an untrusted container safe to run, so keep your other controls in place. Both depend on kernel features and both break some workloads: rootless has restrictions around privileged ports, some networking, and certain storage drivers. And turning on `userns-remap` hides all your existing images and containers behind a new remapped view, so treat it as a storage migration rather than a config tweak.
 
 > ⚠️ **Common Pitfall:** Enabling userns-remap on an existing daemon without migrating volumes/permissions.
 
 ### Under the hood
+
+Here is how each one is turned on, and what it changes underneath.
 
 Set up rootless mode for an unprivileged user with the packaged helper:
 
@@ -298,9 +314,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** Platform decides rootless/userns for Docker hosts; document unsupported features.
+**Ownership:** The platform team decides whether hosts run rootless or `userns-remap`, and writes down which features stop working as a result.
 
-**Failure mode:** Permission broken volumes after remap. Detect in staging migration. Mitigate with rebuild of volume permissions and feature matrix.
+**Failure mode:** After remapping, containers cannot read their own volumes because the file ownership no longer matches. Catch this by rehearsing the migration in staging first. Fix it by resetting ownership on the volume data, and keep a table of which features are supported under each mode.
 
 | Do | Don't |
 |----|-------|
@@ -318,15 +334,19 @@ flowchart TB
 
 ### In plain terms
 
-A Docker context is a named connection profile. It tells the CLI which daemon endpoint, TLS material, and orchestrator settings to use.
+A **Docker context** is a saved connection profile: a name, the address of a daemon, and the certificates or SSH details needed to reach it. Switching contexts points the same `docker` commands at a different machine.
 
-Contexts are safer and clearer than repeatedly exporting `DOCKER_HOST`, but they introduce a human-factor risk: a command can target production while the operator thinks it targets a laptop.
+This matters because one CLI usually has to talk to several engines: your laptop, a shared build machine, maybe a remote host. Contexts let you name each one instead of remembering addresses and re-exporting `DOCKER_HOST` every time.
 
-Contexts point the CLI at remote engines. Convenient and dangerous—wrong context deploys to prod. You might think context is “just a shortcut”—treat it like kubeconfig.
+The convenience is also the danger. Nothing in the output of `docker run` tells you which machine it landed on. A context is much closer to a kubeconfig than to a shell alias: it is the thing standing between "restarting my test container" and "restarting production."
+
+Two habits keep this safe. Pass the target explicitly with `docker -c <name>` in anything scripted, and never leave a production context as the default on a laptop.
 
 > ⚠️ **Common Pitfall:** Leaving a prod context as default on a shared laptop.
 
 ### Under the hood
+
+Here is how contexts are stored and switched.
 
 List and inspect contexts:
 
@@ -361,9 +381,9 @@ Do not expose the unauthenticated Engine API on a TCP socket. Anyone who can con
 
 ### In production
 
-**Ownership:** Humans own careful context switching; platform may forbid direct remote engine access in favor of CI.
+**Ownership:** Every engineer owns checking which context they are on before they run something. The platform team may block direct access to production engines and require changes to go through CI instead.
 
-**Failure mode:** Wrong-context deploy → prod incident. Detect with context name in CI logs and CLI prompts. Mitigate with explicit `-c` and no default prod context.
+**Failure mode:** A command meant for a laptop runs against production. Detect it by printing the context name in CI logs and showing it in your shell prompt. Prevent it by always passing `-c` explicitly and never making a production context the default.
 
 > 🏭 **Production floor:** Prod engines are not a laptop context. Prefer CI/CD for production applies; if a human must touch an engine, require an explicit named context—never a silent default.
 
@@ -383,15 +403,19 @@ Do not expose the unauthenticated Engine API on a TCP socket. Anyone who can con
 
 ### In plain terms
 
-The Docker CLI is one Engine API client. Applications can call the same versioned HTTP API directly or through an SDK.
+The **Engine API** is the HTTP interface the daemon exposes, and the `docker` command is simply one program that calls it. Your own code can call the same API directly, or use an official **SDK**, a language library that wraps those calls in normal functions.
 
-This enables operators to build inventory collectors, controlled automation, test harnesses, and platform services. It also means API credentials carry powerful host permissions.
+Why does that matter to you? Two reasons, and they pull in opposite directions. It means you can automate anything the CLI can do: collect an inventory of running containers, build test harnesses, or write small platform tools. It also means anything that can reach the API has the same power the CLI has.
 
-Everything CLI does goes through the Engine API. SDKs automate—also widen access if the socket is exposed. You might think mounting docker.sock into random containers is normal—it's root-equivalent on many setups.
+That is the part people underestimate. Mounting `/var/run/docker.sock` into a build or test container is a common trick, and on most setups it hands that container the equivalent of root on the host. It can start a new privileged container, mount the host filesystem, and read every secret on the machine. Convenience and total control are the same permission here.
+
+> 💡 **In one line:** Giving something access to the Docker socket is the same as giving it root on that machine.
 
 > ⚠️ **Common Pitfall:** Mounting `docker.sock` into build/test containers on shared hosts.
 
 ### Under the hood
+
+Here is what talking to that API actually looks like.
 
 On Linux, the local daemon normally listens on a Unix socket. A simple read-only request can be demonstrated with `curl`:
 
@@ -421,9 +445,9 @@ Handle timeouts, partial failures, pagination where applicable, and event-stream
 
 ### In production
 
-**Ownership:** Platform forbids casual docker.sock mounts in prod; CI uses least-privilege builders.
+**Ownership:** The platform team forbids casual `docker.sock` mounts in production. CI runs builds with the smallest privileges that still work.
 
-**Failure mode:** Socket mount → host takeover. Detect with admission policies / runtime scans. Mitigate with rootless, nested builders, or remote BuildKit without sock.
+**Failure mode:** A mounted socket lets one container take over the whole host. Detect it with admission policies that reject the mount and with runtime scans that look for it. Avoid it by using rootless engines, nested builders, or a remote BuildKit that needs no socket at all.
 
 | Do | Don't |
 |----|-------|
@@ -441,15 +465,19 @@ Handle timeouts, partial failures, pagination where applicable, and event-stream
 
 ### In plain terms
 
-`daemon.json` is the preferred persistent configuration file for Docker Engine. On a regular Linux installation it is normally `/etc/docker/daemon.json`; rootless and Windows installations use different paths.
+**`daemon.json`** is the configuration file for the Docker daemon itself. On a normal Linux host it lives at `/etc/docker/daemon.json`; rootless and Windows installations keep it elsewhere. It holds settings such as the default log driver, the address pools for networks, and which features are on.
 
-A daemon restart can interrupt container connectivity or change behavior, even when containers have restart policies. Treat configuration as a reviewed rollout.
+Why treat one small JSON file so carefully? Because most of its settings only take effect when the daemon restarts, and a restart can interrupt container networking or change behavior even for containers with restart policies. A typo can stop the daemon from starting at all, which takes the whole host out of service. This is closer to a kernel setting than to an application config.
 
-daemon.json is the engine’s change-controlled config (log driver, cgroup, features). Treat edits like sysctl changes. You might think live tweaks without restart are always enough—many options need restart and soak.
+So handle it the way you would any change to a machine's foundations. Validate the file before restarting, roll it out through configuration management rather than editing hosts by hand, try it on a canary host first, and know how to roll back.
+
+One more trap: a setting supplied both as a `dockerd` startup flag and in `daemon.json` is a conflict, and the daemon will refuse to start. Distribution packages often add flags in a service drop-in file you did not write, so check there before you blame your own edit.
 
 > ⚠️ **Common Pitfall:** Editing daemon.json on every node by hand without config management.
 
 ### Under the hood
+
+Here is a realistic file and the safe way to apply it.
 
 A representative Linux configuration is:
 
@@ -492,9 +520,9 @@ Do not configure the same option both as a daemon startup flag and in `daemon.js
 
 ### In production
 
-**Ownership:** Platform owns daemon.json via config management; changes need soak and rollback.
+**Ownership:** The platform team owns `daemon.json` through configuration management. Every change gets a soak period on a few hosts and a documented way back.
 
-**Failure mode:** Bad config → dockerd won’t start. Detect with fleet config drift checks. Mitigate with canary nodes and validated JSON.
+**Failure mode:** A bad config stops the daemon from starting, and the host is out of service. Detect it by checking the fleet for hosts whose config has drifted from the intended one. Prevent it by validating the JSON before restart and rolling out to canary nodes first.
 
 | Do | Don't |
 |----|-------|
@@ -512,13 +540,19 @@ Do not configure the same option both as a daemon startup flag and in `daemon.js
 
 ### In plain terms
 
-Docker normally programs host firewall rules to implement bridge networking, port publishing, and forwarding. Engine **29.0** introduced an experimental **nftables** backend as an alternative to iptables.
+Every time you publish a port, Docker writes firewall rules on the host to make it work. For years those rules were written using iptables. Engine **29.0** added an experimental **nftables** backend, which is the newer Linux firewall system that most distributions are moving to.
 
-Experimental means the behavior and configuration may change. It is an evaluation target, not an automatic production upgrade. You might think flipping the backend is a drop-in swap—custom `DOCKER-USER` rules and host firewall managers often break until rewritten.
+Why should you know about it? Because the firewall is how containers reach the network and how the outside world reaches them. If your team is already standardizing on nftables for host policy, having Docker write iptables rules alongside is awkward. This option lets both speak the same language.
+
+But **experimental** means exactly that: the behavior and settings can still change between releases. Treat it as something to try on a spare host, not as an upgrade to schedule across the fleet.
+
+The switch is also not a drop-in. Custom rules teams wrote in the iptables `DOCKER-USER` chain have no direct equivalent, so they can silently stop running after the change. That means a rule you rely on to block traffic may simply not fire, which is a failure that looks like nothing happening. Rebuild that policy natively before you trust the host.
 
 > ⚠️ **Common Pitfall:** Migrating `DOCKER-USER` assumptions directly to nftables. Rebuild custom policy with nftables hooks and priorities.
 
 ### Under the hood
+
+Here is how to turn it on and what changes underneath.
 
 Enable it through daemon configuration:
 
@@ -538,9 +572,9 @@ IP forwarding also differs operationally. Confirm IPv4 and IPv6 forwarding plus 
 
 ### In production
 
-**Ownership:** Platform owns firewall-backend choice on Docker hosts; security owns host policy equivalence tests. Treat backend switches as network blast-radius changes.
+**Ownership:** The platform team chooses the firewall backend on Docker hosts. The security team proves the new rules block and allow exactly what the old ones did. Treat a backend switch as a change that can affect every host on the network.
 
-**Failure mode:** Broken publish/NAT or accidental exposure after migration. Detect with connectivity matrices and unexpected open ports. Mitigate with canary hosts, exported rulesets, and documented rollback to iptables.
+**Failure mode:** Published ports stop working, or worse, something is exposed that should not be. Detect it by testing a full matrix of expected connections and by scanning for open ports you did not intend. Contain it with canary hosts, saved copies of the rulesets, and a written rollback to iptables.
 
 | Do | Don't |
 |----|-------|
@@ -641,15 +675,16 @@ Validate the file with `dockerd --validate`, check for duplicate startup flags, 
 
 ## 27.13 Key takeaways
 
-- Engine version alone does not identify the active image store; inspect every host.
-- Fresh Engine 29.x installations default to the containerd image store, while upgraded hosts can retain classic storage.
-- Storage transitions can hide old data, and `userns-remap` is incompatible with the containerd image store.
-- Bound local logs and test remote-driver back pressure.
-- Rootless mode and user namespace remapping reduce different risks and require workload testing.
-- Contexts make endpoints explicit, but remote daemon access remains highly privileged.
-- The Engine API and SDKs enable automation; protect their credentials like host-administrator access.
-- Validate and canary daemon configuration.
-- The nftables backend in Engine 29.x is experimental and requires deliberate firewall-policy migration.
+- The Engine version does not tell you which image store a host uses. Check every host.
+- Fresh 29.x installs use the containerd image store. Upgraded hosts usually keep the classic driver.
+- After a store switch, old data is hidden, not deleted, and still uses disk.
+- `userns-remap` does not work with the containerd image store on Engine 29.x.
+- Always set log rotation, and test what happens when a remote log collector goes away.
+- Rootless mode and `userns-remap` protect against different things, and both break some workloads.
+- Contexts name the machine you are talking to. Remote access is still full control of that machine.
+- The Engine API is the CLI's own interface. Guard its socket like a root password.
+- Validate `daemon.json` and roll it out to a canary before the fleet.
+- The nftables backend is experimental, and your old `DOCKER-USER` rules will not carry over.
 
 ## 27.14 Official documentation map
 

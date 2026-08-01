@@ -579,7 +579,7 @@ What breaks if `minAvailable` is too high during drain: the drain stalls forever
 
 ### In production
 
-**Ownership:** Platform owns drain procedures and node-pressure alerts; app teams own PDB design for their Deployments. Detect pressure via node conditions; detect blocked drains via drain job timeouts and PDB status.
+**Ownership:** The platform team owns the drain procedure and the node-pressure alerts. App teams design the PDB for their own Deployments, since only they know how many replicas may go at once. Spot pressure through node conditions. Spot a blocked drain through drain timeouts and the PDB's own status.
 
 | Do | Don't |
 |----|-------|
@@ -752,11 +752,14 @@ Preferred is a soft preference (Pod can still schedule elsewhere); required is a
 
 ## 20.13 Key takeaways
 
-- The scheduler filters, scores, then binds; Pending Events are your primary debugging tool.
-- Use `nodeSelector` for simple pins; affinity and topology spread for richer hard/soft placement.
-- Taints and tolerations reserve or isolate nodes without trusting every workload author to opt out.
-- PriorityClass and preemption protect critical workloads when the cluster is full—keep the priority ladder small and intentional.
-- Node-pressure eviction and API eviction are different tools; PDBs help with the latter, not the former.
+- The scheduler filters, scores, then binds. Read the Pending Events before changing anything.
+- Pending almost always means your own rules ruled out every node.
+- `nodeSelector` for simple pins. Node affinity when you need operators or a soft preference.
+- Prefer soft rules. A hard rule that cannot be met is an outage waiting for the next incident.
+- Spread replicas across failure domains so one dead node costs a fraction, not everything.
+- Taints repel Pods; tolerations are the opt-in. Do not hand out tolerations everywhere.
+- Priorities only help when they differ. If everything is high, nothing is.
+- PDBs restrain planned drains only. They cannot stop the kubelet reclaiming memory.
 
 ---
 

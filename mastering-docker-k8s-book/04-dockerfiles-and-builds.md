@@ -4,20 +4,24 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Author a clear Dockerfile and explain each major instruction
-> - Build a small Flask **Task API** with sensible image hygiene
+> - Write a clear Dockerfile and say what each instruction is for
+> - Build a small Flask **Task API** image that is safe to run
 > - Use `.dockerignore`, multi-stage builds, BuildKit cache mounts, and build secrets
-> - Apply `ONBUILD`, `STOPSIGNAL`, and `SHELL` when they earn their place
-> - Build for multiple platforms with buildx basics
-> - Distinguish `CMD` versus `ENTRYPOINT` and `COPY` versus `ADD`
+> - Know when `ONBUILD`, `STOPSIGNAL`, and `SHELL` are worth using
+> - Build one image that works on more than one CPU type
+> - Tell `CMD` apart from `ENTRYPOINT`, and `COPY` apart from `ADD`
 
 ---
 
 ## 04.1 From Recipe Card to Kitchen Line
 
-A **Dockerfile** is a recipe. The build engine follows instructions in order, committing filesystem layers as it goes. A sloppy recipe—copy the entire home directory, install compilers you never need at runtime, run as root forever—produces a slow, fragile, oversized dish. A careful recipe produces something you would actually serve to guests (production).
+A **Dockerfile** is a recipe card for an image. It is a plain text file, and the build engine reads it from top to bottom. After most steps, the engine saves the file changes as a new layer.
 
-In this chapter you will build a tiny but real service: a **Task API** in Python Flask. The app is intentionally small so every Dockerfile line stays visible and meaningful.
+A sloppy recipe copies your whole home folder into the image, installs compilers the app never uses, and leaves everything running as root. The result is slow to build, huge to download, and risky to run.
+
+A careful recipe produces something you would happily serve to guests. In this book, guests means production.
+
+In this chapter you build a small but real service: a **Task API** written in Python with Flask. It stays small on purpose. Every line of the Dockerfile should map to a file you can open and read.
 
 ---
 
@@ -25,15 +29,17 @@ In this chapter you will build a tiny but real service: a **Task API** in Python
 
 ### In plain terms
 
-Before optimizing the recipe, you need ingredients: a small HTTP API with a health endpoint and a task list. You will run it with Gunicorn in the container (production-like) while keeping a simple `__main__` block for local runs without Docker.
+The Task API is a small web service with two things in it: a health endpoint that says “I am alive,” and a list of tasks you can read and add to.
 
-A tiny app is not a toy here—it is a controlled surface. Every Dockerfile line in this chapter maps to a file you can see. If you start with a sprawling monolith, layer caching and multi-stage wins get lost in noise.
+Why start with something this small? Because you need ingredients before you can practice the recipe, and a small app keeps every Dockerfile line visible. Start with a sprawling application instead, and the lessons about caching and multi-stage builds disappear into the noise.
 
-> ⚠️ **Common Pitfall:** You might think Flask’s built-in server is “good enough in the image.” It is a development server. Under concurrency and signals, Gunicorn (or another production WSGI server) is the honest default for this book’s container.
+Inside the container, the app will run under **Gunicorn**, a production-grade Python web server that handles many requests at once. The file also keeps a plain `if __name__ == "__main__"` block, so you can still run it directly on your laptop without Docker.
+
+> ⚠️ **Common Pitfall:** You might think Flask’s built-in server is good enough inside the image. It is a development server. Under real traffic, and when the container is asked to shut down, Gunicorn (or another production WSGI server) is the honest choice.
 
 ### Under the hood
 
-Create a project directory:
+Here are the files. Create a project directory:
 
 ```bash
 $ mkdir task-api && cd task-api
@@ -94,7 +100,7 @@ A tiny static file used later to demonstrate the `ADD` instruction (prefer `COPY
 }
 ```
 
-Why Gunicorn in requirements if `__main__` uses Flask’s dev server? The **container** will run Gunicorn for a production-like process; the `__main__` block remains handy for local runs without Docker.
+Why list Gunicorn in the requirements when the `__main__` block uses Flask’s development server? Because the two run in different places. The **container** starts Gunicorn, which is what you want in production. The `__main__` block is only there for quick local runs without Docker.
 
 Quick local sanity check (optional):
 
@@ -113,17 +119,17 @@ $ curl -s http://127.0.0.1:8000/healthz
 {"status":"ok"}
 ```
 
-**What breaks if `/healthz` depends on the database:** orchestrators mark you unready during DB blips even when you wanted a cheap liveness signal. Keep this health endpoint dependency-light; deeper checks belong in readiness later (Kubernetes chapters).
+**What breaks if `/healthz` also checks the database:** a brief database hiccup makes the platform mark every instance unhealthy, even though the process is fine. Keep this endpoint cheap and free of dependencies. Deeper checks belong in readiness probes, covered in the Kubernetes chapters.
 
 ### In production
 
-**Ownership:** app teams own the API code and pinned dependencies; platform owns base-image and scan expectations once it is containerized.
+**Ownership:** app teams own the API code and the pinned dependency versions. The platform team owns which base images are allowed and which scans must pass once the app is containerized.
 
-Pin dependency versions in `requirements.txt` (or a lock file). Do not rely on Flask’s development server under load. Keep the health endpoint cheap and dependency-light—orchestrators will call it often later in Kubernetes.
+Pin exact dependency versions in `requirements.txt`, or use a lock file. Do not serve real traffic with Flask’s development server. Keep the health endpoint cheap, because Kubernetes will call it every few seconds for the life of the pod.
 
-**Failure mode:** unpinned `flask` floats to a breaking major mid-rebuild. **Detect:** lockfile drift; reproducible build digests change unexpectedly. **Mitigate:** pin versions; regenerate locks in PRs.
+**Failure mode:** an unpinned `flask` jumps to a new major version during a rebuild and breaks the app. **Detect:** the lock file no longer matches, and build digests change when nothing in your code did. **Mitigate:** pin versions, and regenerate lock files inside pull requests where reviewers can see them.
 
-**Do:** pin deps; keep `/healthz` cheap. **Don’t:** ship the Flask dev server as PID 1 in shared environments.
+**Do:** pin dependencies and keep `/healthz` cheap. **Don’t:** run the Flask development server as the main process in any shared environment.
 
 **Before you leave this section**
 
@@ -137,15 +143,19 @@ Pin dependency versions in `requirements.txt` (or a lock file). Do not rely on F
 
 ### In plain terms
 
-The build context is the set of files you hand the kitchen. If you hand over your entire home directory—including `.git`, virtualenvs, and `.env` secrets—builds get slow and dangerous.
+The **build context** is the set of files you hand to the build engine when you run `docker build`. Usually it is the folder you point the command at, including everything inside it.
 
-`.dockerignore` is not optional polish. It is the difference between a 2 MB context and a 2 GB context, and between “secrets never entered the daemon” versus “secrets sat in an intermediate layer.”
+Why does that matter? Because those files get sent to the daemon before the first instruction runs. Hand over your whole home directory, complete with `.git` history, a virtual environment, and a `.env` file full of passwords, and the build turns slow and unsafe at the same time.
 
-> ⚠️ **Common Pitfall:** Relying on `.dockerignore` alone while still storing production secrets in the project folder “just for local runs.” Prefer secret mounts and runtime injection; absence is safer than exclusion.
+The `.dockerignore` file lists what to leave out. It works like `.gitignore`, and it is not decoration. It is the difference between sending 2 MB and sending 2 GB. It is also the difference between “the secret never left my laptop” and “the secret is sitting in a layer someone else can download.”
+
+> 💡 **In one line:** The build context is everything you hand the engine before the build starts, so `.dockerignore` decides what never gets shipped at all.
+
+> ⚠️ **Common Pitfall:** Trusting `.dockerignore` while keeping real production secrets in the project folder “just for local runs.” Use secret mounts and inject values at run time. A file that is not there cannot leak.
 
 ### Under the hood
 
-Before the Dockerfile, exclude noise from the build context. The client sends the context directory to the daemon; huge contexts slow builds and risk leaking secrets.
+Here is what actually happens on the machine. Before any Dockerfile instruction runs, the client packages the context directory and sends it to the daemon. A large context slows every build, and any file inside it can end up in a layer.
 
 #### `.dockerignore`
 
@@ -163,7 +173,7 @@ __pycache__
 README.md
 ```
 
-Never rely on `.dockerignore` alone for secrets—do not put secrets in the directory at all if you can avoid it. Prefer BuildKit **secret mounts** (section 04.8) when a build step truly needs a token.
+Never let `.dockerignore` be your only defense for secrets. Keep secrets out of the directory in the first place. When a build step genuinely needs a token, use a BuildKit **secret mount** instead (section 04.8).
 
 ```mermaid
 flowchart LR
@@ -180,19 +190,19 @@ $ docker build -t task-api:ctx-check .
 # Watch the "transferring context" size in BuildKit output — huge numbers mean ignore rules failed
 ```
 
-**What breaks if `.env` is copied then deleted in a later layer:** the secret still exists in the earlier layer and in history. Exclusion and secret mounts beat “delete later.”
+**What breaks if `.env` is copied and then deleted in a later layer:** the secret is still sitting in the earlier layer and in the image history. Anyone who pulls the image can read it. Leaving the file out, or using a secret mount, beats deleting it later.
 
 ### In production
 
-**Ownership:** app teams maintain `.dockerignore` beside the Dockerfile; security/platform may CI-scan final images for credential patterns.
+**Ownership:** app teams keep `.dockerignore` next to the Dockerfile and up to date. Security or platform teams may scan final images in CI for credential patterns.
 
-Review `.dockerignore` in code review the same way you review `.gitignore`. CI should fail builds that accidentally copy `.env` or cloud credential files into layers.
+Review `.dockerignore` in code review, exactly the way you review `.gitignore`. CI should fail any build that copies a `.env` file or cloud credentials into a layer.
 
-**Failure mode:** a developer’s cloud key in context lands in an image pushed to a shared registry. **Detect:** secret scanning on images; unexpected context size metrics. **Mitigate:** ignore rules, pre-commit checks, deny push on scan hits.
+**Failure mode:** a developer’s cloud key sits in the context and ends up in an image pushed to a shared registry. **Detect:** secret scanning on images, and a build context that suddenly grew. **Mitigate:** ignore rules, checks that run before commit, and blocking the push when a scan finds something.
 
-**Do:** code-review `.dockerignore`. **Don’t:** `COPY . .` as the first habit without ignore rules.
+**Do:** review `.dockerignore` like code. **Don’t:** reach for `COPY . .` before the ignore rules exist.
 
-> 🏭 **Production floor:** Treat build context as a trust boundary. Anything transferred can end up in a layer someone else can pull. Blast radius of a leaked CI token in an image is “every environment that can pull that repo.”
+> 🏭 **Production floor:** The build context is a trust boundary. Anything you send can end up in a layer that other people can download. A CI token leaked into an image reaches every environment allowed to pull that repository.
 
 **Before you leave this section**
 
@@ -206,13 +216,17 @@ Review `.dockerignore` in code review the same way you review `.gitignore`. CI s
 
 ### In plain terms
 
-Each instruction is a step on the recipe card. Some change files (`RUN`, `COPY`), some set defaults for later (`ENV`, `WORKDIR`, `USER`), and some document intent (`EXPOSE`, `LABEL`). Learning the *why* of each instruction prevents cargo-cult Dockerfiles that copy flags from Stack Overflow without knowing which layers they create.
+A Dockerfile instruction is one step of the recipe. There are only about fifteen you need, and they fall into three groups.
 
-> ⚠️ **Common Pitfall:** You might think `EXPOSE` publishes a port to your laptop. It documents intent only. Publishing still requires `-p` / Compose ports / a Service.
+Some instructions change files, such as `RUN` and `COPY`. Those create layers. Some set defaults the container will use later, such as `ENV`, `WORKDIR`, and `USER`. Those change the config, not the files. And a few only record intent for other humans and tools, such as `EXPOSE` and `LABEL`.
+
+Why learn which group an instruction belongs to? Because that tells you whether it grows the image, changes how the container starts, or does nothing at run time. Without that, you end up copying flags from a forum post into a Dockerfile you cannot explain, and you cannot tell why the image is 900 MB.
+
+> ⚠️ **Common Pitfall:** You might think `EXPOSE` opens a port on your laptop. It does not. It is documentation. To actually reach the port you still need `-p` on `docker run`, a `ports` entry in Compose, or a Kubernetes Service.
 
 ### Under the hood
 
-Here is a **teaching Dockerfile** that intentionally exercises the major instructions. Comments explain *why*. In real services you may omit `ADD` and `VOLUME` unless needed; you should still recognize them.
+Here is a **teaching Dockerfile** that uses the major instructions on purpose, with comments explaining why each one is there. Real services often skip `ADD` and `VOLUME`, but you should still recognize them when you see them.
 
 #### `Dockerfile`
 
@@ -314,28 +328,28 @@ $ docker inspect task-api:0.1.0 --format 'User={{.Config.User}} Entrypoint={{jso
 User=appuser Entrypoint=["gunicorn"] Cmd=["--bind","0.0.0.0:8000","--workers","2","app:app"]
 ```
 
-**What breaks if you omit `USER`:** the process runs as root inside the container by default on many bases—larger blast radius after a remote code execution bug.
+**What breaks if you leave out `USER`:** on most base images the process runs as root inside the container. If an attacker finds a way to run code in your app, they now have root inside that container, which is a much bigger problem to contain.
 
 ### In production
 
-**Ownership:** app teams author Dockerfiles; platform defines baseline hygiene (non-root, approved bases, scan gates) enforced in CI.
+**Ownership:** app teams write the Dockerfiles. The platform team sets the baseline every image must meet—non-root user, approved base images, passing scans—and CI enforces it.
 
-Baseline hygiene checklist:
+Baseline checklist:
 
-1. Prefer specific base tags (`3.12-slim`), not floating mystery tags alone.
-2. Run as non-root (`USER`).
-3. Multi-stage to drop build tools.
-4. `.dockerignore` to keep secrets and junk out of context.
-5. Do not `curl | bash` unpinned scripts in Dockerfiles.
-6. Pin language packages.
-7. Scan images in CI before promotion.
-8. Least privilege: no `--privileged` for this API.
+1. Use a specific base tag such as `3.12-slim`, not a tag that can move under you.
+2. Run as a non-root user with `USER`.
+3. Use multi-stage builds so build tools never reach the final image.
+4. Use `.dockerignore` to keep secrets and junk out of the build context.
+5. Never pipe an unpinned script from the internet into a shell inside a Dockerfile.
+6. Pin your language package versions.
+7. Scan images in CI before promoting them.
+8. Give the container the least privilege it needs. This API never needs `--privileged`.
 
-**Failure mode:** floating `FROM python:latest` plus root user ships a surprise base upgrade as root. **Detect:** inspect `User` and base digest in CI; admission/policy later in Kubernetes. **Mitigate:** pin bases (ideally by digest); require `USER` non-root.
+**Failure mode:** a `FROM python:latest` that can move, combined with a root user, quietly ships a new base image running as root. **Detect:** check `User` and the base digest in CI, and add admission policy once you reach Kubernetes. **Mitigate:** pin bases, ideally by digest, and require a non-root `USER`.
 
-**Do:** make the inspect one-liner part of review. **Don’t:** treat `EXPOSE` as networking.
+**Do:** make the `docker inspect` one-liner part of code review. **Don’t:** read `EXPOSE` as networking.
 
-> 🏭 **Production floor:** Pin the *runtime* base by digest for release builds when you need bit-for-bit promotion. A floating `python:3.12-slim` tag can move between the build you tested and the rebuild someone runs “the same way” on Friday.
+> 🏭 **Production floor:** For release builds, pin the *runtime* base image by digest when promotion must be byte-for-byte identical. A `python:3.12-slim` tag can move between the build you tested on Tuesday and the rebuild someone runs “exactly the same way” on Friday.
 
 **Before you leave this section**
 
@@ -349,13 +363,17 @@ Baseline hygiene checklist:
 
 ### In plain terms
 
-BuildKit is the modern oven. It builds faster, understands cache mounts and secrets, and powers `docker build` / `docker buildx` on Docker Engine 29.x. The problem it solves is the old builder’s awkwardness: slow rebuilds, secrets leaking into layers, and weak cache control.
+**BuildKit** is the engine that actually runs your build steps. On Docker Engine 29.x it powers both `docker build` and `docker buildx`, so you are already using it.
 
-> ⚠️ **Common Pitfall:** Confusing a **cache mount** (may persist on the builder) with a **secret mount** (must not land in layers). They both use `--mount`, but their trust models differ.
+Why should you care which builder runs? Because BuildKit fixes three real problems from the old one. Rebuilds were slow because nothing could be reused between builds. Secrets leaked, because the only way to pass a token was to bake it into a layer. And you had little control over what was cached.
+
+BuildKit gives you two new tools for that, both written as `--mount` on a `RUN` line. A **cache mount** keeps a folder, such as the pip download cache, on the build machine between builds without putting it in the image. A **secret mount** hands a credential to one step and never writes it to a layer.
+
+> ⚠️ **Common Pitfall:** Treating a **cache mount** and a **secret mount** as the same thing because both use `--mount`. A cache can stick around on a shared builder for days. A secret must never be stored anywhere. Never put credentials in a cache mount.
 
 ### Under the hood
 
-The `# syntax=docker/dockerfile:1` directive enables modern Dockerfile features (cache mounts, better heredocs, secret mounts, and so on).
+Here is what actually happens on the machine. The `# syntax=docker/dockerfile:1` line at the top of the Dockerfile turns on modern Dockerfile features, including cache mounts, secret mounts, and better multi-line syntax.
 
 ```bash
 $ docker build -t task-api:0.1.0 .
@@ -380,7 +398,7 @@ Pass build-time version:
 $ docker build --build-arg APP_VERSION=0.1.0 -t task-api:0.1.0 .
 ```
 
-The `RUN --mount=type=cache,target=/root/.cache/pip` line keeps a pip cache *across builds* without committing cache files into image layers. That is BuildKit’s “why”: faster rebuilds without fatter images.
+The `RUN --mount=type=cache,target=/root/.cache/pip` line keeps pip’s download cache *between builds*, while never writing those cached files into an image layer. That is BuildKit in one line: faster rebuilds without a fatter image.
 
 ```mermaid
 flowchart TD
@@ -398,17 +416,17 @@ flowchart TD
 $ docker history task-api:0.1.0
 ```
 
-**What breaks if BuildKit is disabled or an ancient builder is forced:** cache mounts and secret mounts fail or are ignored; builds get slower and riskier. On Engine 29.x, BuildKit is the expected default—investigate if someone set `DOCKER_BUILDKIT=0`.
+**What breaks if BuildKit is turned off, or an old builder is forced:** cache mounts and secret mounts either fail or are silently ignored. Builds get slower, and credentials can end up in layers. On Engine 29.x, BuildKit is the default, so find out who set `DOCKER_BUILDKIT=0` and why.
 
 ### In production
 
-**Ownership:** platform enables BuildKit and registry cache exporters in CI; app teams write Dockerfiles that use mounts correctly.
+**Ownership:** the platform team turns on BuildKit and provides shared cache storage in CI. App teams write Dockerfiles that use mounts correctly.
 
-Keep BuildKit enabled (default on current Desktop/Engine). In CI, use cache exporters or registry cache backends so agents do not cold-start every pipeline. Never confuse “cache mount” with “secret mount”—caches can persist on builders; secrets must not land in layers.
+Leave BuildKit on; it is the default on current Desktop and Engine. In CI, export the cache to a registry so agents do not start cold on every pipeline run. Keep the two mount types straight: a cache can live on the builder for a long time, and a secret must never be written into a layer.
 
-**Failure mode:** shared CI builder cache retains a secret because someone used a cache mount for credentials. **Detect:** secret scanning; audit Dockerfile mounts in review. **Mitigate:** secrets only via `type=secret`; scrub builders; rotate on suspicion.
+**Failure mode:** a shared CI builder keeps a credential because someone passed it through a cache mount. **Detect:** secret scanning, plus reviewing every `--mount` line in code review. **Mitigate:** pass secrets only with `type=secret`, wipe the builder, and rotate the credential whenever you suspect exposure.
 
-**Do:** keep `# syntax=docker/dockerfile:1` and cache mounts for package managers. **Don’t:** set `DOCKER_BUILDKIT=0` “to make it work” without understanding what you lose.
+**Do:** keep `# syntax=docker/dockerfile:1` at the top, and use cache mounts for package managers. **Don’t:** set `DOCKER_BUILDKIT=0` to make an error go away without understanding what you just gave up.
 
 **Before you leave this section**
 
@@ -422,11 +440,15 @@ Keep BuildKit enabled (default on current Desktop/Engine). In CI, use cache expo
 
 ### In plain terms
 
-**Why:** Compilers and build tooling are needed to *install* dependencies, not to *serve* HTTP. If you leave `build-essential` in the final image, you ship extra attack surface and megabytes.
+A **multi-stage build** is one Dockerfile with more than one `FROM` line. Each `FROM` starts a fresh stage, and the last stage becomes your image. Earlier stages are thrown away, except for the files you explicitly copy forward.
 
-**How:** Stage `builder` installs into `/install`; stage `runtime` copies only `/install` and `app.py`. The final image never contains the compiler packages from the builder stage.
+Why go to that trouble? Because the tools that *install* your dependencies are not the tools that *serve* traffic. A C compiler is needed to build some Python packages, and it is useless once the app is running. Leave `build-essential` in the final image and you ship hundreds of extra megabytes plus a compiler an attacker would love to find.
 
-Multi-stage is the clearest “production floor” habit in Dockerfiles: the image you run should not be the image you compiled in.
+Here is how it works in this chapter’s Dockerfile. The `builder` stage installs everything into `/install`. The `runtime` stage starts from a clean slim base and copies in only `/install` and `app.py`. The compiler never exists in the image you ship.
+
+Multi-stage is the clearest production habit in a Dockerfile: the image you run should never be the image you compiled in.
+
+> 💡 **In one line:** Build in a big messy stage, then copy only the finished files into a small clean stage—the shipped image never sees your compiler.
 
 ```mermaid
 flowchart LR
@@ -445,11 +467,11 @@ flowchart LR
 
 *Figure 04.3: Multi-stage builds compile or install in a heavy stage, then copy only runtime artifacts into a slim final image.*
 
-> ⚠️ **Common Pitfall:** Copying the entire builder filesystem into runtime “to be safe.” You just dragged the toolchain back in.
+> ⚠️ **Common Pitfall:** Copying the whole builder filesystem into the runtime stage “to be safe.” That drags the compiler and every build package right back in, and you get none of the benefit.
 
 ### Under the hood
 
-Contrast with a simpler single-stage file (larger / less ideal):
+Here is what the simpler single-stage version looks like. It is bigger and less safe:
 
 ```dockerfile
 FROM python:3.12-slim
@@ -461,24 +483,24 @@ EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
 ```
 
-This works—and is fine for the first five minutes—but keeps you root by default and mixes concerns. Prefer the multi-stage version as your baseline habit.
+This works, and it is fine for your first five minutes with Docker. It also runs as root by default and mixes building with running. Make the multi-stage version your normal habit instead.
 
 ```bash
 $ docker history task-api:0.1.0
 # Confirm build-essential is not in the final stage history
 ```
 
-**What breaks if `COPY --from=builder` paths are wrong:** runtime missing modules at start; `ModuleNotFoundError` in logs. Fix the install prefix and copy path—not by installing compilers into runtime.
+**What breaks if the `COPY --from=builder` paths are wrong:** the runtime image is missing Python modules, and the container dies with `ModuleNotFoundError` in the logs. Fix the install prefix and the copy path. Do not fix it by installing compilers into the runtime stage.
 
 ### In production
 
-**Ownership:** app teams structure stages; platform may fail CI if scanners find compilers in the final stage.
+**Ownership:** app teams decide how the stages are split. The platform team may fail CI when a scanner finds compilers in the final stage.
 
-Make “final stage has no compiler/toolchain” a review checkbox. For compiled languages, copy only the binary and required runtime libs—not the entire build tree.
+Add “the final stage contains no compiler or build tools” to your review checklist. For compiled languages, copy the finished binary and the libraries it needs at run time, not the whole build tree.
 
-**Failure mode:** “multi-stage” Dockerfile that still `apt-get install build-essential` in the final stage. **Detect:** history/scan; size budget. **Mitigate:** checklist + automated grep/scan for toolchain packages in the promoted digest.
+**Failure mode:** a Dockerfile that looks multi-stage but still runs `apt-get install build-essential` in the final stage. **Detect:** `docker history`, a scanner, or a size budget in CI. **Mitigate:** the checklist plus an automated search for build packages in the digest you promote.
 
-**Do:** name stages (`AS builder`, `AS runtime`) and copy narrowly. **Don’t:** use single-stage root images as the long-term default.
+**Do:** name your stages (`AS builder`, `AS runtime`) and copy as little as possible. **Don’t:** keep a single-stage root image as your long-term default.
 
 **Before you leave this section**
 
@@ -492,9 +514,15 @@ Make “final stage has no compiler/toolchain” a review checkbox. For compiled
 
 ### In plain terms
 
-These three instructions are specialty tools. `STOPSIGNAL` tells Docker which doorbell to ring when stopping. `SHELL` changes which shell interprets shell-form commands. `ONBUILD` leaves a sticky note for *future* Dockerfiles that use your image as a base.
+These three instructions are specialty tools. You will not need them most days, and you will be glad you recognize them when you do.
+
+`STOPSIGNAL` sets which signal Docker sends when it asks the container to stop. A **signal** is a short message the operating system delivers to a process, and `SIGTERM` is the polite “please finish up and exit.” `SHELL` changes which shell interprets commands written in shell form. `ONBUILD` records instructions that do nothing now and run later, inside any image built `FROM` yours.
+
+Why care about instructions you rarely write? Because each one explains a confusing symptom. A container that takes exactly ten seconds to stop every time is usually a signal problem. A build that mysteriously copies files you never mentioned is usually an `ONBUILD` trigger hiding in the base image.
 
 ### Under the hood
+
+Here is what each one does.
 
 #### `STOPSIGNAL`
 
@@ -502,7 +530,7 @@ These three instructions are specialty tools. `STOPSIGNAL` tells Docker which do
 STOPSIGNAL SIGTERM
 ```
 
-`docker stop` sends this signal (default is `SIGTERM`), waits for the grace period, then `SIGKILL`. Set it when your PID 1 expects something else (rare for Gunicorn; more common for custom runtimes). Prefer fixing the app to handle `SIGTERM` over inventing exotic stop signals.
+`docker stop` sends this signal, waits out the grace period, and then sends `SIGKILL`, which cannot be caught or ignored. The default is `SIGTERM`. Change it only when your main process expects something else, which is rare for Gunicorn and more common for custom runtimes. Fixing the app to handle `SIGTERM` is almost always better than picking an unusual stop signal.
 
 #### `SHELL`
 
@@ -511,7 +539,7 @@ SHELL ["/bin/bash", "-c"]
 RUN echo "shell form now uses bash"
 ```
 
-`SHELL` changes the default shell used by shell-form `RUN`, `CMD`, and `ENTRYPOINT`. Prefer **exec form** JSON arrays for `CMD`/`ENTRYPOINT` so you do not depend on a shell for PID 1. Use `SHELL` when a Windows container build needs `cmd` versus PowerShell, or when a complex shell-form `RUN` truly needs bash features.
+`SHELL` changes the default shell used by the shell form of `RUN`, `CMD`, and `ENTRYPOINT`. For `CMD` and `ENTRYPOINT`, prefer the **exec form**—a JSON array like `["gunicorn", "app:app"]`—so your main process starts directly with no shell wrapped around it. Reach for `SHELL` when a Windows container build needs PowerShell instead of `cmd`, or when a complicated `RUN` genuinely needs bash features.
 
 #### `ONBUILD`
 
@@ -520,7 +548,7 @@ ONBUILD COPY . /app
 ONBUILD RUN pip install -r /app/requirements.txt
 ```
 
-Instructions registered with `ONBUILD` execute later, when *another* Dockerfile uses `FROM` your image. They are powerful for base images (“everyone who inherits me will copy their app here”) and infamous for surprising consumers who did not read the parent Dockerfile.
+Instructions written with `ONBUILD` do nothing while your image builds. They run later, in someone else’s build, the moment another Dockerfile says `FROM` your image. They are useful for a shared base image—“everyone who builds on me copies their app to the same place”—and notorious for surprising people who never read the parent Dockerfile.
 
 ```bash
 $ docker inspect my-base:1 --format '{{json .Config.OnBuild}}'
@@ -528,13 +556,15 @@ $ docker inspect my-base:1 --format '{{json .Config.OnBuild}}'
 
 ### In production
 
-- Document any `ONBUILD` triggers loudly in the base image README; prefer explicit child Dockerfiles over hidden triggers when teams are large.
-- Keep `STOPSIGNAL` aligned with how your process manager expects shutdown.
-- Avoid relying on `SHELL` for runtime `CMD`—exec form handles signals better.
+**Ownership:** whoever publishes a shared base image owns documenting its `ONBUILD` triggers. Teams that build on it own checking before they adopt it.
 
-> ⚠️ **Warning:** An innocent `FROM company-python:3` can suddenly run unexpected `ONBUILD` copy/install steps. Always `docker inspect` unfamiliar bases.
+- Document every `ONBUILD` trigger prominently in the base image README. In a large organization, an explicit child Dockerfile beats a hidden trigger every time.
+- Set `STOPSIGNAL` to match the signal your process actually listens for when shutting down.
+- Do not depend on `SHELL` for the runtime `CMD`. Exec form delivers signals to your process correctly.
 
-**Do:** inspect `OnBuild` on shared bases. **Don’t:** surprise downstream teams with heavy hidden triggers.
+> ⚠️ **Warning:** An innocent-looking `FROM company-python:3` can quietly run copy and install steps you never wrote. Run `docker inspect` on any base image you do not already know.
+
+**Do:** inspect `OnBuild` on shared base images before adopting them. **Don’t:** surprise the teams downstream of you with heavy hidden triggers.
 
 **Before you leave this section**
 
@@ -547,15 +577,17 @@ $ docker inspect my-base:1 --format '{{json .Config.OnBuild}}'
 
 ### In plain terms
 
-Sometimes a build needs a token—to download a private package, for example. If you pass that token as a normal build-arg or `ENV`, it can end up in image history forever. **Build secrets** let BuildKit mount the credential for one `RUN` without baking it into a layer.
+A **build secret** is a credential BuildKit hands to one build step and then throws away, without ever writing it into the image.
 
-The misconception is “I’ll delete the env var in the next layer.” Layer history still has the secret. Mounts fix the model: the credential was never a committed filesystem diff.
+Why do you need a special mechanism? Because builds sometimes need a token—to download a package from a private repository, for example. If you pass that token as a build argument (`ARG`) or an environment variable (`ENV`), it is stored in the image and its history. Anyone who can pull the image can read it, possibly years later.
 
-> ⚠️ **Common Pitfall:** `ARG PIP_TOKEN=…` or `ENV PIP_TOKEN=…` for private indexes. Anyone with the image can often recover it from history or config.
+The tempting fix is “I will just unset it in the next step.” That does not work. Layers only stack, so the earlier layer still holds the value. A secret mount changes the situation instead of patching it: the credential appears at a temporary path for one `RUN`, and no layer ever records it.
+
+> ⚠️ **Common Pitfall:** Using `ARG PIP_TOKEN=…` or `ENV PIP_TOKEN=…` to reach a private package index. Anyone holding that image can usually recover the token from the image history or config.
 
 ### Under the hood
 
-Create a local secret file (never commit it):
+Here is what actually happens on the machine. Create a local secret file, and never commit it:
 
 ```bash
 $ echo 'my-private-token' > ./secret-token.txt
@@ -583,27 +615,27 @@ $ export PIP_TOKEN=my-private-token
 $ docker build --secret id=pip_token,env=PIP_TOKEN -t task-api:0.1.0 .
 ```
 
-SSH agent forwarding for private Git deps uses `--ssh` mounts (related pattern):
+Pulling private Git dependencies uses the same idea with `--ssh`, which lends the build your SSH keys without copying them in:
 
 ```bash
 $ docker build --ssh default -t task-api:0.1.0 .
 ```
 
-**What breaks if you forget `# syntax=docker/dockerfile:1`:** secret mounts may not parse as expected on older frontend behavior. Keep the syntax directive.
+**What breaks if you forget the `# syntax=docker/dockerfile:1` line:** secret mounts may not be understood, because older Dockerfile syntax does not include them. Keep that line at the top.
 
 ### In production
 
-**Ownership:** security/platform owns CI vaults and secret injection; app teams own Dockerfile mount IDs matching CI configuration.
+**Ownership:** the security or platform team owns the CI secret store and how secrets reach a build. App teams own making the mount IDs in the Dockerfile match what CI provides.
 
-- Never use `ARG PASSWORD=…` for credentials you care about—build-args can leak via `docker history` and intermediate cache.
-- Store CI secrets in the CI vault; pass them with `--secret`; scrub agent disks.
-- Prefer runtime secret injection (Compose secrets, Kubernetes Secrets) for values the *running* app needs—not only build-time tokens.
+- Never use `ARG PASSWORD=…` for a credential you care about. Build arguments show up in `docker history` and in cached layers.
+- Keep CI secrets in the CI secret store, pass them with `--secret`, and wipe agent disks between jobs.
+- For values the *running* app needs, inject them at run time with Compose secrets or Kubernetes Secrets. Build secrets are only for build time.
 
-**Failure mode:** token in image config discovered months later in a mirror. **Detect:** secret scanners on pushed digests; history audit. **Mitigate:** rebuild without the arg; rotate the token; block `ARG` patterns in policy.
+**Failure mode:** a token sitting in image config, found months later in a mirrored copy of the registry. **Detect:** secret scanners on every pushed digest, plus an audit of image history. **Mitigate:** rebuild without the argument, rotate the token immediately, and block that `ARG` pattern by policy.
 
-**Do:** `--secret` for build-time creds. **Don’t:** bake runtime DB passwords into images at all—inject at run.
+**Do:** use `--secret` for build-time credentials. **Don’t:** bake a runtime database password into an image at all. Inject it when the container starts.
 
-> 🏭 **Production floor:** A leaked build token’s blast radius is every private package feed it could read—and every image built with it. Rotate first, debate blame later. Record the affected digest range in the incident ticket.
+> 🏭 **Production floor:** A leaked build token reaches every private package feed it could read, and every image built with it. Rotate the token first and discuss how it happened afterward. Record the range of affected digests in the incident ticket.
 
 **Before you leave this section**
 
@@ -616,9 +648,13 @@ $ docker build --ssh default -t task-api:0.1.0 .
 
 ### In plain terms
 
-Chapter 03 explained multi-platform *images*. Here you *produce* them. One build command can target `linux/amd64` and `linux/arm64` so the same tag works on servers and Apple silicon laptops.
+A multi-platform build produces one image name that works on more than one CPU type. Chapter 03 explained what those images are. Here you make them.
+
+Why does this land in the build chapter? Because the fix has to happen at build time. If you build only for your laptop’s CPU, no amount of retrying on the server will help; the binary simply cannot run there. One `buildx` command can target `linux/amd64` and `linux/arm64` together, so the same tag works on your Apple silicon laptop and on the amd64 servers.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker buildx ls
@@ -628,7 +664,7 @@ $ docker buildx build \
     --push .
 ```
 
-Useful automatic build-args inside Dockerfiles:
+BuildKit fills in these build arguments for you, and you can read them inside the Dockerfile:
 
 | ARG | Meaning |
 |-----|---------|
@@ -645,15 +681,15 @@ ARG TARGETPLATFORM
 # install/build for $TARGETPLATFORM when your toolchain supports it
 ```
 
-On Engine 29.x with the containerd image store, loading multi-platform results locally is more capable than older graph-driver setups. If `--load` rejects multi-platform output, push to a registry or use a `docker-container` builder driver as documented in Docker’s multi-platform guide.
+On Engine 29.x with the containerd image store, you can keep multi-platform results locally, which older graph-driver setups could not do. If `--load` refuses your multi-platform output, push to a registry instead, or switch to a `docker-container` builder driver as described in Docker’s multi-platform guide.
 
 ### In production
 
-CI release jobs should build every architecture you run in production and push a single multi-arch manifest list. Test at least one container per arch in the pipeline.
+**Ownership:** CI owns the list of platforms every release builds for. App teams confirm that dependencies with compiled code work on each architecture.
 
-**Ownership:** CI owns the platform matrix; app teams confirm native deps work per arch.
+Release jobs in CI must build every architecture you run in production and push one manifest list covering all of them. Run at least one container per architecture in the pipeline before the release is allowed through.
 
-**Do:** `--platform` explicitly in release jobs. **Don’t:** assume Mac pulls prove server arch.
+**Do:** pass `--platform` explicitly in release jobs. **Don’t:** treat a successful pull on a Mac as evidence about the server.
 
 **Before you leave this section**
 
@@ -667,11 +703,15 @@ CI release jobs should build every architecture you run in production and push a
 
 ### In plain terms
 
-Building is half the job. Running proves the recipe works: publish a port, hit the API, then practice overriding `CMD` versus `ENTRYPOINT`.
+Running the image is the other half of the job. A build that succeeds proves the recipe was valid. Only a run proves the dish is edible.
 
-> ⚠️ **Common Pitfall:** Overriding with a string that accidentally replaces ENTRYPOINT when you only meant to change flags—know which flag you are using.
+Why do this now, before the container management chapter? Because three specific things go wrong on the first run, and you should meet them here: the port is not published, the app listens on the wrong address inside the container, or you override the start command incorrectly. In this section you publish a port, call the API, and practice changing `CMD` and `ENTRYPOINT` on purpose so an accidental override is easy to recognize later.
+
+> ⚠️ **Common Pitfall:** Replacing the whole program when you only meant to change a flag. `docker run image <args>` replaces `CMD`. `--entrypoint` replaces the program itself. Know which one you typed.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker run --rm -d --name task-api -p 8000:8000 task-api:0.1.0
@@ -706,15 +746,15 @@ Stop the detached container when finished:
 $ docker stop task-api
 ```
 
-**What breaks if the app binds to `127.0.0.1` inside the container:** host port publishing cannot reach it. Bind to `0.0.0.0` inside the container (as Gunicorn does here).
+**What breaks if the app listens on `127.0.0.1` inside the container:** that address means “only this machine,” and inside a container it means “only this container.” Published host ports cannot reach it. Listen on `0.0.0.0` inside the container, as Gunicorn does here.
 
 ### In production
 
-**Ownership:** developers verify the image locally; release owns the promoted digest that staging/prod pull.
+**Ownership:** developers verify the image runs before it leaves their machine. Release owns the digest that staging and production pull.
 
-Keep `ENTRYPOINT` stable (the binary) and override `CMD` for flags. That pattern survives Kubernetes `command` / `args` mapping with fewer surprises.
+Keep `ENTRYPOINT` fixed as the program, and change `CMD` when you need different flags. That split maps cleanly onto Kubernetes `command` and `args` later, with far fewer surprises.
 
-**Do:** smoke-test `/healthz` on the digest you will promote. **Don’t:** promote an untested local tag that never ran.
+**Do:** call `/healthz` on the exact digest you are about to promote. **Don’t:** promote a locally built tag that nobody ever ran.
 
 **Before you leave this section**
 
@@ -728,13 +768,21 @@ Keep `ENTRYPOINT` stable (the binary) and override `CMD` for flags. That pattern
 
 ### In plain terms
 
-**COPY** is the boring, safe way to add local files. **ADD** has extras (URLs, auto-extract) that surprise people. **ENTRYPOINT** is the fixed program; **CMD** is the default arguments (or the whole command if there is no entrypoint).
+These are two pairs of instructions that look interchangeable and are not.
 
-Boring is a feature. Surprises in packaging become surprises at 2 a.m.
+**COPY** copies files from your build context into the image. **ADD** does that too, and then adds surprises: it can download a URL, and it automatically unpacks local tar archives. **ENTRYPOINT** names the program the container runs. **CMD** supplies the default arguments to that program, or the whole command when there is no entrypoint.
 
-> ⚠️ **Common Pitfall:** Shell-form `CMD gunicorn ...` wrapping PID 1 in a shell so `docker stop` signals never reach Gunicorn cleanly.
+Why be picky about this? Because both surprises show up at the worst time. An `ADD` that downloads from the internet makes your build depend on a server you do not control, and the bytes can change while your Dockerfile does not. A `CMD` written in shell form starts your app underneath a shell, and that shell often swallows the stop signal, so `docker stop` waits the full grace period and then kills your app mid-request.
+
+Boring is a feature here. A surprise in how you package the app becomes a surprise at 2 a.m.
+
+> 💡 **In one line:** `ENTRYPOINT` is the program, `CMD` is its default arguments—and writing them as JSON arrays is what lets your app shut down cleanly.
+
+> ⚠️ **Common Pitfall:** Writing `CMD gunicorn ...` in shell form. That wraps your app in a shell as the container’s main process, and `docker stop` signals never reach Gunicorn properly.
 
 ### Under the hood
+
+Here is how to choose between them.
 
 | Goal | Pattern |
 |------|---------|
@@ -742,7 +790,7 @@ Boring is a feature. Surprises in packaging become surprises at 2 a.m.
 | Fixed binary + overridable args | `ENTRYPOINT ["app"]` + `CMD ["--flag"]` |
 | Shell form wrapping | Avoid when possible; exec form (`JSON` array) handles signals better |
 
-Exec form is preferred so PID 1 receives signals correctly (graceful stop). Pair with `STOPSIGNAL` and a long enough `docker stop -t` grace period when draining requests.
+Use exec form so your program becomes **PID 1**, the container’s first and main process, and receives stop signals directly. Pair it with `STOPSIGNAL` and a `docker stop -t` grace period long enough to finish in-flight requests.
 
 ```mermaid
 flowchart TD
@@ -756,13 +804,15 @@ flowchart TD
 
 *Figure 04.4: Prefer exec-form `ENTRYPOINT`/`CMD` so overrides stay predictable and signals reach the real process.*
 
-**What breaks if you `ADD http://…` in CI:** builds become network-dependent and harder to audit; the remote bytes can change under the same Dockerfile text.
+**What breaks if you use `ADD http://…` in CI:** the build now depends on a remote server staying up and serving the same bytes. Nothing in your Dockerfile records what it downloaded, so the build is neither reproducible nor auditable.
 
 ### In production
 
-Ban casual `ADD http://…` in Dockerfiles—network-dependent builds are harder to audit and reproduce. Vendor dependencies into the context or use a locked package manager instead.
+**Ownership:** app teams write the instructions. Reviewers block remote `ADD` and shell-form entrypoints before they reach the main branch.
 
-**Do:** COPY + exec-form ENTRYPOINT/CMD. **Don’t:** remote ADD for production dependencies.
+Ban casual `ADD http://…` in Dockerfiles. A build that reaches out to the internet is harder to audit and impossible to reproduce exactly. Commit the dependency into the context, or fetch it through a package manager with a lock file.
+
+**Do:** use `COPY`, and write `ENTRYPOINT` and `CMD` in exec form. **Don’t:** use remote `ADD` for anything production depends on.
 
 **Before you leave this section**
 
@@ -776,31 +826,37 @@ Ban casual `ADD http://…` in Dockerfiles—network-dependent builds are harder
 
 ### In plain terms
 
-After you can bake a cake, check it for contaminants. Scanning does not replace secure coding, but it catches known CVEs in base packages early.
+Image scanning means running a tool that compares every package inside your image against public lists of known security problems. Those published problems are called **CVEs**, short for Common Vulnerabilities and Exposures.
 
-> ⚠️ **Common Pitfall:** Treating a green scan as “secure forever.” New CVEs appear; rebuild when bases patch.
+Why bother, when you wrote careful code? Because most of an image is not your code. It is the base operating system and the libraries you installed. A scanner reads the package list and tells you which of those already have known holes, before an attacker does the same thing.
+
+Scanning does not replace writing secure code, and it does not prove an image is safe. It catches the known problems cheaply and early, which is exactly what you want from a gate that runs on every build.
+
+> ⚠️ **Common Pitfall:** Reading a clean scan as “secure forever.” New CVEs are published every week against packages you already shipped. Rebuild when your base image is patched.
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker scout quickview task-api:0.1.0
 ```
 
-If Scout is unavailable in your environment, use another scanner you have (Trivy, Grype, and similar):
+If Docker Scout is not available where you work, use whichever scanner you have, such as Trivy or Grype:
 
 ```bash
 $ trivy image task-api:0.1.0
 ```
 
-**What breaks if you only scan the builder stage:** runtime still ships vulnerable packages you never looked at. Scan the **final** digest you promote.
+**What breaks if you only scan the builder stage:** the image you actually ship still contains packages nobody looked at. Scan the **final** digest, the one you are about to promote.
 
 ### In production
 
-**Ownership:** security sets severity gates; app teams fix or waive with expiry; platform blocks promote on gate fail.
+**Ownership:** the security team sets which severity levels block a release. App teams fix findings, or record an exception with an owner and an expiry date. The platform team blocks promotion when the gate fails.
 
-Gate merges on scan policy (fail on criticals in the final stage). Rebuild regularly when base images patch. Scanning is necessary but not sufficient—still run as non-root, drop capabilities later (Chapter 10), and keep secrets out of layers.
+Block merges on scan policy: critical findings in the final stage stop the build. Rebuild on a schedule so you pick up patched base images. Scanning is necessary and not sufficient. You still run as a non-root user, remove privileges the container does not need (Chapter 10), and keep secrets out of layers.
 
-**Do:** scan the promoted digest. **Don’t:** waive criticals without an expiry and owner.
+**Do:** scan the exact digest you promote. **Don’t:** waive a critical finding without both an owner and an expiry date.
 
 **Before you leave this section**
 
@@ -905,12 +961,16 @@ Secret mounts expose the credential to a build step without storing it in image 
 
 ## 04.16 Key Takeaways
 
-- Dockerfiles are ordered recipes; layer caching rewards stable-first ordering.
-- Know the core instructions plus `STOPSIGNAL`, `SHELL`, and `ONBUILD`.
-- Multi-stage builds + `.dockerignore` + non-root users + BuildKit cache mounts are baseline hygiene.
-- Build secrets keep credentials out of layers; never treat `ARG` as a vault.
-- buildx multi-platform builds align laptop and server architectures.
-- Scan images and pin dependencies; never confuse `EXPOSE` with publishing ports.
+- A Dockerfile runs **top to bottom**. Put stable steps first so the cache can help you.
+- **Copy `requirements.txt` and install before you copy the source.** That one habit saves minutes per build.
+- The **build context is everything you hand the engine.** Write `.dockerignore` before you write `COPY . .`.
+- **Build in one stage, ship from another.** No compilers in the final image.
+- **Run as a non-root `USER`.** Root in a container is still root in that container.
+- **`ARG` is not a vault.** Use `--secret` for build-time tokens, and inject runtime secrets at run time.
+- **`EXPOSE` publishes nothing.** You still need `-p`, a Compose port, or a Service.
+- **`ENTRYPOINT` is the program, `CMD` is the arguments.** Write both as JSON arrays.
+- **Build for the CPU you deploy to**, not just the one on your desk.
+- Scan the digest you promote, and rebuild when the base image is patched.
 
 ---
 

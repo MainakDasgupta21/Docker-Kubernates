@@ -4,26 +4,32 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain metrics, logs, and traces in a Kubernetes context
-> - Install and use metrics-server for resource metrics and `kubectl top`
-> - Approach the Kubernetes Dashboard safely (or choose safer alternatives)
-> - Design a logging architecture with node agents, optional sidecars, and node log query
-> - Describe Prometheus and Grafana as the common metrics stack
-> - Outline OpenTelemetry for distributed traces
-> - Use PSI metrics (cgroup v2, GA in Kubernetes 1.36) as contention signals
-> - Avoid monitoring anti-patterns that create blind spots or security holes
+> - Explain what metrics, logs, and traces each tell you, and when to reach for which
+> - Install metrics-server and read resource usage with `kubectl top`
+> - Run the Kubernetes Dashboard safely, or decide not to run it at all
+> - Plan how logs get off the node, using agents, sidecars, and node log query
+> - Describe how Prometheus and Grafana fit together as a metrics stack
+> - Explain what OpenTelemetry does for tracing a request across services
+> - Read PSI metrics (cgroup v2, GA in Kubernetes 1.36) to spot resource contention
+> - Avoid the monitoring habits that leave blind spots or open security holes
 
 ---
 
 ## 22.1 Flying blind versus instrument panels
 
-You would not fly a passenger jet with taped-over gauges. CPU spikes, memory leaks, crashing containers, and slow API calls are the turbulence of production systems. **Observability** is the discipline of making a system’s internal state visible from the outside through **metrics**, **logs**, and **traces**.
+Nobody flies a passenger jet with tape over the gauges. Pilots cannot see the fuel level or the engine temperature from the cockpit window. They read instruments, and the instruments are what make the flight safe.
 
 ![Aircraft instrument panel for metrics logs and traces](assets/analogy-instrument-panel.png)
 
 *Figure 22.A: Metrics, logs, and traces are the gauges that keep the cluster flight safe.*
 
-Kubernetes gives you building blocks (Events, container logs, resource metrics APIs, kubelet Summary API). Production teams usually add a metrics stack (often **Prometheus** + **Grafana**), a log pipeline, and eventually **OpenTelemetry** traces. This chapter builds the mental model and the first practical tools—without pretending a single dashboard solves reliability.
+Running software is the same. CPU spikes, memory leaks, containers that crash and restart, calls that take four seconds instead of forty milliseconds — none of that is visible from outside. **Observability** is the practice of making what happens inside a system visible from the outside, using three kinds of signal: **metrics**, **logs**, and **traces**.
+
+Kubernetes hands you a few instruments for free. Events tell you what the cluster decided. Container logs capture what your app printed. The metrics APIs report CPU and memory usage. That is a start, not a panel.
+
+Most teams add three more things. A metrics system, usually **Prometheus** for collecting numbers and **Grafana** for drawing them. A log pipeline that copies logs off the nodes before those nodes disappear. And eventually **OpenTelemetry** traces, which follow one request across every service it touches.
+
+This chapter builds the mental model first and the tools second. Be warned about one thing up front: installing a dashboard is not the same as being able to answer questions during an outage.
 
 ---
 
@@ -31,13 +37,21 @@ Kubernetes gives you building blocks (Events, container logs, resource metrics A
 
 ### In plain terms
 
-**Metrics** tell you *how much* and *how often*. **Logs** tell you *what happened* in words. **Traces** tell you *where time went* across services. You need all three for different questions; none replaces the others.
+The three pillars are three kinds of data, each answering a different kind of question. **Metrics** are numbers measured over time: how many requests per second, how much memory, how many errors. **Logs** are lines of text your program wrote describing what it was doing. **Traces** follow one single request as it moves through several services and record how long each hop took.
 
-Pillars are complementary evidence, not competing religions. You might think metrics alone explain every outage—without logs and traces you guess at causality.
+Why keep all three? Because each one is nearly useless for the other's job. A metric tells you the error rate jumped at 14:02, but not what the error said. A log line tells you the exact error, but not whether it happened once or ten thousand times. A trace tells you the request spent three seconds waiting on the database, which neither of the others would ever reveal.
+
+Picture the cockpit again. Metrics are the gauges: altitude, fuel, speed. Logs are the pilot's written record of what happened and when. A trace is the flight path of one particular aircraft, from gate to gate, with the duration of every leg.
+
+> 💡 **In one line:** Metrics tell you something is wrong, logs tell you what the error was, and traces tell you which hop was slow — you need all three.
+
+The mistake to avoid is not choosing wrongly between them. It is collecting all of it, forever, with nobody responsible for any of it. Data nobody looks at is not observability. It is a bill.
 
 > ⚠️ **Common Pitfall:** Collecting everything forever without owners or retention. Observability without an on-call consumer is expensive noise.
 
 ### Under the hood
+
+Here is what each pillar answers and what you would install for it:
 
 | Pillar | Questions answered | Typical tools |
 |--------|--------------------|---------------|
@@ -59,9 +73,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** Platform owns the observability stack (agents, storage, retention); app teams own instrumentation and SLI dashboards for their services.
+**Ownership:** The platform team runs the observability stack — the agents, the storage, and how long data is kept. App teams instrument their own code and own the dashboards that show their **SLIs** (service level indicators, the measured numbers such as error rate and latency that say whether a service is healthy).
 
-**Failure mode:** Blind spots during incidents → longer MTTR. Detect with synthetic checks and missing-scrape alerts. Mitigate with a minimum signal contract (RED/USE + structured logs + trace IDs).
+**Failure mode:** A blind spot during an incident makes every outage last longer. Detect blind spots with checks that run continuously and with alerts that fire when an expected scrape stops arriving. Prevent them by agreeing on a minimum set of signals every service must emit: request rate, error rate, and duration, plus structured logs carrying a trace ID.
 
 > 🏭 **Production floor:** Page on symptoms users feel (error rate, latency SLO burn), not on every CPU blip. An alert without a runbook owner is noise.
 
@@ -84,13 +98,19 @@ flowchart TB
 
 ### In plain terms
 
-**metrics-server** scrapes kubelets for CPU and memory usage and exposes the **Metrics API** (`metrics.k8s.io`). It powers `kubectl top` and resource-based Horizontal Pod Autoscalers. It is a live gauge cluster, not a historical archive.
+**metrics-server** is a small component that asks every kubelet how much CPU and memory each Pod is using right now, and publishes those numbers through the **Metrics API**. It keeps only the most recent readings. Nothing is stored for later.
 
-metrics-server feeds `kubectl top` and the Metrics API used by HPA on CPU/memory. It is not long-term Prometheus history. You might think metrics-server replaces Prometheus—different jobs, different retention.
+Why does that matter? Because two things you use constantly depend on it and nothing else. `kubectl top`, which shows current usage, reads from this API. So does the **Horizontal Pod Autoscaler** when it scales on CPU or memory. If metrics-server is down, `kubectl top` returns an error and your autoscaler stops adjusting, silently.
+
+Think of metrics-server as the live gauge on the dashboard. It shows the needle right now. It is not the flight recorder. Historical graphs, week-over-week comparisons, and alert rules all need Prometheus or a cloud metrics service instead. The two are not competitors; they do different jobs with different storage.
+
+This distinction is worth remembering when an autoscaler misbehaves. If you go straight to Prometheus and your Grafana graphs look fine, you can lose an hour before noticing that the API the autoscaler actually reads has been unavailable the whole time.
 
 > ⚠️ **Common Pitfall:** Debugging HPA with Prometheus while metrics-server is down. HPA resource metrics need the Metrics API.
 
 ### Under the hood
+
+Here is how you install it and what it gives you:
 
 ```bash
 $ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
@@ -126,9 +146,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform owns metrics-server health; app teams own HPA targets that depend on it.
+**Ownership:** The platform team keeps metrics-server healthy. App teams own the autoscaler targets that depend on it.
 
-**Failure mode:** metrics-server down → `kubectl top` fails and resource HPAs freeze. Detect with Metrics API probes. Mitigate with DaemonSet/Deployment alerts and PDB on metrics-server.
+**Failure mode:** When metrics-server is down, `kubectl top` fails and every CPU or memory autoscaler stops adjusting. Detect it with a probe that calls the Metrics API directly. Reduce the risk with alerts on the metrics-server Deployment and a PodDisruptionBudget so maintenance cannot take it out entirely.
 
 | Do | Don't |
 |----|-------|
@@ -148,15 +168,17 @@ flowchart LR
 
 ### In plain terms
 
-A web UI that can list workloads and logs is convenient. The same UI with `cluster-admin` on the public internet is a root shell with a paint job.
+The **Kubernetes Dashboard** is an optional web interface for the cluster. It lists workloads, shows logs, and lets you edit objects from a browser.
 
-A powerful UI that can become a powerful blast radius if bound to cluster-admin and exposed broadly. Prefer read-only + SSO + network restriction.
+Why does a convenience tool need a warning? Because of what it runs as. The Dashboard talks to the API server using its own ServiceAccount, and whatever that account is allowed to do, anyone who reaches the page can do. Bind it to `cluster-admin` and put it on a public address, and you have published a full-privilege terminal with a friendly interface in front of it.
+
+The safe version is not complicated. Give it read-only rights. Put a real login in front of it, using your company sign-on. Keep it on a private network or behind a VPN. Plenty of production teams skip it entirely and use Grafana for viewing and Git for changing, which removes the question altogether.
 
 > ⚠️ **Common Pitfall:** Exposing Dashboard with a privileged ServiceAccount on a public LoadBalancer “for convenience.”
 
 ### Under the hood
 
-Safety guidelines:
+Here are the rules that keep it safe:
 
 1. Prefer **read-only** RBAC bindings for dashboard users
 2. Do not expose the Dashboard on a public LoadBalancer without strong auth
@@ -175,9 +197,9 @@ Starting to serve on 127.0.0.1:8001
 
 ### In production
 
-**Ownership:** Platform owns whether Dashboard exists and how it authenticates; never a shared admin token in a wiki.
+**Ownership:** The platform team decides whether the Dashboard exists at all and how people log in to it. Never keep a shared admin token in a wiki page.
 
-**Failure mode:** Stolen Dashboard session → cluster takeover. Detect with audit on Dashboard SA and ingress access logs. Mitigate with SSO, short-lived tokens, read-only RBAC, private exposure.
+**Failure mode:** A stolen Dashboard session becomes a cluster takeover. Detect it by auditing what the Dashboard's ServiceAccount does and by reading the ingress access logs. Prevent it with company sign-on, tokens that expire quickly, read-only permissions, and exposure on a private network only.
 
 | Do | Don't |
 |----|-------|
@@ -197,13 +219,21 @@ Starting to serve on 127.0.0.1:8001
 
 ### In plain terms
 
-Applications should write to **stdout/stderr**. The kubelet keeps runtime logs on the node; `kubectl logs` reads them. Cluster-wide search needs a shipper. When you need **node** or **systemd**-style logs without SSH, Kubernetes **node log query** (stable in **1.36**) exposes a kubelet API for selected system logs.
+Logging in Kubernetes follows one rule: your application prints to **stdout** and **stderr**, the two output streams every program already has, and the platform takes it from there. The kubelet writes those streams to files on the node, and `kubectl logs` reads them back.
 
-Node agents ship container stdout/stderr to a central store; apps should log structured JSON to stdout. You might think SSHing to nodes for logs is sustainable—nodes disappear; evidence must be centralized.
+Why not have your app write its own log files, or send them somewhere itself? Because the node holding those files can disappear at any moment. A node gets replaced during an upgrade and everything on its disk goes with it, including the evidence you needed. Printing to stdout lets one agent on each node copy every container's output to central storage automatically, with no cooperation from your code.
+
+That is why logging into a machine to read a log file does not scale. It works for one node in a lab. It fails the first time the node that had your error is already gone.
+
+Kubernetes also has an answer for the logs the platform itself produces. **Node log query**, stable in Kubernetes **1.36**, lets you read selected system logs — kubelet's own output, for example — through the API server instead of opening a shell on the machine.
+
+One caution about all of this. Everything your app prints ends up in a searchable store that many people can read. Print a token or a customer's personal data and you have copied a secret into a system that was never designed to hold one.
 
 > ⚠️ **Common Pitfall:** Logging secrets (tokens, PAN data) to stdout. Treat log pipelines as sensitive data stores.
 
 ### Under the hood
+
+Here are the commands and the collection patterns:
 
 ```bash
 $ kubectl logs deploy/task-api -n tasks --tail=100
@@ -266,9 +296,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** Platform owns agents, indexes, retention; app teams own log fields and redaction. Incident evidence: query by trace_id / pod / deployment revision.
+**Ownership:** The platform team runs the agents, the search indexes, and the retention rules. App teams decide which fields their logs contain and which values must be removed before printing. During an incident, search by trace ID, by Pod, or by Deployment revision.
 
-**Failure mode:** Agent down → silent blind spots. Detect with expected-bytes-per-namespace monitors. Mitigate with DaemonSet health alerts and disk-pressure-aware buffering.
+**Failure mode:** When a log agent dies, you lose visibility on that node and nothing tells you. Detect it by alerting when a namespace stops producing the volume of logs it normally produces. Reduce the risk with health alerts on the agent DaemonSet and with buffering that behaves sensibly when the node disk fills up.
 
 | Do | Don't |
 |----|-------|
@@ -301,15 +331,21 @@ FailedScheduling, OOMKilled, Unhealthy probes, and FailedMount often explain out
 
 ### In plain terms
 
-**Prometheus** scrapes HTTP metrics endpoints on a schedule, stores time series, and evaluates alert rules. **Grafana** turns those series into dashboards humans can use at 3 a.m. Together with **kube-state-metrics** and node exporters, they form the de facto open-source Kubernetes metrics stack.
+**Prometheus** is a metrics database that goes and fetches its own data. On a schedule, it calls an HTTP endpoint on each target, reads the current numbers, and stores them with a timestamp. That repeated fetch is called a **scrape**. **Grafana** is the tool that draws those stored numbers as graphs.
 
-Events and probe failures are first-line Kubernetes signals—FailedScheduling, Unhealthy, OOMKilled. You might think Events are durable history—they are time-limited; scrape or archive what matters.
+Why is scraping the design? Because it means your application does not need to know where the monitoring system lives, or handle retries, or buffer during an outage. Your app just exposes a page of current numbers at `/metrics` and forgets about it. Prometheus does the rest, and if Prometheus is down, your app is unaffected.
+
+Two helpers complete the picture. **kube-state-metrics** turns the state of Kubernetes objects into numbers, so you can graph how many Deployment replicas are unavailable. A node exporter does the same for the machines themselves.
+
+Prometheus is not your only early-warning system, though. Kubernetes **Events** — short records the cluster attaches to objects — often name the problem before any graph moves. `FailedScheduling`, `OOMKilled`, and `Unhealthy` are all Events. So are the results of your probes, the periodic health checks the kubelet runs against each container.
+
+Two warnings about those signals. Events are not permanent; the cluster discards them after a few hours, so export the ones that matter. And probe failures deserve attention before users complain, because a **liveness probe** that is too aggressive will restart perfectly healthy Pods over and over.
 
 > ⚠️ **Common Pitfall:** Ignoring probe failures until users page you. Liveness flapping can kill healthy Pods.
 
 ### Under the hood
 
-Typical components (often installed via Helm—[Chapter 23](23-helm.md)):
+Here is what a full metrics stack contains. Typical components (often installed via Helm—[Chapter 23](23-helm.md)):
 
 - Prometheus (or Grafana Mimir / managed Prometheus)
 - kube-state-metrics — object state as metrics
@@ -347,9 +383,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** App teams own probe design; platform owns Event retention exporters. Detect with probe failure metrics and Event alerts on CrashLoop.
+**Ownership:** App teams design their own probes, because only they know what "healthy" means for their service. The platform team runs the exporters that keep Events beyond their normal lifetime. Detect trouble with metrics on probe failures and alerts on CrashLoopBackOff Events.
 
-**Failure mode:** Bad liveness → restart storms. Mitigate with conservative liveness, dedicated readiness, and load-test probes in staging.
+**Failure mode:** A liveness probe that is too strict causes restart storms — healthy Pods killed and restarted in a loop. Prevent it by keeping liveness checks generous and shallow, by using a separate readiness probe to control traffic, and by running probes under load in staging before production sees them.
 
 | Do | Don't |
 |----|-------|
@@ -369,15 +405,21 @@ flowchart LR
 
 ### In plain terms
 
-When a single user request fans out across the Task API, a database, and a cache, logs from each piece do not show *which* hop was slow. A **distributed trace** is a tree of **spans** tied by a trace ID—like a baggage tag that follows the request through every airport. **OpenTelemetry (OTel)** is the vendor-neutral standard for producing those spans (and metrics/logs) from applications and infrastructure.
+A **distributed trace** is the recorded journey of one request through your system. Each piece of work along the way — the API handler, the database query, the cache lookup — is recorded as a **span**, a timed segment with a start, an end, and a label. All the spans from one request share the same trace ID, so they can be assembled into a tree afterward.
 
-Traces show the path of one request across services. OpenTelemetry standardizes instrumentation. You might think tracing replaces metrics—use traces for latency pathology; metrics for SLOs.
+Why is this its own tool? Because when a request takes four seconds, the logs cannot tell you where those seconds went. Each service logs that it handled the request. None of them logs that it spent 3.8 seconds waiting for the one downstream. Only a trace puts the timings side by side and points at the culprit.
+
+Think of a baggage tag. Your suitcase passes through four airports, and each one scans the tag on arrival and departure. At the end, you can see exactly where it sat for six hours.
+
+**OpenTelemetry**, usually shortened to **OTel**, is the open standard for producing this data. It matters because it is not tied to any vendor. You instrument your code once, and you can send the results to Jaeger, to Grafana Tempo, or to a commercial service, changing only a configuration line.
+
+One practical warning before you start. Recording every single request is affordable in a demo and ruinous in production. Decide early which fraction to keep, using **sampling** — a rule that stores some traces and discards the rest.
 
 > ⚠️ **Common Pitfall:** 100% sampling in production without a plan—cost and noise explode. Start with head/tail sampling strategies.
 
 ### Under the hood
 
-Core ideas:
+Here are the pieces and how a span reaches a backend:
 
 - **Trace** — one end-to-end request
 - **Span** — a unit of work (HTTP handler, DB query) with timestamps and attributes
@@ -431,9 +473,9 @@ Correlate with logs by injecting the trace ID into structured log lines.
 
 ### In production
 
-**Ownership:** Platform owns collectors and backends; app teams instrument code and propagate context.
+**Ownership:** The platform team runs the collectors and the tracing backend. App teams instrument their code and make sure the trace ID is passed along on every outbound call.
 
-**Failure mode:** Broken context propagation → useless orphan spans. Detect with trace completeness checks. Mitigate with shared libraries and gateway instrumentation.
+**Failure mode:** When one service fails to pass the trace ID along, the spans after it lose their parent and become orphans that explain nothing. Detect it by checking whether traces arrive complete. Prevent it with a shared library that every service uses and with instrumentation at the gateway so at least the entry point is always covered.
 
 | Do | Don't |
 |----|-------|
@@ -453,15 +495,19 @@ Correlate with logs by injecting the trace ID into structured log lines.
 
 ### In plain terms
 
-CPU percentage says “how busy.” **Pressure Stall Information (PSI)** says “how long tasks waited because the resource was contested.” A container can show moderate CPU usage and still be starving. PSI (GA in Kubernetes **1.36**) exposes that wait time for CPU, memory, and I/O—when nodes run **cgroup v2** and a supporting Linux kernel.
+**PSI** stands for **Pressure Stall Information**. It is a Linux measurement of how much time your processes spent *waiting* for a resource instead of doing work. It covers CPU, memory, and disk. It became generally available in Kubernetes **1.36**, and it requires nodes running **cgroup v2**, the newer Linux system for grouping and limiting a container's resources.
 
-Pressure Stall Information shows when workloads stall on CPU/memory/IO under cgroup v2—earlier than classical utilization alone. GA signals in Kubernetes **1.36** make PSI more operationally relevant. You might think 50% CPU means healthy—PSI can show saturation while utilization looks fine.
+Why is waiting time worth measuring separately? Because usage percentage hides it. A container sitting at 50% CPU sounds comfortable. But if it spends half of every second queued behind other containers waiting for a turn on the processor, your users feel that delay and your CPU graph never moves. Usage tells you how much of the resource you got. PSI tells you how much you asked for and did not get.
+
+Think of a busy road. Traffic volume is utilization: how many cars passed. Time stuck at the light is pressure. A road can carry a modest number of cars and still make everyone late.
+
+This is why an alert built only on CPU percentage can stay quiet through a latency incident that customers are already complaining about. Graph pressure next to usage, not instead of it.
 
 > ⚠️ **Common Pitfall:** Alerting only on utilization and missing stall-time saturation that users already feel.
 
 ### Under the hood
 
-Requirements:
+Here is what has to be true before PSI numbers appear:
 
 - Linux kernel 4.20+ with PSI enabled (not booted with `psi=0`)
 - **cgroup v2**
@@ -481,9 +527,9 @@ Interpret `some` versus `full` pressure averages (10s / 60s / 5m): sustained hig
 
 ### In production
 
-**Ownership:** Platform enables PSI metrics where kubelet/cgroup v2 support it; app teams add saturation panels beside utilization.
+**Ownership:** The platform team turns PSI on wherever the kubelet and cgroup v2 support it. App teams add a pressure panel next to every usage panel on their dashboards.
 
-**Failure mode:** Hidden saturation → latency SLO burn without CPU alerts. Detect with PSI metrics and latency SLIs together. Mitigate by rightsizing and reducing noisy neighbors.
+**Failure mode:** Hidden waiting time burns your latency target while every CPU alert stays green. Detect it by reading PSI and latency together rather than either alone. Fix it by giving the workload the resources it actually needs and by moving the noisy neighbors that are competing with it.
 
 | Do | Don't |
 |----|-------|
@@ -590,11 +636,16 @@ PSI measures **time tasks spend stalled** waiting for CPU, memory, or I/O under 
 
 ## 22.14 Key takeaways
 
-- Observability needs metrics, logs, and traces—wired into alerts you will actually act on.
-- metrics-server enables `kubectl top` and CPU/memory autoscaling; it is not a full monitoring platform.
-- Log to stdout; collect with node agents; use node log query for kubelet/system logs without SSH when enabled.
-- Prometheus + Grafana remain the common open-source metrics stack; OpenTelemetry is the path for traces.
-- PSI (cgroup v2, GA in 1.36) surfaces contention that utilization charts can hide.
+- Metrics say something broke. Logs say what it said. Traces say which hop was slow.
+- Collect only what someone will act on. Unowned data is a bill, not a signal.
+- metrics-server powers `kubectl top` and CPU autoscaling. It stores no history.
+- Print to stdout. An agent on each node ships it before the node disappears.
+- Never treat logging into a node as your log strategy. That node will be gone.
+- Events name the problem before any graph moves, and they expire in hours.
+- A liveness probe that is too strict restarts healthy Pods in a loop.
+- Sample your traces. Keeping every request is affordable only in a demo.
+- Usage says how much you got. PSI says how long you waited. Graph both.
+- Alert on what users feel: errors and latency. Not on every CPU spike.
 
 ---
 

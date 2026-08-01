@@ -4,12 +4,12 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Separate configuration from images with ConfigMaps (env and file mounts)
-> - Store and consume Secrets safely, including built-in Secret types
-> - Combine multiple sources with **projected volumes**
-> - Explain encryption at rest for Secrets in etcd
-> - Choose external secret managers (ESO / Secrets Store CSI) for production
-> - Avoid baking credentials into container image layers
+> - Keep settings out of your image by using ConfigMaps, as environment variables or as files
+> - Store and read Secrets safely, and use the built-in Secret types for the right jobs
+> - Bring several sources into one directory with **projected volumes**
+> - Explain what encrypting Secrets inside etcd does protect, and what it does not
+> - Decide when to keep credentials in an outside system such as Vault or a cloud secret manager
+> - Keep passwords and tokens out of your image layers for good
 
 ---
 
@@ -17,22 +17,24 @@
 
 ### In plain terms
 
-Your container image should be the **appliance**, not the **settings dial**. The same Task API image should run in development, staging, and production. What changes is configuration: log level, database URL, feature flags, and credentials. If those values are baked into the image, you rebuild for every environment—and anyone who pulls the image can mine credentials from the layers.
+**Externalizing configuration** means keeping settings outside the image and handing them to the container when it starts. Settings are things like the log level, the database address, feature flags, and passwords.
 
-The problem externalization solves is promotion safety: ship one digest through environments and only swap dials. That is how you prove "what we tested is what we run" instead of rebuilding with different `ENV` lines and hoping the binaries match.
+Here is why it matters. If those values live inside the image, you must build a different image for development, staging, and production. Then you can never honestly say "we tested exactly what we shipped," because you shipped a different build. Worse, anyone who can pull that image can read the credentials out of its layers.
+
+Think of the image as an appliance and the configuration as the dial on the front. You buy one kettle, not three kettles pre-set to three temperatures. In Kubernetes, one image moves through every environment, and only the dials change.
 
 > ⚠️ **Common Pitfall:** Baking `DATABASE_URL` into the image "just for the demo" and forgetting it before the image is published to a shared registry.
 
 ### Under the hood
 
-Kubernetes provides two first-class objects:
+Kubernetes gives you two objects for this:
 
 | Object | Intended for | Default visibility |
 |--------|--------------|--------------------|
 | **ConfigMap** | Non-sensitive config | Readable by anyone with get/list in the namespace |
 | **Secret** | Sensitive material | Still base64 in the API by default; extra RBAC and optional etcd encryption |
 
-Both are injected into Pods as environment variables, files, or (for Secrets) sometimes via CSI drivers from external stores.
+Both reach a Pod the same two ways: as environment variables, or as files in a mounted directory. Secrets can also arrive through a CSI driver that reads from an outside store.
 
 Lab baseline for this chapter (and the rest of Part II):
 
@@ -46,9 +48,9 @@ $ kind create cluster --name config --image kindest/node:v1.36.0
 
 **Ownership:** app teams own ConfigMap/Secret *keys* and consumption; platform owns encryption-at-rest, external secret managers, and policies that ban Secrets in git.
 
-- Treat image digests as immutable; promote the **same digest** across environments with different ConfigMaps/Secrets.
-- Never commit production Secrets to git in plain form. Use sealed secrets, ESO, or your cloud secret manager.
-- Size matters: ConfigMaps and Secrets are stored in etcd and are limited (practically about **1 MiB**). Large files belong in object storage or volumes, not ConfigMaps.
+- A digest names one exact build. Move the **same digest** through every environment and change only the ConfigMaps and Secrets.
+- Never commit a production Secret to git in plain form. Use Sealed Secrets, the External Secrets Operator, or your cloud's secret manager.
+- Watch the size. ConfigMaps and Secrets live in etcd and top out around **1 MiB** in practice. Large files belong in object storage or a volume, not in a ConfigMap.
 
 ```mermaid
 flowchart TB
@@ -76,9 +78,11 @@ flowchart TB
 
 ### In plain terms
 
-A ConfigMap is a labeled envelope of settings—key/value pairs and small text files—that Pods can read without rebuilding the image. The problem it solves is non-sensitive drift between environments: log levels, feature flags, and property files that should change without a new build.
+A **ConfigMap** is a Kubernetes object that holds plain settings: key-value pairs and small text files. Pods read those values at start time, so you can change a setting without building a new image.
 
-You might think updating a ConfigMap instantly reconfigures every Pod. Environment variables are fixed at container start; file mounts may update later, but the process must reload. Without a rollout, you can believe prod "has the new config" while old processes still run.
+Use it for everything that is not a secret. Log levels, feature flags, timeouts, cache sizes, a small properties file. These are the values that genuinely differ between development and production, and none of them are worth a rebuild.
+
+You might think changing a ConfigMap instantly reconfigures every running Pod. It does not, and this trips up nearly everyone. Environment variables are read once, when the container starts, and never change after that. Mounted files *do* get updated eventually, but your process still has to notice and reload them. Without a rollout, you can be convinced production has the new config while every Pod is still running the old value.
 
 > ⚠️ **Common Pitfall:** Expecting ConfigMap env changes to hot-reload. Restart or redesign for file watches.
 
@@ -105,7 +109,7 @@ $ kubectl apply -f task-api-config.yaml
 $ kubectl get configmap task-api-config -o yaml
 ```
 
-**Environment injection** (cherry-pick):
+Note that `data` holds both simple values and a whole file (`app.properties`). There are three ways to get those into a container. First, **pick one key** and name it as an environment variable:
 
 ```yaml
 apiVersion: apps/v1
@@ -133,7 +137,7 @@ spec:
                   key: LOG_LEVEL
 ```
 
-**Bulk env** with `envFrom`:
+Second, take **every key at once** with `envFrom`:
 
 ```yaml
           envFrom:
@@ -141,7 +145,7 @@ spec:
                 name: task-api-config
 ```
 
-**File mount**:
+Third, mount keys as **files** in a directory:
 
 ```yaml
           volumeMounts:
@@ -175,9 +179,9 @@ flowchart LR
 
 **Ownership:** app teams own ConfigMap content; platform may enforce `immutable: true` for audited baselines.
 
-- Updating a ConfigMap does **not** always restart Pods. Env vars are fixed at container start; mounted files can update eventually (kubelet sync), but apps must reload.
-- For rollouts after config changes, bump a Deployment annotation or use `kubectl rollout restart`.
-- Use `immutable: true` on ConfigMaps that should never change in place—forces a new object for changes and reduces accidental mutation.
+- Changing a ConfigMap does **not** restart your Pods. Environment variables are fixed when the container starts. Mounted files do get refreshed by the kubelet, but the app has to reload them.
+- To make a config change take effect, restart the Pods: change an annotation on the Deployment, or run `kubectl rollout restart`.
+- Set `immutable: true` on any ConfigMap that must never be edited in place. Changes then require a new object, which removes a whole class of accidents.
 
 **Do:** trigger a rollout after env-based config changes. **Don't:** store passwords in ConfigMaps "temporarily."
 
@@ -193,11 +197,15 @@ flowchart LR
 
 ### In plain terms
 
-Secrets are ConfigMaps with a warning label: they hold passwords, tokens, and keys. Kubernetes gives them distinct types and slightly stronger defaults, but **base64 is not encryption**. Anyone with `get secrets` can decode them unless you add controls.
+A **Secret** is a Kubernetes object for sensitive values: passwords, API tokens, certificates, and keys. It works almost exactly like a ConfigMap, and it reaches your container the same two ways.
 
-The problem Secrets solve is separating sensitive material from images and from world-readable ConfigMaps—so RBAC, etcd encryption, and external managers have a dedicated object kind to protect. They do *not* by themselves make credentials safe for git or for every ServiceAccount in the namespace.
+So why have a separate kind at all? Because a separate kind can be protected separately. You can grant read access to ConfigMaps and withhold it for Secrets. You can tell the API server to encrypt only Secrets inside etcd. You can point an outside secret manager at them. None of that is possible if passwords are mixed into ConfigMaps.
 
-You might think "it's base64, so it's obfuscated enough for GitHub." Base64 reverses in one shell pipeline. Treat a Secret YAML in git as a plaintext leak unless it is sealed/encrypted for that purpose.
+Now the single most important sentence in this chapter. **Base64 is encoding, not encryption.** Encoding just rewrites bytes into a safe alphabet, and anyone can reverse it. Encryption needs a key that an attacker does not have. Kubernetes stores Secret values in base64 for transport reasons only, and that is exactly what the `base64 -d` command below undoes in a fraction of a second.
+
+You might think base64 makes a Secret safe enough to commit to a private repository. It does not. Treat a Secret YAML file in git as a password published in plain text, because that is what it is. Anyone who can clone the repo — today, or from history, or a contractor next year — has your credential.
+
+> 💡 **In one line:** A Secret is not encrypted by default. Base64 is a costume, not a lock; RBAC and encryption at rest are the actual protection.
 
 > ⚠️ **Common Pitfall:** Putting Secrets in git “because they are base64.” Base64 reverses with `echo … | base64 -d`. Use sealed/external systems for source control.
 
@@ -214,7 +222,7 @@ stringData:
   API_TOKEN: "replace-me"
 ```
 
-`stringData` is convenience; the API stores `data` as base64.
+You wrote `stringData`, which lets you type plain text. The API server converts it and stores it under `data` as base64. Here is how little that protects you:
 
 ```bash
 $ kubectl get secret task-api-secret -o jsonpath='{.data.API_TOKEN}' | base64 -d
@@ -224,7 +232,9 @@ $ kubectl get secret task-api-secret -o jsonpath='{.data.API_TOKEN}' | base64 -d
 replace-me
 ```
 
-**Consume as env:**
+One command, and the password is on screen. That is the whole story of base64.
+
+**Read it as an environment variable:**
 
 ```yaml
           env:
@@ -235,7 +245,7 @@ replace-me
                   key: DATABASE_URL
 ```
 
-**Consume as files** (often safer—less likely to leak via process listings):
+**Read it as a file**, which is usually safer. Environment variables show up in crash dumps, in process listings, and in logs that print the whole environment. A file in a directory does none of that:
 
 ```yaml
           volumeMounts:
@@ -249,6 +259,8 @@ replace-me
 ```
 
 #### Built-in Secret types
+
+Kubernetes knows a few kinds of Secret by name, and tools look for those names. Use the right type instead of `Opaque` when one fits:
 
 | Type | Purpose |
 |------|---------|
@@ -282,10 +294,10 @@ flowchart LR
 
 **Ownership:** security/platform own encryption-at-rest, ESO/CSI patterns, and RBAC for `get secrets`; app teams own rotation procedures and which keys the app reads; nobody owns "Secrets committed to the app repo."
 
-- RBAC: separate who can `create/update` Secrets from who can only mount them via Pods.
-- Prefer file mounts + short-lived tokens over long-lived env vars.
-- Enable **encryption at rest** for the Secret resource in the API server (see §17.5).
-- Rotate credentials on a schedule; design apps to reload or restart cleanly.
+- Split the RBAC. The people who may `create` and `update` Secrets are not the same set as the people whose Pods merely mount them.
+- Prefer files and short-lived tokens over long-lived environment variables.
+- Turn on **encryption at rest** for Secrets in the API server (see §17.5).
+- Rotate credentials on a schedule, and make sure your app can reload or restart cleanly when they change.
 
 > 🏭 **Production floor:** Secrets do not belong in git. Not in `stringData`, not "temporarily," not in private repos that every contractor can clone. Use Sealed Secrets, SOPS, External Secrets Operator, or your cloud secret manager; CI injects or syncs at deploy time. If a Secret hits git history, rotate it—removing the file is not enough.
 
@@ -303,9 +315,11 @@ flowchart LR
 
 ### In plain terms
 
-Sometimes a Pod needs **several** config sources in **one directory**: a ConfigMap file, a Secret file, a service account token, and Pod metadata. A **projected volume** merges those sources into a single mount path—like a binder with tabs from different drawers. The problem it solves is sprawl of mounts and the old pattern of long-lived auto-mounted SA tokens as Secrets.
+A **projected volume** puts several different sources into one directory: a file from a ConfigMap, a file from a Secret, a service account token, and some Pod metadata, all under one mount path.
 
-You might think multiple volumeMounts are always equivalent. Projection also enables **time-bound service account tokens** with audience and expiry—modern clusters prefer that over the legacy Secret-based token.
+There are two reasons to use one. The plain reason is tidiness: your app reads one directory instead of four mounts scattered across the filesystem. Think of a binder with tabs, where each tab came from a different drawer.
+
+The important reason is the token. A **service account token** is the credential a Pod uses to talk to the Kubernetes API. The old way handed out a token in a Secret that never expired. A projected volume issues one that expires — you set `expirationSeconds` — and is valid only for a stated audience. The kubelet refreshes the file before it runs out. A stolen token that dies in an hour is far less useful to an attacker than one that lives forever.
 
 > ⚠️ **Common Pitfall:** Mounting the default service account token into every Pod with broad permissions. Use dedicated ServiceAccounts and projected tokens.
 
@@ -349,7 +363,7 @@ spec:
                     fieldPath: metadata.labels
 ```
 
-Projected volumes are the modern way to get **time-bound service account tokens** into Pods (replacing long-lived auto-mounted Secrets in many clusters).
+Read the four `sources` entries as four drawers feeding one binder. Each one sets its own `path`, and those paths are relative to the single `mountPath`. This is the modern way to hand a Pod a **short-lived service account token**, and it replaces the long-lived, automatically mounted Secret in most clusters.
 
 ```mermaid
 flowchart TB
@@ -368,9 +382,9 @@ flowchart TB
 
 **Ownership:** platform sets defaults for automount and projected token audiences; app teams declare what they mount.
 
-- Prefer projected SA tokens with short `expirationSeconds` and audience binding when your platform supports it.
-- Keep mount paths read-only.
-- Document the directory layout so sidecars and main containers agree on paths.
+- Use projected service account tokens with a short `expirationSeconds` and a bound audience wherever your platform supports it.
+- Mount every one of these paths read-only.
+- Write down the directory layout, so sidecars and the main container agree on where each file lives.
 
 Official concept page: [Projected Volumes](https://kubernetes.io/docs/concepts/storage/projected-volumes/).
 
@@ -386,17 +400,19 @@ Official concept page: [Projected Volumes](https://kubernetes.io/docs/concepts/s
 
 ### In plain terms
 
-Even if RBAC is perfect, etcd backups and disk snapshots can leak Secrets. Encryption at rest tells the API server to store Secret payloads encrypted with a key you control (often a KMS plugin). The problem it solves is offline theft of etcd data—not a caller who already has `get secrets`.
+**Encryption at rest** means the API server encrypts Secret values before writing them into etcd, using a key you control.
 
-You might think encryption at rest means developers can no longer `kubectl get secret` and decode. It does not. RBAC still gates live API access; encryption protects the datastore and its backups.
+Here is the threat it addresses. Your RBAC rules can be perfect and still not help, because there is another copy of every Secret: the etcd database file and every backup of it. Anyone who gets a disk snapshot or a backup tarball can read Secrets straight out of it, without ever touching your cluster or your permissions. Encryption at rest makes that copy useless without the key.
+
+Be precise about what it does *not* do. It does not stop a developer who already has permission to read Secrets. That person calls the API, and the API server decrypts for them as designed. Encryption protects the data sitting on disk. RBAC protects the live API. You need both.
 
 > ⚠️ **Common Pitfall:** Enabling encryption providers but never rewriting existing Secrets—old plaintext objects remain until you `kubectl get … | kubectl replace`.
 
 ### Under the hood
 
-Cluster admins configure an `EncryptionConfiguration` and point `kube-apiserver` at it. Providers include `aescbc`, `aesgcm`, and `kms` (recommended for production so keys live outside etcd hosts).
+Here is how a cluster admin turns it on. You write an `EncryptionConfiguration` file and point `kube-apiserver` at it. The providers are `aescbc`, `aesgcm`, and `kms`. Use `kms` in production, because it keeps the key in an outside key service rather than on the same machines as etcd.
 
-After enabling, rewrite existing Secrets so they are re-encrypted:
+Turning it on only affects future writes. To protect what is already stored, rewrite every existing Secret:
 
 ```bash
 $ kubectl get secrets --all-namespaces -o json \
@@ -409,9 +425,9 @@ $ kubectl get secrets --all-namespaces -o json \
 
 **Ownership:** cluster/platform admins own EncryptionConfiguration and KMS keys; security owns key rotation drills.
 
-- Prefer KMS providers from your cloud or HSM-backed key services.
-- Practice key rotation drills; document who can decrypt backups.
-- Encryption at rest does **not** protect against a caller with `get secrets`—RBAC and admission still matter.
+- Use a KMS provider from your cloud, or a key service backed by hardware.
+- Rehearse key rotation before you need it, and write down exactly who is able to decrypt a backup.
+- Remember the limit: encryption at rest does **not** stop a caller who already has `get secrets`. RBAC and admission policy still carry that weight.
 
 **Do:** KMS + tested restore of encrypted etcd snapshots. **Don't:** store the local encryption key next to the etcd backup in the same bucket without controls.
 
@@ -427,20 +443,22 @@ $ kubectl get secrets --all-namespaces -o json \
 
 ### In plain terms
 
-Enterprises often already store credentials in Vault, AWS Secrets Manager, GCP Secret Manager, or Azure Key Vault. Kubernetes should **reference** those stores rather than become the system of record. The problem this solves is rotation, audit, and "Secrets never in git" at organizational scale.
+**External secret management** means the real credential lives in a system outside Kubernetes — Vault, AWS Secrets Manager, GCP Secret Manager, or Azure Key Vault — and Kubernetes only fetches a copy.
 
-You might think syncing into a Kubernetes Secret undoes the benefit. Sync is a delivery mechanism; the *source of truth* and audit trail stay external—if you also lock down who can read the synced Secret.
+Most companies need this because they already have one of those systems, with rotation schedules, approval workflows, and an audit log that says who read what and when. Kubernetes Secrets have none of that. Making the cluster the **system of record**, meaning the one authoritative place a value lives, would mean giving all of it up.
+
+You might think copying the value into a Kubernetes Secret throws away the benefit. It does not, as long as you are clear about roles. The copy is delivery. The outside store is still where the value is created, rotated, and audited. What you must add is tight RBAC on the copy, or you have simply moved the problem.
 
 > ⚠️ **Common Pitfall:** Committing `stringData` Secrets to public repos—or private repos with broad clone access—while also running ESO. Pick one system of record and enforce it.
 
 ### Under the hood
 
-Two common patterns:
+There are two common ways to wire this up:
 
 1. **External Secrets Operator (ESO)** — controllers sync external secrets into Kubernetes `Secret` objects.
 2. **Secrets Store CSI Driver** — mounts secrets directly into Pods as volumes (optionally syncing to a Secret).
 
-Both keep rotation and audit trails in the external system while apps keep using familiar files or env vars.
+Either way, rotation and the audit trail stay in the outside system, and your app keeps reading ordinary files or environment variables. Nothing in the application code has to know where the value came from.
 
 ```mermaid
 flowchart LR
@@ -459,9 +477,9 @@ flowchart LR
 
 **Ownership:** security owns the external store and rotation policy; platform owns ESO/CSI install; app teams own ExternalSecret manifests that map keys into their namespace.
 
-- Decide whether apps read CSI mounts or synced Secrets.
-- Restrict who can create `ExternalSecret` / `SecretProviderClass` objects.
-- Monitor sync failures—stale credentials are a common outage class.
+- Pick one pattern per platform: apps read CSI mounts, or apps read synced Secrets. Do not leave it to each team.
+- Restrict who can create `ExternalSecret` and `SecretProviderClass` objects, because those objects decide which credentials land in a namespace.
+- Alert on sync failures. A credential that quietly failed to update is one of the most common causes of a 3 a.m. page.
 
 **Do:** alert on sync lag after rotation. **Don't:** duplicate the same password in Vault *and* a hand-applied Secret that drifts.
 
@@ -614,11 +632,15 @@ It protects Secret payloads on disk and in etcd backups from offline readers who
 
 ## 17.11 Key takeaways
 
-- Keep config and secrets **out of images**; inject them at runtime.
-- ConfigMaps for non-sensitive data; Secrets for sensitive data—with clear eyes about base64.
-- Prefer file mounts and projected volumes for tokens and multi-source config.
-- Encrypt Secrets at rest and consider external secret managers for enterprise systems of record.
-- Design for rotation: rollouts, short-lived tokens, and audited access.
+- Keep settings and credentials **out of the image**. Hand them to the container at start time.
+- One image digest moves through every environment. Only the ConfigMaps and Secrets change.
+- **ConfigMap** for ordinary settings. **Secret** for anything sensitive.
+- **Base64 is not encryption.** A Secret in git is a password in plain text.
+- Environment variables are frozen at container start. Restart the Pods for a config change to take effect.
+- Mount credentials as files rather than environment variables. Files do not leak into logs and process listings.
+- A **projected volume** merges sources into one directory and gives you short-lived service account tokens.
+- **Encryption at rest** protects etcd and its backups. It does not stop anyone who can already read Secrets.
+- Keep the real credential in an outside secret manager, and alert when the copy fails to sync.
 
 ---
 

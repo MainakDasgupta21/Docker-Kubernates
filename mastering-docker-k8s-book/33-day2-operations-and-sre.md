@@ -4,21 +4,27 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Define SLIs, SLOs, and error budgets, and use them to make operational decisions
-> - Schedule GPUs and other specialized hardware with Dynamic Resource Allocation, including admin access (GA in 1.36)
-> - Do capacity planning that balances cost, headroom, and autoscaling
-> - Design a disaster-recovery strategy: etcd backups, restore drills, and RTO/RPO targets
-> - Write an incident runbook that a tired on-call engineer can actually follow
+> - Explain what SLIs, SLOs, and error budgets are, and use them to settle arguments about shipping
+> - Give workloads GPUs and other special hardware using Dynamic Resource Allocation, including the admin access that became stable in 1.36
+> - Plan capacity so you have room for spikes and failures without paying for idle machines
+> - Build a recovery plan with real targets for how long you can be down and how much data you can lose
+> - Write a runbook a tired on-call engineer can actually follow at 3 a.m.
 
 ---
 
 ## 33.1 The day after launch
 
-There is a myth that shipping is the finish line. In reality, the day you go to production is **day one**. Everything after — keeping the service healthy, fast, and affordable while the world throws traffic, hardware failures, and 3 a.m. pages at it — is **day two**, and it never ends. This is the domain of **Site Reliability Engineering (SRE)**: treating operations as an engineering problem, with measurable goals and error budgets instead of heroics and hope.
+There is a myth that shipping is the finish line. Going to production is day one.
 
-Think of a restaurant. Opening night (day one) is exciting: the menu is set, the doors open. But the restaurant's *reputation* is built on day two and every day after — consistent food, predictable wait times, a plan for when the walk-in freezer dies on a Saturday night, and a calm response when it does. A great kitchen isn't one that never has problems; it's one that has *rehearsed* its problems.
+Everything after that is day two, and day two never ends. Keeping the service healthy, fast, and affordable while the world throws traffic spikes, dead disks, and 3 a.m. pages at it is a job of its own. **Site Reliability Engineering**, or **SRE**, is the practice of treating that job as engineering: measurable targets and deliberate trade-offs instead of heroics and hope.
 
-This chapter is about running the kitchen. We start with how you *measure* reliability (SLOs), then handle the specialized hardware modern workloads demand (GPUs via DRA), then plan capacity, prepare for disaster, and finally write the runbooks that turn a chaotic incident into a checklist.
+Think of a restaurant. Opening night is the exciting part. The menu is set, the doors open, everyone is watching.
+
+But the reputation is built on every night after. Food that tastes the same on a Tuesday. Wait times people can predict. A plan for when the walk-in freezer dies mid-service on a Saturday, and a calm response when it does.
+
+A great kitchen is not one that never has problems. It is one that has rehearsed its problems.
+
+This chapter is about running the kitchen. We start with how to measure reliability, then look at giving workloads the specialized hardware modern applications want, then plan capacity, prepare for the day something is truly gone, and finally write the runbooks that turn a chaotic incident into a checklist.
 
 ---
 
@@ -26,19 +32,25 @@ This chapter is about running the kitchen. We start with how you *measure* relia
 
 ### In plain terms
 
-You cannot manage what you do not measure, and "is the site up?" is too crude to be useful. SRE gives three precise tools:
+These are three tools for turning "is the site okay?" into something you can actually measure and act on.
 
 - **SLI (Service Level Indicator):** a *measurement* of how good the service is right now — e.g. "the fraction of requests served in under 300 ms," or "the fraction of requests that succeed."
 - **SLO (Service Level Objective):** the *target* for an SLI over a window — e.g. "99.9% of requests succeed over 30 days."
 - **Error budget:** the *allowance* for failure that the SLO implies — 99.9% success means you may fail 0.1% of requests. That leftover 0.1% is a budget you get to *spend*.
 
-The error budget is the quiet genius of SRE. It turns "should we ship this risky change?" from an argument into arithmetic: if you have budget left, ship; if you've burned it, freeze features and fix reliability.
+Why go to this trouble? Because without it, "is the site up?" is a matter of opinion, and every conversation about risk becomes an argument between the people who want to ship and the people who want stability. Neither side has evidence, so the louder one wins.
 
-SLIs measure user happiness; SLOs set targets; error budgets decide how much change risk you can afford. You might think 100% SLO is professional—it freezes change and ignores reality.
+The error budget is what settles it, and it is the quietly brilliant part of SRE. It turns a judgment call into arithmetic. Budget left over means you can afford the risky deploy, so ship it. Budget gone means you stop shipping features and spend the time on reliability instead. Nobody has to win an argument.
+
+> 💡 **In one line:** The error budget is how much failure you are allowed. Spend it on shipping, or waste it on outages.
+
+Two things people get wrong. Aiming for 100% sounds professional and is actually a refusal to choose: it costs enormously, no real system achieves it, and it leaves no room for the changes that keep a product alive. And measuring the wrong thing is worse than measuring nothing. An SLI should track something a user would notice, such as failed or slow requests. Paging someone because CPU hit 80% while every request succeeded just teaches them to ignore the pager.
 
 > ⚠️ **Common Pitfall:** Burning budget with endless risky deploys while paging on vanity metrics.
 
 ### Under the hood
+
+Here is how to define these concretely and alert on them.
 
 Common SLIs, expressed as ratios of good events to valid events:
 
@@ -111,9 +123,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Service owners own SLOs/budgets; platform provides measurement. Incident evidence includes budget burn charts.
+**Ownership:** Each service's owners set and own its SLOs and error budget. The platform team supplies the measurement. Every incident review includes the budget burn chart as evidence.
 
-**Failure mode:** Ignored budgets → chronic outages. Detect with burn-rate alerts. Mitigate by freezing risky changes when budget is exhausted.
+**Failure mode:** Budgets get ignored and the service is chronically unreliable, one small outage at a time. Detect it with burn-rate alerts that fire while the budget is being spent, not after it is gone. Act on it by freezing risky changes when the budget is exhausted.
 
 | Do | Don't |
 |----|-------|
@@ -135,15 +147,21 @@ flowchart LR
 
 ### In plain terms
 
-Classic Kubernetes resources are simple counters: "this pod wants 2 CPUs and 4 GiB of memory." That model breaks down for modern accelerators. A GPU isn't just "one unit" — it has a model, a memory size, a driver version, sharing modes (time-slicing, MIG partitions), and topology constraints. **Dynamic Resource Allocation (DRA)** is the framework that lets workloads *describe* the hardware they need in rich detail, and lets specialized drivers *allocate* it intelligently — instead of pretending a GPU is just another integer in `resources.limits`.
+**Dynamic Resource Allocation**, or **DRA**, is the way workloads ask for specialized hardware such as GPUs by describing what they need, rather than by counting units.
 
-DRA is the way Kubernetes now does AI/GPU scheduling: the core DRA APIs are **stable** (GA) in the 1.34–1.35 window and remain the baseline in **1.36**, where the **DRA admin access** feature itself reached **GA** — giving cluster admins a secure, permanent way to reach devices already in use by other workloads for monitoring and maintenance.
+The problem it solves is that CPU and memory are simple. Two cores is two cores, and four gibibytes is four gibibytes; the scheduler adds them up and finds a node. A GPU is not like that. It has a model, an amount of onboard memory, a driver version, ways of being shared such as time-slicing or partitioning, and a physical position relative to other GPUs that matters for fast interconnects.
 
-DRA models specialized resources (GPUs) more flexibly than classical Device Plugins alone—follow your 1.36 platform support. You might think requesting `nvidia.com/gpu: 1` is the whole story—drivers, isolation, and scheduling still matter.
+Writing `nvidia.com/gpu: 1` throws all of that away. It says "give me one thing that is a GPU," and then your training job lands on a card with too little memory or the wrong driver, and the scheduler had no way to know. DRA lets the request carry the real requirements and lets the hardware vendor's driver decide what satisfies them.
+
+It is the standard path now. The core DRA APIs became stable across the 1.34 and 1.35 releases and are the baseline in **1.36**, where **DRA admin access** also reached general availability. That last feature gives cluster administrators a supported way to reach a device that a workload is already using, so they can monitor it or run maintenance without evicting anyone.
+
+One rule for adoption: pick one model per cluster. Running some workloads on classic device plugin requests and others on DRA means two systems are handing out the same physical cards with no shared view of what is free. Announce the standard, publish the classes teams should request, and migrate deliberately.
 
 > ⚠️ **Common Pitfall:** Mixing classical GPU requests and DRA without a platform standard.
 
 ### Under the hood
+
+Here are the objects involved and how a workload asks for a device.
 
 DRA introduces a small vocabulary of objects in the `resource.k8s.io/v1` API:
 
@@ -240,9 +258,9 @@ Without that label (case-sensitive), the API server refuses the privileged reque
 
 ### In production
 
-**Ownership:** Platform owns GPU/DRA enablement and node pools; ML app teams consume the published API.
+**Ownership:** The platform team owns enabling DRA, running the drivers, and managing the GPU node pools. ML teams request hardware through the device classes the platform publishes.
 
-**Failure mode:** Fragmentation → Pending GPU jobs. Detect with GPU free/allocated metrics. Mitigate with pooling and clear request APIs.
+**Failure mode:** Free capacity ends up scattered in pieces too small to use, and GPU jobs sit `Pending` while the dashboard shows idle cards. Detect it by tracking free versus allocated devices, not just total utilization. Reduce it by pooling GPU nodes rather than dedicating them per team, and by giving teams a small set of clear request options instead of arbitrary ones.
 
 | Do | Don't |
 |----|-------|
@@ -262,13 +280,19 @@ Without that label (case-sensitive), the API server refuses the privileged reque
 
 ### In plain terms
 
-Capacity planning is answering three questions before your users answer them for you: *How much do we need? How much headroom for spikes and failures? How do we grow without overpaying?* Too little capacity means outages and throttling; too much means burning money on idle nodes. The art is deliberate headroom, not guesswork.
+Capacity planning is deciding how much you need before your users decide it for you. Three questions: how much capacity does normal traffic require, how much spare do you keep for spikes and failures, and how do you grow without paying for idle machines?
 
-Capacity is requests, limits, headroom for drains, and dependency limits—not only node count. You might think cluster autoscaler removes planning—you still plan quotas and max surge.
+Getting it wrong hurts in both directions. Too little and you get throttling, evictions, and outages. Too much and you burn money on nodes doing nothing, month after month. The goal is headroom you chose on purpose, not headroom that happens to exist.
+
+Two things get overlooked. Headroom is not only for traffic spikes: draining a node for maintenance has to put those Pods somewhere, and a cluster running at 100% of allocatable cannot do it. And your capacity is not just node count. It is the requests and limits on every Pod, since the scheduler packs nodes by requests. Requests set too high waste capacity you paid for; set too low they overcommit the node and you get throttling and out-of-memory kills.
+
+Autoscaling helps, and it does not remove the planning. It also creates a specific trap worth naming. When latency rises, the autoscaler adds replicas, and if the real bottleneck is your database, those new replicas each open more connections and make it worse. Scaling faster into a saturated dependency is how a slow afternoon becomes an outage. Load-test the things you depend on, and cap how far an application may scale past what they can serve.
 
 > ⚠️ **Common Pitfall:** Autoscaling nodes while the database is the real bottleneck.
 
 ### Under the hood
+
+Here are the three autoscalers and how they work together.
 
 Kubernetes gives you three autoscaling axes, and they work together:
 
@@ -316,9 +340,9 @@ Requests and limits are the foundation of all of it: the scheduler bin-packs by 
 
 ### In production
 
-**Ownership:** Platform owns cluster headroom; app teams own workload forecasts and dependency caps.
+**Ownership:** The platform team owns cluster-wide headroom. App teams forecast their own growth and set caps so they cannot scale past what their dependencies can serve.
 
-**Failure mode:** Surprise saturation → SLO burn. Detect with allocation vs allocatable and queue depth. Mitigate with seasonal forecasts and load tests.
+**Failure mode:** The cluster runs out of room without warning and the error budget burns. Detect it by tracking committed requests against allocatable capacity, and by watching queue depth rather than only CPU. Prevent it with forecasts that account for seasonal peaks and load tests that include your dependencies.
 
 | Do | Don't |
 |----|-------|
@@ -338,13 +362,21 @@ Requests and limits are the foundation of all of it: the scheduler bin-packs by 
 
 ### In plain terms
 
-Disaster recovery (DR) is your answer to "the cluster (or region) is *gone* — now what?" It rests on two numbers you must choose *before* the disaster: **RTO (Recovery Time Objective)**, how long you can be down, and **RPO (Recovery Point Objective)**, how much data you can afford to lose. A backup you have never restored is not a backup; it's a hope. DR is the rehearsed ability to get back.
+**Disaster recovery**, shortened to **DR**, is your written answer to a simple question: the cluster is gone, or the whole region is gone, so what happens now?
 
-DR is etcd + app data + registry artifacts + runbooks with tested RTO/RPO. You might think multi-AZ equals DR—regional loss needs a story.
+It rests on two numbers you choose in advance. **RTO**, the recovery time objective, is how long you can be down. **RPO**, the recovery point objective, is how much recent data you can afford to lose. Pick them before the disaster, because during one every answer is "as fast as possible," which is not a plan.
+
+Those numbers decide everything else. An RPO of one hour means hourly backups are enough. An RPO of one minute means continuous replication and a much larger bill. An RTO of four hours allows a rebuild from scratch; an RTO of fifteen minutes means a standby environment already running. The point of naming the numbers is to make the cost visible while there is still time to argue about it.
+
+Recovery has two halves and people plan only one. Cluster state lives in etcd: every Deployment, Secret, and RBAC rule. Application data lives in your volumes and databases: the things your users actually created. Restoring etcd gives you a cluster that knows what should be running and has none of the data it was running on. You need both, restored in an order you have written down.
+
+Finally, spreading across availability zones is not disaster recovery. It handles one zone failing, which is real and worth doing, and it does nothing when the region goes or when somebody deletes the wrong thing everywhere at once. Rehearse the restore on a schedule and time it. A backup nobody has restored is a hope with a filename.
 
 > ⚠️ **Common Pitfall:** etcd backups without app datastore restores.
 
 ### Under the hood
+
+Here are the two halves and the commands for each.
 
 Kubernetes DR has two distinct concerns, and people conflate them at their peril:
 
@@ -410,9 +442,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform owns control-plane DR; app teams own data-plane RPO/RTO drills.
+**Ownership:** The platform team owns recovering the control plane. App teams own their own data, and rehearse restoring it against their stated targets.
 
-**Failure mode:** Untested DR → extended outage. Detect with drill cadence metrics. Mitigate with scheduled game days.
+**Failure mode:** A recovery plan nobody has tested turns a bad day into a multi-day outage. Detect the gap by tracking how long it has been since each team ran a drill. Close it with scheduled game days where you actually restore, and record the time it took.
 
 | Do | Don't |
 |----|-------|
@@ -434,13 +466,21 @@ flowchart LR
 
 ### In plain terms
 
-At 3 a.m., a paged engineer has adrenaline, not genius. A **runbook** is a pre-written, step-by-step guide for a specific alert or failure so the response is a *checklist*, not an improvisation. Good runbooks convert institutional knowledge (usually stuck in one senior engineer's head) into something anyone on-call can execute.
+A **runbook** is a written, step-by-step response to one specific alert. It says what the alert means, who is affected, which commands to run first, and when to escalate.
 
-Runbooks encode detect→mitigate→evidence. They name owners, blast radius, and first commands. You might think tribal knowledge is faster—until the primary is on a flight.
+Write them because of who reads them. At 3 a.m. a paged engineer has adrenaline, not genius, and may have never seen this service before. Under that much stress people forget things they know perfectly well in daylight. A checklist beats recall every time.
+
+Runbooks also move knowledge out of one person's head. Every team has someone who just knows that this alert usually means the connection pool. That works until they are asleep, on a plane, or no longer at the company. Writing it down is how the team stops depending on one person being reachable.
+
+A runbook is only useful if it is specific. "Investigate the issue" helps nobody. Real commands they can paste, the name of the dashboard, the rollback command, a time limit before escalating, and who to escalate to. Link it directly from the alert so nobody is searching a wiki while the pager is going off.
+
+One habit the runbook should encode: mitigate before you diagnose. Rolling back a bad deploy to stop users hurting right now beats a forty-minute investigation into why it broke. Root cause belongs in the postmortem, when everyone is calm and nothing is on fire.
 
 > ⚠️ **Common Pitfall:** Runbooks that say “fix it” without commands, owners, or rollback.
 
 ### Under the hood
+
+Here is a template you can copy, and where it fits in the incident lifecycle.
 
 A useful runbook is short, specific, and action-first. A template:
 
@@ -489,9 +529,9 @@ Note the order: **mitigate before you diagnose**. Rolling back a bad deploy to r
 
 ### In production
 
-**Ownership:** Service owners maintain runbooks; platform maintains cluster-level ones. Link from alerts.
+**Ownership:** Service owners write and maintain the runbooks for their own alerts. The platform team maintains the cluster-level ones. Every alert links to its runbook.
 
-**Failure mode:** Missing runbook → slow MTTR. Detect with postmortems citing missing docs. Mitigate with alert→runbook URLs and quarterly reviews.
+**Failure mode:** There is no runbook, so recovery takes far longer than it should. Detect it from postmortems that keep citing missing or outdated documentation. Fix it by putting a runbook URL in every alert and reviewing them quarterly, since a runbook that no longer matches reality is worse than none.
 
 | Do | Don't |
 |----|-------|
@@ -585,11 +625,18 @@ Mitigate first — roll back, scale out, disable a feature flag, or shed load to
 
 ## 33.10 Key takeaways
 
-- SRE measures reliability with **SLIs**, targets it with **SLOs**, and manages risk with the **error budget**; alert on **burn rate**, and never chase 100%.
-- **Dynamic Resource Allocation** is how Kubernetes schedules AI/GPU hardware with real detail; core DRA is stable, and **admin access is GA in 1.36**, gated by the `resource.kubernetes.io/admin-access` namespace label.
-- **Capacity planning** combines right-sized requests, HPA/VPA, Cluster Autoscaler/Karpenter, and PodDisruptionBudgets, with deliberate N+1 headroom and cost tracking.
-- **Disaster recovery** means chosen **RTO/RPO**, etcd *and* PersistentVolume backups (Velero + GitOps), and — above all — **tested restores**; backups contain Secrets, so encrypt them.
-- **Incident runbooks** turn 3 a.m. chaos into a checklist: detect → triage → **mitigate first** → resolve → blameless postmortem; link every page to a runbook and rehearse with game days.
+- An **SLI** measures reliability, an **SLO** is the target, and the **error budget** is the failure you are allowed to spend.
+- Alert on how fast the budget is burning, not on CPU. Never chase 100%; it costs everything and buys nothing.
+- Measure something a user would notice. Paging on a metric users cannot feel just teaches people to ignore pages.
+- **Dynamic Resource Allocation** lets workloads describe the hardware they need instead of counting GPUs. Pick one model per cluster and stick to it.
+- Keep headroom for draining nodes, not just for traffic. A cluster at 100% cannot be maintained.
+- Requests are how the scheduler packs nodes. Too high wastes money, too low causes throttling and out-of-memory kills.
+- Never autoscale into a saturated dependency. More replicas on a struggling database makes it worse.
+- Choose your **RTO** and **RPO** before the disaster, because during one every answer is "immediately."
+- Back up etcd *and* your application data. Restoring one without the other gives you half a system.
+- A backup nobody has restored is a hope with a filename. Drill it and time it.
+- **Mitigate before you diagnose.** Roll back now; find the root cause in the postmortem.
+- Every alert links to a runbook with real commands, an owner, and an escalation deadline.
 
 ---
 

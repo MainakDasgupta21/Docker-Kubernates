@@ -4,29 +4,29 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain what container orchestration is and why single-host Docker is not enough for production-scale systems
-> - Initialize a Swarm and describe manager and worker roles
-> - Deploy, scale, and update **services** instead of managing individual containers
-> - Deploy whole applications as **stacks** using Compose files
-> - Explain how the **routing mesh** makes any node answer for any published service
-> - Use Swarm **secrets** and **configs** to inject credentials and non-sensitive files into services
-> - Position Swarm honestly relative to Kubernetes, which the rest of this book covers
+> - Say what orchestration means, and why one Docker host is not enough for a production system
+> - Start a swarm and describe what managers do and what workers do
+> - Create, scale, and update **services** instead of tending single containers by hand
+> - Deploy a whole application as a **stack** from a Compose-shaped file
+> - Explain how the **routing mesh** lets any node answer for a published service
+> - Hand credentials and plain config files to services using Swarm **secrets** and **configs**
+> - Place Swarm honestly next to Kubernetes, which the rest of this book covers
 
 ---
 
 ## 09.1 From chef to restaurant chain
 
-So far you have been a chef in one kitchen. You know every pan (container): start it, watch it, restart it. That works for one kitchen.
+So far you have been a chef in one kitchen. You know every pan, and every pan is a container. You start it, watch it, and restart it when it fails. That works for one kitchen.
 
 ![Restaurant chain headquarters and branches for Swarm orchestration](assets/analogy-restaurant-chain.png)
 
 *Figure 09.A: Managers plan; workers cook—the chain keeps serving if one kitchen stalls.*
 
-Opening a restaurant chain means ten kitchens and hundreds of dishes. You need a *head office* that takes declarations like "every location serves the daily special, five stations at all times" and makes it happen — hiring, rebalancing, replacing failures — without you flying out.
+Now open a restaurant chain: ten kitchens and hundreds of dishes. You need a *head office*. You tell it "every location serves the daily special, five stations running at all times," and it makes that true. It hires, moves people around, and replaces anyone who calls in sick. You never fly out.
 
-That head office is an **orchestrator**. You stop issuing "start this container here" and start declaring **desired state** ("run five replicas of this service somewhere sensible"). The orchestrator continuously compares reality to the declaration and repairs drift.
+That head office is an **orchestrator** — software that runs containers across many machines on your behalf. You stop saying "start this container here." You start declaring **desired state**, meaning the end result you want, such as "run five copies of this service somewhere sensible." The orchestrator keeps comparing reality against your declaration and fixes any difference it finds.
 
-Docker Swarm is Docker's built-in orchestrator. Even in a Kubernetes-centric world it matters: it is the gentlest introduction to orchestration (already inside Docker), and every idea — desired state, services, replicas, ingress load balancing — reappears in Kubernetes wearing different clothes.
+Docker Swarm is Docker's built-in orchestrator. It still matters in a Kubernetes world, for two reasons. It is the gentlest way into orchestration, because it already ships inside Docker. And every idea here — desired state, services, replicas, load balancing at the front door — comes back in Kubernetes wearing different clothes.
 
 ---
 
@@ -34,13 +34,17 @@ Docker Swarm is Docker's built-in orchestrator. Even in a Kubernetes-centric wor
 
 ### In plain terms
 
-A **swarm** is a group of Docker Engines (each machine is a **node**) acting as one cluster. **Managers** hold the brain; **workers** run the food.
+A **swarm** is a group of Docker Engines that act as one cluster. Each machine in the group is a **node**.
 
-The split between managers and workers is the same head-office/branch pattern from the opening analogy, made concrete. Managers hold the *desired state* — the declarations of what should run — and decide where work goes. Workers just execute the tasks managers assign them. A manager is also a worker by default, which is why a single machine can be a complete one-node swarm: it plans and cooks. As you grow, you add managers for resilience of the *brain* and workers for capacity of the *hands*, and those two axes scale independently.
+You should care about the two node roles because they decide what happens when a machine dies. **Managers** hold the brain: they store the desired state — the declarations of what should be running — and decide where the work goes. **Workers** are the hands: they run whatever the managers assign them. A manager is also a worker by default, which is why one machine can be a complete one-node swarm. It plans and it cooks.
 
-> ⚠️ **Common Pitfall:** You might reason "more managers means more resilience, so I'll run two." Two managers are strictly *worse* than one for availability: Raft needs a majority (quorum), and with two nodes the majority is still two — lose either and the survivor cannot make decisions, freezing all cluster changes. Manager counts must be **odd** (1, 3, or 5).
+That is the head-office and branch pattern from the opening story, made real. As you grow, you add managers to protect the brain and workers to add capacity for the hands. Those two needs grow independently of each other.
+
+> ⚠️ **Common Pitfall:** You might reason "more managers means more resilience, so I'll run two." Two managers are strictly *worse* than one. Managers agree with each other using **Raft**, an algorithm that requires a majority of them — a **quorum** — before any decision counts. With two managers, the majority is still two. Lose either one and the survivor can decide nothing, which freezes every change to the cluster. Manager counts must be **odd**: 1, 3, or 5.
 
 ### Under the hood
+
+Here is what each role actually does on the machine:
 
 - **Managers** store desired state in a replicated **Raft** log, schedule work, and expose the Swarm API. Use an **odd** count (1, 3, or 5) so managers can keep quorum if one fails.
 - **Workers** run the containers managers assign. Managers are workers by default, which is why a one-node swarm still runs workloads.
@@ -85,9 +89,9 @@ flowchart TB
 
 ### In production
 
-Never run an even number of managers "for luck." Two managers are *worse* than one: lose either and the survivor has no majority, freezing cluster changes. Plan join tokens and manager availability like you would plan etcd members later in Kubernetes.
+Never run an even number of managers "for luck." Two managers are *worse* than one: lose either and the survivor has no majority, which freezes every cluster change. Plan your manager count and your join tokens as carefully as you will later plan etcd members in Kubernetes.
 
-**Who owns this:** the platform/on-call team owns manager count, quorum health, join-token custody, and manager backups. **Failure mode and detection:** the scary one is *quorum loss* — you fall below a majority of managers (for example, two of three managers down) and the cluster freezes: existing tasks keep running, but you cannot deploy, scale, or heal until quorum returns. Detect with `docker node ls` (unreachable managers) and by watching manager availability as a first-class signal. **Do** run 3 or 5 managers spread across failure domains, back up the Raft store, and guard the manager token; **don't** run 2 or 4 managers, and don't co-locate all managers on one host or rack.
+**Who owns this:** the platform/on-call team owns the manager count, quorum health, who holds the join tokens, and manager backups. **Failure mode and detection:** the frightening one is *quorum loss*. You drop below a majority of managers — say two of three managers are down — and the cluster freezes. Existing tasks keep running, but you cannot deploy, scale, or heal anything until the majority is back. Watch for unreachable managers in `docker node ls`, and treat manager availability as a signal you alert on. **Do** run 3 or 5 managers spread across separate failure domains, back up the Raft store, and guard the manager token; **don't** run 2 or 4 managers, and don't put all managers on one host or in one rack.
 
 **Before you leave this section**
 
@@ -101,13 +105,19 @@ Never run an even number of managers "for luck." Two managers are *worse* than o
 
 ### In plain terms
 
-In Swarm mode you stop babysitting containers and create **services**: declarations of image, replica count, and ports. The manager turns each replica into a **task** (one container on some node) and keeps the count honest forever.
+A **service** is a declaration: this image, this many copies, these ports. You hand it to a manager, and the manager keeps it true.
 
-This is the mental shift from *imperative* to *declarative* that underpins every orchestrator. With `docker run` you issue a command and own the consequences: if the container dies, it stays dead until you notice and act. With a service you declare an end state — "three replicas of `nginx:1.27`, port 8080 published" — and hand the manager a standing instruction to *make reality match, forever*. The manager decomposes the service into tasks (each task is one container on one node) and runs a reconciliation loop that continuously compares desired to actual and repairs any gap. You stop being the thing that restarts dead containers.
+You should care because this takes you out of the loop as the person who restarts dead containers. With `docker run` you issue one command and own everything that follows. If the container dies, it stays dead until you notice and act. With a service you declare an end state — "three copies of `nginx:1.27`, port 8080 published" — and give the manager a standing order to make reality match that declaration, forever.
 
-> ⚠️ **Common Pitfall:** You might expect three replicas of Postgres to give you a highly available database. They give you three *independent* databases sharing nothing — replica count is process multiplication, not data clustering. Stateful services need their own replication/clustering design; Swarm will faithfully keep three separate, diverging databases running.
+The manager splits the service into **tasks**. One task is one container running on one node. It then runs a **reconciliation loop**, which simply means it keeps comparing what should be running to what is running and closes any gap. That shift from giving commands to declaring an end state is what every orchestrator is built on.
+
+> 💡 **In one line:** A **service** is what you declare — one image, N replicas. A **task** is one running container filling one of those replica slots. You manage the service, and Swarm manages the tasks.
+
+> ⚠️ **Common Pitfall:** You might expect three replicas of Postgres to give you a highly available database. They give you three *separate* databases that share nothing. A replica count multiplies processes; it does not cluster data. A stateful app needs its own replication design, and Swarm will faithfully keep three separate databases running as their contents drift apart.
 
 ### Under the hood
+
+Here is what actually happens on the machine:
 
 ```bash
 $ docker service create --name web --replicas 3 -p 8080:80 nginx:1.27
@@ -158,9 +168,9 @@ The update performs a **rolling update**: replace tasks in batches so the servic
 
 ### In production
 
-`docker run` still works on a swarm node but creates an **unmanaged** container — no healing, no scaling. If you want orchestration, it must be a service (or a stack that creates services). Treat replicated *stateful* apps carefully: three Postgres replicas are three independent databases unless you design clustering yourself.
+`docker run` still works on a swarm node, but it creates an **unmanaged** container: nothing heals it, nothing scales it. If you want the cluster to look after a workload, it must be a service, or a stack that creates services. Handle replicated *stateful* apps carefully. Three Postgres replicas are three separate databases unless you design the clustering yourself.
 
-**Who owns this:** the app team owns the service definition (image, replicas, update strategy, health check); the platform team owns cluster capacity and placement. **Failure mode and detection:** the two recurring ones are (1) a rolling update rolling out a bad image because there is no health gate — detect with `docker service ps <svc>` showing tasks flapping and `docker service logs`, and recover with `docker service rollback`; and (2) a stray `docker run` on a swarm node creating an unmanaged container that never heals and quietly competes for host resources — detect by comparing `docker service ps` (managed tasks) against `docker ps` (all containers). **Do** attach health checks, tune `--update-parallelism`/`--update-delay`, and keep everything as services; **don't** hand-run containers on swarm nodes or scale stateful services expecting free HA.
+**Who owns this:** the app team owns the service definition — image, replicas, update strategy, health check. The platform team owns cluster capacity and placement. **Failure mode and detection:** two failures recur. First, a rolling update ships a bad image because nothing checks health along the way. You will see tasks flapping in `docker service ps <svc>`, read the reason in `docker service logs`, and recover with `docker service rollback`. Second, a stray `docker run` on a swarm node leaves an unmanaged container that never heals and quietly competes for host resources. Find those by comparing `docker service ps` (managed tasks) with `docker ps` (every container). **Do** attach health checks, tune `--update-parallelism` and `--update-delay`, and keep every workload as a service; **don't** start containers by hand on swarm nodes, and don't scale a stateful service expecting free high availability.
 
 **Before you leave this section**
 
@@ -174,15 +184,17 @@ The update performs a **rolling update**: replace tasks in batches so the servic
 
 ### In plain terms
 
-When you publish a service port, Swarm opens that port on **every node**, not only where tasks run. Traffic arriving anywhere is forwarded to a healthy replica. Where the packet lands and where the container runs are deliberately decoupled.
+The **routing mesh** is the part of Swarm that opens a published port on *every* node and forwards each request to a healthy copy of the service, wherever that copy runs.
 
-The problem the routing mesh solves is *placement transparency for callers*. In single-host Docker, a published port lives on the one host running the container; if the container moves, the mapping context breaks and clients must know where it went. In a cluster, tasks move between nodes as things fail and rebalance, and you do not want your load balancer chasing the scheduler. The mesh decouples the two: every node accepts the published port and forwards to a healthy replica wherever it currently runs. Your external load balancer points at all node IPs and never needs to know placement.
+You need this so callers never have to track where containers are. On a single host, a published port lives on the one machine running the container. If the container moves, clients have to be told where it went. In a cluster, tasks move between nodes as machines fail and work rebalances, and you do not want your load balancer chasing the scheduler around.
+
+The mesh breaks that link on purpose. Traffic can arrive at any node, and that node forwards it to a healthy copy running anywhere in the cluster. Your external load balancer points at all the node addresses and never needs to know which node holds which task.
 
 > ⚠️ **Common Pitfall:** You might see the published port open on a node and conclude a task is running *there*. Not so — the mesh opens the port on **every** node, including nodes with zero replicas of that service. A node answering on `:8080` tells you nothing about where the container actually lives.
 
 ### Under the hood
 
-Publishing uses the **routing mesh** (ingress mode) over the built-in `ingress` overlay network:
+Here is what actually happens on the machine. Publishing uses the **routing mesh** (ingress mode) over the built-in `ingress` overlay network:
 
 ```bash
 $ curl -s -o /dev/null -w "%{http_code}\n" http://node-3:8080
@@ -213,9 +225,9 @@ Internally, services on a shared overlay also get DNS names and a virtual IP —
 
 ### In production
 
-Point external load balancers at a pool of node IPs without tracking scheduler placement. Remember: a listening port on a node does **not** mean the workload is local.
+Point external load balancers at a pool of node IPs and stop tracking where the scheduler placed anything. Remember one thing: a listening port on a node does **not** mean the workload is running there.
 
-**Who owns this:** the platform team owns the node-IP pool the external LB targets and the inter-node firewall rules the mesh needs; the app team chooses ingress versus `mode=host` publishing per service. **Failure mode and detection:** a common incident is health-checking a single node and declaring the service down (or up) when the mesh masks per-task health — check `docker service ps` for real task placement and health, not just a port probe. Another is expecting real client IPs in logs and getting mesh addresses. **Do** point the LB at all node IPs, open the mesh ports, and reach for `mode=host` when you need source-IP preservation or per-node binding; **don't** infer task placement from an open published port.
+**Who owns this:** the platform team owns the pool of node addresses the external load balancer targets, plus the between-node firewall rules the mesh needs. The app team picks ingress mode or `mode=host` publishing for each service. **Failure mode and detection:** a common incident is health-checking one node and declaring the service down (or up), because the mesh hides the health of individual tasks. Read real task placement and health from `docker service ps` instead of trusting a port probe. Another is expecting real client IP addresses in your logs and getting mesh addresses instead. **Do** point the load balancer at all node IPs, open the mesh ports, and use `mode=host` when you need the real client IP or a per-node binding; **don't** guess where a task runs from an open published port.
 
 **Before you leave this section**
 
@@ -229,13 +241,17 @@ Point external load balancers at a pool of node IPs without tracking scheduler p
 
 ### In plain terms
 
-Images should stay generic. **Secrets** deliver sensitive values (passwords, TLS keys) as in-memory files. **Configs** deliver non-sensitive files (nginx site configs, feature flags, static JSON) as ordinary files in the container filesystem — without baking them into the image or bind-mounting host paths on every node.
+A **secret** is a sensitive value — a password, a TLS key — that the cluster hands to a task as an in-memory file. A **config** is the same idea for a file that is not sensitive, such as an nginx site config, a feature flag list, or a static JSON file.
 
-The problem both solve is *keeping environment-specific material out of the image*. If a password or a site config is baked into the image, then the image is environment-specific, sensitive, and must be rebuilt to change a value — three things you do not want. Swarm inverts this: the image ships generic, and the cluster injects the right file into each task at runtime. Secrets and configs use nearly identical APIs; the difference is intent and handling. Secrets are for material that would hurt if it leaked and are delivered on a tmpfs-style path under `/run/secrets/`; configs are for ordinary files you simply do not want to bake in.
+Both exist to keep environment-specific material out of your images. Bake a password or a site config into an image and that image becomes environment-specific, becomes sensitive, and has to be rebuilt to change one value. You want none of those three things. Swarm turns it around. The image ships generic, and the cluster injects the right file into each task as it starts, with no host paths to copy onto every node.
+
+The two objects use nearly the same commands. What differs is intent and handling. Secrets carry material that would hurt if it leaked, and they arrive on a tmpfs-style path under `/run/secrets/`. Configs carry ordinary files that you simply do not want baked into the image, and they arrive as regular files at a path you pick.
 
 > ⚠️ **Common Pitfall:** You might put a password in a **config** because "it's basically the same mechanism and it works." Configs are not intended as secret-grade protection for the payload — use `docker secret` for anything confidential. Choosing the object by convenience instead of sensitivity is exactly how credentials end up in the wrong, less-protected place.
 
 ### Under the hood
+
+Here is what actually happens on the machine when you create each object and attach it to a service.
 
 **Secrets** (encrypted at rest in the managers' Raft store; mounted under `/run/secrets/` via a tmpfs-style path):
 
@@ -297,9 +313,9 @@ flowchart LR
 
 ### In production
 
-Rotate by creating a new secret/config, updating the service to reference it, then removing the old object after convergence. Never bake prod credentials into images. For single-host Compose, `secrets:` / `configs:` in the Compose file are a reasonable *dev* approximation (often file-backed); Swarm's Raft-backed delivery is the cluster-grade version.
+To rotate a value, create a new secret or config, update the service to point at it, and remove the old object once every task has switched over. Never bake production credentials into an image. On single-host Compose, the `secrets:` and `configs:` keys are a reasonable *development* stand-in and are often backed by plain files. Swarm's Raft-backed delivery is the cluster-grade version.
 
-**Who owns this:** the platform/security team owns secret creation, rotation cadence, and the fact that secrets live in the managers' Raft store — which makes manager hosts and their backups sensitive assets. **Failure mode and detection:** because Swarm secrets are **immutable**, "rotation" means creating a new secret object and updating services to reference it, then removing the old one after convergence; attempting to edit a secret in place, or removing the old secret before every task has switched over, breaks running tasks. Detect stale references with `docker service inspect` and confirm convergence with `docker service ps` before deleting the old object. **Do** rotate by add-new/update/remove-old and treat manager nodes + Raft backups as secret-bearing; **don't** log secret values, bake them into images, or put credentials in configs.
+**Who owns this:** the platform/security team owns creating secrets, how often they rotate, and the consequence that secrets live in the managers' Raft store — which makes manager hosts and their backups sensitive assets. **Failure mode and detection:** Swarm secrets are **immutable**, meaning you cannot change one in place. So rotation means creating a new secret object, updating services to point at it, and removing the old one after every task has switched over. Trying to edit a secret in place, or deleting the old secret too early, breaks running tasks. Find stale references with `docker service inspect`, and confirm every task has switched with `docker service ps` before you delete the old object. **Do** rotate by add-new, update, then remove-old, and treat manager nodes and Raft backups as if they hold the secrets themselves — because they do; **don't** log secret values, bake them into images, or put credentials in configs.
 
 > 🏭 **Production floor:** Swarm secrets are cluster credentials at rest in the managers' Raft log and mounted into tasks under `/run/secrets/`. That makes every manager node, its disk, and its Raft backups sensitive — a compromised manager or an unencrypted backup is a secret leak. Change-manage secret rotation (create new → update services → verify convergence → remove old), restrict who can run `docker secret`/reach the manager API, guard the manager join token, and never demote a manager or copy its state to a less-trusted host without accounting for the secrets it carries.
 
@@ -315,13 +331,19 @@ Rotate by creating a new secret/config, updating the service to reference it, th
 
 ### In plain terms
 
-Creating services one `docker service create` at a time recreates the problem Compose solved. A **stack** deploys an entire Compose file to the swarm.
+A **stack** is a whole application deployed to the swarm from one Compose-shaped file.
 
-The insight is that you already learned the declarative-file habit in Chapter 08 — a stack is that same habit, aimed at the cluster instead of one host. Instead of typing a `docker service create` per component (imperative, un-versioned, easy to drift), you write one Compose-shaped file with a `deploy:` section per service and hand it to `docker stack deploy`. The cluster reconciles the whole application to match. It is Compose's "one file describes the system" promise, now backed by Swarm's scheduling, healing, and rolling updates.
+You want this because creating services one `docker service create` at a time brings back the exact problem Compose solved. Typing a command per component means nothing is written down, nothing is reviewed, and the real cluster slowly drifts away from what anyone remembers.
 
-> ⚠️ **Common Pitfall:** You might copy a Chapter 08 `compose.yaml` with `build:` straight into `docker stack deploy` and expect it to build. Stacks do **not** build images — they schedule prebuilt images by reference. You must build and push to a registry first and use `image:`; a `build:` key is ignored (or errors) at stack-deploy time.
+A stack is the Chapter 08 habit pointed at a cluster instead of one host. You write one file, add a `deploy:` section to each service, and hand the file to `docker stack deploy`. The cluster then makes the whole application match what the file says. It is Compose's "one file describes the system" promise, now backed by Swarm's scheduling, healing, and rolling updates.
+
+> 💡 **In one line:** A **stack** is one file describing every service of an application, deployed to the cluster with a single command — Compose's habit with Swarm's muscle behind it.
+
+> ⚠️ **Common Pitfall:** You might copy a Chapter 08 `compose.yaml` that has a `build:` key straight into `docker stack deploy` and expect it to build the image. Stacks do **not** build images. They schedule images that already exist, by name. Build and push to a registry first, then reference the result with `image:`. A `build:` key is ignored, or errors, at stack-deploy time.
 
 ### Under the hood
+
+Here is what a stack file actually looks like:
 
 ```yaml
 # stack.yaml
@@ -416,9 +438,9 @@ Swarm ships inside Docker, reuses Compose-shaped files, and can be learned in an
 
 ### In production
 
-Prefer stacks over ad-hoc `service create` for anything you will revisit. Keep images in a registry. Treat Swarm as a teaching and niche tool unless your org deliberately standardized on it.
+Use a stack, not one-off `service create` commands, for anything you will come back to. Keep your images in a registry. Treat Swarm as a teaching tool and a niche production choice unless your organization deliberately standardized on it.
 
-**Who owns this:** the app team owns the stack file (images, `deploy:`, secret/config references) as version-controlled source; the platform team owns the registry and the external objects (`external: true` secrets/configs must exist on the swarm first). **Failure mode and detection:** a stack deploy that references an `external: true` secret/config that was never created fails to converge — detect with `docker stack ps <stack>` showing tasks stuck in `Rejected`/`Preparing` and read the error column. A subtler one is deploying an `image:` tag the cluster nodes cannot pull (private registry, no credentials) — same symptom, different cause. **Do** create external secrets/configs before deploy, pin images by digest in a registry all nodes can reach, and keep stacks in Git; **don't** manage long-lived apps with ad-hoc `service create`.
+**Who owns this:** the app team owns the stack file — images, `deploy:`, and the secret and config references — as source code in version control. The platform team owns the registry and the external objects, because any secret or config marked `external: true` must already exist on the swarm. **Failure mode and detection:** a stack that references an `external: true` secret or config nobody created never finishes deploying. You will see tasks stuck in `Rejected` or `Preparing` in `docker stack ps <stack>`, with the reason in the error column. A quieter version is an `image:` tag the nodes cannot pull, usually a private registry with no credentials — same symptom, different cause. **Do** create external secrets and configs before you deploy, pin images by digest in a registry every node can reach, and keep stack files in Git; **don't** run long-lived apps from one-off `service create` commands.
 
 **Before you leave this section**
 
@@ -502,12 +524,15 @@ Same general Compose shape, but stacks honor `deploy:` (replicas, updates, place
 
 ## 09.10 Key takeaways
 
-- Orchestration replaces imperative container commands with **declared desired state** and a reconciliation loop.
-- A swarm is Docker Engines as one cluster: **managers** (odd count, Raft) decide; **workers** run tasks.
-- **Services** give replicas, healing, scaling, and rolling updates; **stacks** deploy Compose-shaped files with `deploy:`.
-- The **routing mesh** publishes ports on every node and load-balances to wherever replicas run.
-- **Secrets** and **configs** keep images generic: secrets for sensitive values, configs for non-sensitive files.
-- Swarm is the friendliest orchestration classroom; Kubernetes is where production has consolidated — and every concept here transfers.
+- You stop giving commands and start declaring the end state. A loop keeps reality matching it.
+- A swarm is many Docker Engines acting as one cluster. **Managers** decide, **workers** run the work.
+- Managers need an **odd** count: 1, 3, or 5. Two managers are worse than one.
+- **Service** = what you declared. **Task** = one container filling one replica slot. **Stack** = every service of an app in one file.
+- Three Postgres replicas are three separate databases. Replicas multiply processes, not data.
+- The **routing mesh** opens a published port on every node, so an open port tells you nothing about where the container runs.
+- **Secrets** for anything sensitive, **configs** for plain files. Both keep the image generic. Never put a password in a config.
+- Stacks do not build. Push the image first, then reference it with `image:`.
+- Swarm is the friendliest classroom for orchestration. Kubernetes is where production went, and every idea here carries over.
 
 ---
 

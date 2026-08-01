@@ -4,11 +4,11 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain why controllers own Pods instead of leaving bare Pods in production
-> - Deploy and roll out stateless apps with Deployments and ReplicaSets
-> - Choose StatefulSets, DaemonSets, Jobs, and CronJobs for the right workload shapes
-> - Configure rolling updates, rollbacks, and HorizontalPodAutoscaler targets
-> - Avoid common replica, identity, and Job parallelism pitfalls
+> - Say why something must own your Pods instead of you running them by hand
+> - Ship and update stateless apps with Deployments and ReplicaSets
+> - Pick StatefulSets, DaemonSets, Jobs, or CronJobs for the job each one is built for
+> - Set up rolling updates, undo a bad release, and choose HorizontalPodAutoscaler targets
+> - Avoid the usual traps with replica counts, Pod identity, and running Jobs in parallel
 
 ---
 
@@ -16,13 +16,17 @@
 
 ### In plain terms
 
-A bare Pod is a single plant in a pot. Knock it over and it stays down. A **controller** is a gardener with a planting plan: "always three roses in this bed." Controllers recreate, scale, and update Pods from a template. The problem they solve is the Chapter 11 lesson at scale: someone must hold the promise that the workload exists—and it must not be a human at 3 a.m.
+A **controller** is a program that creates and replaces Pods for you, from a template you wrote. You tell it how many Pods you want, and it keeps that number true.
 
-You might think a carefully named bare Pod in production is "simpler than a Deployment." It is simpler until the node dies. Then you discover nobody recorded desired replicas, rollout history, or who owns replacement.
+You need one because a Pod on its own is fragile. A bare Pod is a single plant in a pot: knock it over and it stays down. A controller is a gardener working from a planting plan that says "always three roses in this bed." Something has to hold that promise, and as Chapter 11 showed, it cannot be a person at 3 a.m.
+
+You might think a carefully named bare Pod in production is simpler than a Deployment. It is simpler, right up until the node dies. Then you find out that nobody recorded how many copies there should be, what the previous version was, or who is responsible for bringing it back.
 
 > ⚠️ **Common Pitfall:** Using `kubectl run` for a production API and forgetting it created an unmanaged Pod (or a generated Deployment you never committed). Always end in Git-reviewed controller YAML.
 
 ### Under the hood
+
+Here is what each controller keeps true for you:
 
 | Controller | Keeps this true |
 |------------|-----------------|
@@ -37,7 +41,7 @@ You might think a carefully named bare Pod in production is "simpler than a Depl
 $ kind create cluster --name workloads --image kindest/node:v1.36.0
 ```
 
-All of these store desired state in the API and reconcile forever (or until Job completion).
+All of them store your desired state in the API and keep working toward it forever — or until the Job finishes.
 
 ```mermaid
 flowchart TB
@@ -57,7 +61,7 @@ flowchart TB
 
 **Ownership:** app teams own Deployment/StatefulSet/Job manifests; platform bans long-lived bare Pods via admission.
 
-Ban long-lived bare Pods via policy. Every app Pod should have an ownerReference to a controller. Exceptions (debug Pods) must be namespaced and TTL'd.
+Block long-lived bare Pods with admission policy. Every application Pod should carry an `ownerReference` pointing at a controller. Allow exceptions only for debug Pods, and only in a dedicated namespace where they expire on their own.
 
 > 🏭 **Production floor:** Never ship bare Pods as the production shape. Policy should reject Pods without a controlling owner except break-glass debug namespaces. Pair every multi-replica Deployment with a **PodDisruptionBudget** before the first node drain (details in Chapter 24)—hooks help one Pod leave; PDBs keep enough Pods available.
 
@@ -75,15 +79,17 @@ Ban long-lived bare Pods via policy. Every app Pod should have an ownerReference
 
 ### In plain terms
 
-A **ReplicaSet** only cares about arithmetic: enough Pods with the right labels? If not, create or delete. The problem it solves is holding a replica count—Deployments layer rollout strategy and history on top.
+A **ReplicaSet** does one thing: it counts. Are there enough Pods with the right labels? If not, it creates some. Too many? It deletes some. That is all.
 
-You might think you should edit ReplicaSets directly during an incident. The Deployment controller owns them and will fight you; use `kubectl rollout` against the Deployment instead.
+You care because a ReplicaSet is one half of every Deployment. The ReplicaSet holds the number of copies. The Deployment sits above it and handles *changing* versions safely, plus keeping a history you can go back to.
+
+You might think you should edit a ReplicaSet directly during an incident. Do not. The Deployment above it owns it and will undo your change within seconds. Run `kubectl rollout` against the Deployment instead.
 
 > ⚠️ **Common Pitfall:** Editing a ReplicaSet under a live Deployment "to fix replicas." The Deployment reconciles and overwrites your fix—or leaves you with a confusing revision.
 
 ### Under the hood
 
-You rarely create ReplicaSets by hand—Deployments own them. Still, understand the shape:
+You rarely write a ReplicaSet by hand, since Deployments create them for you. It still helps to know the shape:
 
 ```yaml
 apiVersion: apps/v1
@@ -107,7 +113,7 @@ spec:
           image: ghcr.io/mastering-k8s/task-api:1.0
 ```
 
-Selector labels must match the template labels. Mismatch is rejected or orphan-prone depending on how you got there—never "almost match."
+The selector labels must match the template labels exactly. A near-match is either rejected outright or leaves you with Pods nothing owns, depending on how you got there. Never settle for "almost matching."
 
 ```bash
 $ kubectl get rs -l app=task-api
@@ -124,7 +130,7 @@ task-api-7d9f8c5b64   3         3         3       10m
 
 **Ownership:** Deployment controller owns ReplicaSets; humans own the Deployment manifest.
 
-Do not manage ReplicaSets directly when a Deployment exists—you will fight the Deployment controller. Use `kubectl rollout` against Deployments.
+Never manage a ReplicaSet directly while a Deployment owns it. You will lose that argument with the Deployment controller. Use `kubectl rollout` against the Deployment instead.
 
 **Before you leave this section**
 
@@ -138,9 +144,15 @@ Do not manage ReplicaSets directly when a Deployment exists—you will fight the
 
 ### In plain terms
 
-A **Deployment** is how most HTTP APIs and workers ship: replica count, Pod template, and a strategy for replacing old Pods with new ones. The problem it solves is shipping new images without deleting the Service or inventing a custom rollout script.
+A **Deployment** is the object you write to run a stateless app. It holds three things: how many copies you want, the Pod template to copy, and the rules for swapping old Pods out for new ones.
 
-You might think changing the image tag is enough for a safe rollout. Without readiness probes, Kubernetes may mark new Pods Ready immediately and serve errors while the rollout "succeeds."
+This is what makes shipping a new version boring. Change the image in one field, apply, and the Deployment brings up new Pods and retires old ones a few at a time. Nobody deletes the Service, and nobody writes a custom rollout script.
+
+Here is how the pieces stack. Your Deployment creates a ReplicaSet for each version. The ReplicaSet keeps its own Pod count. When you change the image, the Deployment makes a *new* ReplicaSet and shrinks the old one. Both exist for a while, which is exactly why you can go back.
+
+> 💡 **In one line:** A ReplicaSet keeps N identical Pods alive; a Deployment manages several ReplicaSets over time so you can change versions and undo the change.
+
+You might think changing the image tag is enough for a safe rollout. It is not. Without a readiness probe, Kubernetes counts a new Pod as Ready the moment it starts, so it can send traffic to a Pod that is still broken while the rollout reports success.
 
 > ⚠️ **Common Pitfall:** Rolling without readiness probes and celebrating `kubectl rollout status` while users see 5xx.
 
@@ -189,7 +201,7 @@ deployment.apps/task-api created
 $ kubectl get deploy,rs,pods -l app=task-api
 ```
 
-Change `image` to `:1.1` and re-apply—the Deployment creates a new ReplicaSet and rolls traffic as readiness passes.
+Change `image` to `:1.1` and apply again. The Deployment creates a second ReplicaSet and moves traffic over as each new Pod passes its readiness probe.
 
 ```mermaid
 flowchart TB
@@ -210,10 +222,10 @@ flowchart TB
 
 **Ownership:** app teams own Deployment specs and image digests; platform may enforce digest pinning and required probes via policy.
 
-1. Always set readiness probes before relying on RollingUpdate.
+1. Always add a readiness probe before you trust RollingUpdate.
 2. Pin images by digest in regulated environments.
-3. Record `app.kubernetes.io/*` labels on template and Deployment.
-4. Use PodDisruptionBudgets so voluntary drains cannot take all replicas.
+3. Put the `app.kubernetes.io/*` labels on both the Deployment and its Pod template.
+4. Add a PodDisruptionBudget so a planned node drain cannot take every replica at once.
 
 > 🏭 **Production floor:** Digest pin the container image (`@sha256:…`) in production Deployments. Promote digests through environments; roll back by re-applying the previous digest—not by guessing tags. Before any node drain, confirm a PDB covers this Deployment (Chapter 24).
 
@@ -231,9 +243,11 @@ flowchart TB
 
 ### In plain terms
 
-Rollouts replace Pods gradually. If the new version is bad, **rollback** returns you to a previous ReplicaSet revision. The problem this solves is shipping without a big-bang cutover—and undoing without rebuilding from memory.
+A **rollout** replaces Pods a few at a time instead of all at once. A **rollback** puts you back on an earlier version by switching to the ReplicaSet that version left behind.
 
-You might think rollback is "git revert the manifest only." `kubectl rollout undo` switches ReplicaSets immediately; Git should still catch up so the next apply does not re-break you.
+Both exist so that shipping is reversible. You never flip the whole service at one instant, and when a release turns out to be bad, you do not rebuild the old version from memory under pressure. The old ReplicaSet is still sitting there, ready.
+
+You might think a rollback means reverting the manifest in Git. `kubectl rollout undo` is faster and switches ReplicaSets right away, which is what you want at 2 a.m. But Git must catch up afterward, or the next `apply` will happily redeploy the broken version.
 
 > ⚠️ **Warning:** Without readiness probes, Kubernetes may roll "successfully" while serving errors. Probes are part of the rollout contract.
 
@@ -247,7 +261,7 @@ $ kubectl rollout undo deployment/task-api
 $ kubectl rollout undo deployment/task-api --to-revision=2
 ```
 
-`maxSurge` allows extra Pods during the update; `maxUnavailable` limits how many may be down. `Recreate` strategy kills all old Pods first—simple but downtime-heavy; use for stubborn singleton locks, not public APIs.
+Two numbers control the pace. `maxSurge` is how many extra Pods may exist during the update. `maxUnavailable` is how many may be missing at once. The `Recreate` strategy skips all of that and stops every old Pod before starting the new ones — simple, but it means downtime. Use it for software that cannot tolerate two versions holding the same lock, never for a public API.
 
 ```mermaid
 flowchart LR
@@ -264,7 +278,7 @@ strategy:
   type: Recreate
 ```
 
-Pause/resume for canary-style manual gates:
+You can also stop a rollout partway through, check on it, and then let it continue:
 
 ```bash
 $ kubectl rollout pause deployment/task-api
@@ -277,7 +291,7 @@ $ kubectl rollout resume deployment/task-api
 
 **Ownership:** app/SRE teams own rollout parameters; platform alerts on `ProgressDeadlineExceeded`.
 
-Alert on `ProgressDeadlineExceeded`. Keep `revisionHistoryLimit` high enough for undo, low enough not to clutter. Prefer progressive delivery tools (Argo Rollouts, Flagger) when you need true canaries—but master vanilla rollouts first.
+Alert on `ProgressDeadlineExceeded`. Keep `revisionHistoryLimit` big enough that you can still undo, and small enough that the list stays readable. When you need real **canary** releases — sending a small slice of traffic to the new version first — reach for Argo Rollouts or Flagger. Learn plain rollouts first.
 
 **Before you leave this section**
 
@@ -291,15 +305,17 @@ Alert on `ProgressDeadlineExceeded`. Keep `revisionHistoryLimit` high enough for
 
 ### In plain terms
 
-**StatefulSets** are for software that cares *who* it is: databases, queues, and consensus members that need stable DNS names and sticky disks. The problem they solve is identity across reschedule—`task-db-0` must keep its PVC and DNS even when the Pod moves nodes.
+A **StatefulSet** runs Pods that each have a fixed name, a fixed DNS address, and their own disk. Pod `task-db-0` stays `task-db-0`, keeps the same storage, and keeps the same address even after it moves to another node.
 
-You might think "important apps should use StatefulSets." Importance is not identity. Stateless APIs belong on Deployments; StatefulSets add ordered rollout and PVC coupling you must operate.
+You need this for software that cares *which* instance it is. A database replica, a queue broker, or a member of a consensus group all track each other by name. If names shuffle on every restart, the cluster cannot form. A Deployment gives you interchangeable Pods with random names, which is the opposite of what these need.
+
+You might think important applications should use StatefulSets. Importance is not the test — identity is. A stateless API belongs on a Deployment. A StatefulSet brings ordered rollouts and a disk per Pod, and both of those are extra things you have to operate.
 
 > ⚠️ **Common Pitfall:** Scaling a StatefulSet down without understanding PVC retention—data volumes may remain (good) while ordinals disappear (confusing) or get deleted (catastrophic) depending on policy.
 
 ### Under the hood
 
-Pods get ordinal names (`task-db-0`, `task-db-1`) and stable network identities via a **headless Service**. `volumeClaimTemplates` create a PVC per ordinal.
+Pods are numbered (`task-db-0`, `task-db-1`) and get a stable DNS name from a **headless Service**, which is a Service with no cluster IP that returns the individual Pod addresses instead. The `volumeClaimTemplates` field creates one PersistentVolumeClaim per numbered Pod.
 
 ```yaml
 apiVersion: v1
@@ -347,7 +363,7 @@ spec:
             storage: 10Gi
 ```
 
-DNS: `task-db-0.task-db.default.svc.cluster.local`. Updates and scaling are ordered by default (`OrderedReady`); `Parallel` policy trades safety for speed.
+Each Pod gets its own DNS name, like `task-db-0.task-db.default.svc.cluster.local`. By default, updates and scaling happen one Pod at a time, in order (`OrderedReady`). The `Parallel` policy does them all at once, which is faster and less safe.
 
 ```mermaid
 flowchart LR
@@ -364,7 +380,7 @@ flowchart LR
 
 **Ownership:** data/platform teams often own database StatefulSets or operators; app teams rarely should roll their own Postgres HA from a raw StatefulSet alone.
 
-Do not use StatefulSets just because "it sounds serious." Prefer Deployments for truly stateless APIs. For databases, still run operators or proven charts when possible—StatefulSet gives primitives, not automatic Postgres HA. Understand PVC retention (`whenDeleted` / `whenScaled` policies) before scaling down.
+Do not reach for a StatefulSet because it sounds serious. Use a Deployment for anything genuinely stateless. For databases, run a proven operator or chart where one exists: a StatefulSet gives you building blocks, not working Postgres failover. Read the PVC retention policies (`whenDeleted` and `whenScaled`) before you ever scale one down.
 
 **Before you leave this section**
 
@@ -378,9 +394,11 @@ Do not use StatefulSets just because "it sounds serious." Prefer Deployments for
 
 ### In plain terms
 
-A **DaemonSet** plants a daemon on every (eligible) node—log agents, node exporters, CNI helpers, storage plugins. The problem it solves is tracking node membership automatically as the cluster grows or shrinks.
+A **DaemonSet** runs exactly one copy of a Pod on every node that qualifies. Add a node and a Pod appears there. Remove a node and its Pod goes away with it.
 
-You might think setting Deployment replicas equal to node count is equivalent. Nodes join and leave; Deployments do not track that, and may pack multiple agents on one node.
+You need this for anything that has to watch the machine it runs on: log collectors, metrics agents, CNI network helpers, and storage plugins. Each one must be present on every node, or you get blind spots.
+
+You might think you can just set a Deployment's replicas to the number of nodes. That breaks quickly. Nodes join and leave, and a Deployment does not notice. It may also place two agents on one node and none on another, because it only counts Pods.
 
 > ⚠️ **Common Pitfall:** Forgetting tolerations so agents never run on control-plane or tainted GPU nodes where you needed them.
 
@@ -411,7 +429,7 @@ spec:
               memory: "64Mi"
 ```
 
-Tolerate control-plane taints if the agent must run everywhere. Use `nodeSelector` / affinity to limit to GPU nodes or bare-metal pools.
+If the agent truly must run everywhere, it needs tolerations for the control-plane taints. To go the other way and cover only some nodes, use `nodeSelector` or affinity — for example, only GPU nodes or only a bare-metal pool.
 
 **What breaks if DaemonSet memory requests are huge:** you shrink allocatable capacity on every node—schedule failures cascade for ordinary apps.
 
@@ -419,7 +437,7 @@ Tolerate control-plane taints if the agent must run everywhere. Use `nodeSelecto
 
 **Ownership:** platform owns logging/metrics/CNI DaemonSets; app teams rarely create them.
 
-Budget DaemonSet resources carefully—they multiply by node count. Rolling update strategy (`RollingUpdate` vs `OnDelete`) matters for agents that must not vanish during upgrades. Prefer DaemonSets over static Pods for add-ons you manage via the API.
+Budget DaemonSet resources carefully, because whatever you request is charged on every single node. Choose the update strategy on purpose too: `RollingUpdate` replaces agents automatically, while `OnDelete` waits for you, which matters for agents that must not disappear mid-upgrade. For add-ons you want to manage through the API, use a DaemonSet rather than static Pods.
 
 **Before you leave this section**
 
@@ -433,9 +451,11 @@ Budget DaemonSet resources carefully—they multiply by node count. Rolling upda
 
 ### In plain terms
 
-A **Job** runs work until it succeeds (or hits backoff limits)—migrations, batch reports, one-shot transforms. The problem it solves is finite work with retries without leaving a long-running Deployment that has nothing to do.
+A **Job** runs a task until it finishes successfully, then stops. If the task fails, the Job retries it up to a limit you set.
 
-You might think a Deployment with `restartPolicy: Always` is fine for migrations. Migrations need completion counting and backoff limits; Jobs exist for that shape.
+You need this for work that ends: a database migration, a nightly report, a one-time data transform. A Deployment is built to run forever and restart anything that exits, which is exactly wrong for work that is supposed to exit. A Job counts successes instead, and gives up after too many failures rather than looping forever.
+
+You might think a Deployment can handle a migration. It cannot count completions, and it cannot stop trying. That is why the Job API exists.
 
 > ⚠️ **Common Pitfall:** Non-idempotent Jobs that retry and double-apply a migration—design for at-least-once execution.
 
@@ -462,7 +482,7 @@ $ kubectl apply -f task-migrate.yaml
 $ kubectl wait --for=condition=complete job/task-migrate --timeout=120s
 ```
 
-`completions` and `parallelism` control how many successful Pods you need and how many run at once. `ttlSecondsAfterFinished` cleans finished Jobs.
+Two fields control the shape of the work. `completions` is how many Pods must succeed. `parallelism` is how many may run at the same time. Set `ttlSecondsAfterFinished` and Kubernetes deletes the finished Job for you.
 
 **What breaks if `restartPolicy: Always` is set on a Job Pod template:** the API rejects it—Jobs allow `Never` or `OnFailure` only.
 
@@ -470,7 +490,7 @@ $ kubectl wait --for=condition=complete job/task-migrate --timeout=120s
 
 **Ownership:** app teams own migration Jobs in release pipelines; platform may enforce TTL cleanup.
 
-Make tasks idempotent—Jobs retry. Set active deadlines for runaway batches. Do not use Deployments for one-shot migrations; do not use Jobs for long-running servers.
+Write every task so running it twice is safe, because Jobs do retry. Set `activeDeadlineSeconds` so a runaway batch cannot run all night. Never use a Deployment for a one-shot migration, and never use a Job for a long-running server.
 
 **Before you leave this section**
 
@@ -484,9 +504,11 @@ Make tasks idempotent—Jobs retry. Set active deadlines for runaway batches. Do
 
 ### In plain terms
 
-A **CronJob** is the cluster's crontab: at this schedule, create a Job. The problem it solves is recurring batch work without an external scheduler VM.
+A **CronJob** creates a Job on a schedule you write in cron syntax. It is the cluster's version of a crontab entry.
 
-You might think overlapping runs are fine. Database-heavy reports often are not—set `concurrencyPolicy: Forbid` unless overlap is safe.
+You need it so recurring work lives in the cluster with everything else. The alternative is a separate machine running cron, which nobody patches, nobody monitors, and everybody forgets until it silently stops firing.
+
+You might think overlapping runs are harmless. For a heavy report against a shared database, two runs at once can be much worse than one run being late. Set `concurrencyPolicy: Forbid` unless you have checked that overlap is safe.
 
 > ⚠️ **Common Pitfall:** Ignoring `concurrencyPolicy` on CronJobs → overlapping Jobs stampede the database.
 
@@ -513,7 +535,7 @@ spec:
               command: ["python", "report.py"]
 ```
 
-`concurrencyPolicy`: `Allow`, `Forbid`, or `Replace`. Timezone fields exist on modern CronJobs—pin timezone explicitly in multi-region platforms.
+`concurrencyPolicy` takes three values: `Allow` lets runs overlap, `Forbid` skips a run while the last one is still going, and `Replace` cancels the old run in favor of the new one. Modern CronJobs also accept a time zone, and you should set it explicitly on any platform that spans regions.
 
 **What breaks if the controller is down across the schedule window:** Jobs may be missed unless `startingDeadlineSeconds` and catch-up behavior are understood—alert on missed schedules.
 
@@ -521,7 +543,7 @@ spec:
 
 **Ownership:** app teams own schedules; platform monitors CronJob controller health.
 
-Alert on missed schedules (`startingDeadlineSeconds`). Keep history limits finite. Remember suspended CronJobs (`spec.suspend: true`) during incidents.
+Alert on schedules that never fired, and set `startingDeadlineSeconds` so you know when a missed run is skipped. Keep the history limits finite so old Jobs do not pile up. And write down every CronJob you suspend (`spec.suspend: true`) during an incident, so someone turns it back on afterward.
 
 **Before you leave this section**
 
@@ -535,9 +557,11 @@ Alert on missed schedules (`startingDeadlineSeconds`). Keep history limits finit
 
 ### In plain terms
 
-**HPA** watches metrics and turns the replica dial on a Deployment (or similar) so capacity tracks load. The problem it solves is manual scaling lag—traffic rises, replicas should follow within policy, then shrink carefully.
+The **HorizontalPodAutoscaler** (HPA) watches a metric, such as CPU use, and changes the replica count on a Deployment to match the load.
 
-You might think HPA uses percent of limits. Utilization is percent of **requests**—missing requests makes HPA meaningless or dangerous.
+You need it because people scale too slowly. Traffic rises at 9 a.m. and nobody notices until the queue backs up. The HPA adds Pods within a minute, inside limits you set, and removes them again carefully when load drops.
+
+You might think the target percentage is measured against your CPU *limit*. It is not. Utilization is a percentage of the **request**. A container with no CPU request has no denominator, so the math is meaningless and the scaling decisions that follow can be dangerous.
 
 > ⚠️ **Common Pitfall:** HPA without resource requests → metrics nonsense and surprise scale decisions.
 
@@ -564,7 +588,7 @@ spec:
           averageUtilization: 70
 ```
 
-Requires metrics-server (or compatible metrics pipeline). Custom and external metrics unlock queue depth and business SLIs.
+This needs metrics-server, or another component that serves the same metrics API. With custom and external metrics you can scale on things that matter more than CPU, such as queue depth or requests per second.
 
 ```mermaid
 flowchart LR
@@ -586,7 +610,7 @@ $ kubectl get hpa task-api -w
 
 **Ownership:** app/SRE own HPA targets; platform owns metrics-server SLOs.
 
-Set requests accurately—utilization is percent of request, not of limit. Pair with PodDisruptionBudgets. Prefer scale-down stabilization windows to avoid flapping. Vertical scaling (VPA / in-place resize) is complementary, not a drop-in replacement for HPA.
+Set requests accurately, because utilization is measured against the request and not the limit. Pair every HPA with a PodDisruptionBudget. Use a scale-down stabilization window so the replica count does not bounce up and down. Vertical scaling (VPA or in-place resize) sits alongside the HPA; it does not replace it.
 
 > 🏭 **Production floor:** Before cluster upgrades or node drains, confirm PDBs still allow voluntary disruption given current HPA replica counts. A PDB of `minAvailable: 2` with HPA at 2 replicas can block drains until you scale up—by design, not a bug.
 
@@ -691,11 +715,15 @@ Accurate CPU **requests** (and a metrics pipeline such as metrics-server). Utili
 
 ## 14.14 Key takeaways
 
-- Controllers reconcile Pod counts and lifecycles; bare Pods are demos.
-- **Deployments** dominate stateless delivery—probes make rolling updates honest.
-- **StatefulSets**, **DaemonSets**, **Jobs**, and **CronJobs** cover identity, per-node, and batch shapes.
-- **HPA** scales replicas from metrics; requests and PDBs make it safe.
-- Pick the workload API for the problem—do not stretch Deployments into databases or Jobs into servers.
+- A controller holds the promise that your Pods exist. A bare Pod is a demo.
+- A **ReplicaSet** keeps a count. A **Deployment** manages ReplicaSets so you can change versions and undo.
+- A readiness probe is what makes a rolling update honest. Without one, rollouts "succeed" while users get errors.
+- `kubectl rollout undo` fixes production fast; update Git right after, or the next apply breaks it again.
+- Use a **StatefulSet** only when instances need names and their own disks.
+- Use a **DaemonSet** when every node needs one copy. Its resource requests are charged per node.
+- Use a **Job** for work that ends, and a **CronJob** for work that repeats. Make both safe to retry.
+- **HPA** scales on a percentage of *requests*, so requests must be set and accurate.
+- Pick the API that matches the problem. Do not stretch a Deployment into a database or a Job into a server.
 
 ---
 

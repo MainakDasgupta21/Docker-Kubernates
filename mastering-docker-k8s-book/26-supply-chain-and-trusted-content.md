@@ -4,18 +4,22 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Use Docker Scout to analyze images and compare vulnerability changes
-> - Explain where Docker Hardened Images fit in a base-image strategy
-> - Distinguish image signing from SBOM and provenance attestations
-> - Verify image identity with Cosign or Notation
-> - Design registry and deployment policy gates around immutable digests
-> - Consume an SBOM during vulnerability response, licensing review, and audits
+> - Use Docker Scout to see what is wrong with an image and how a new release compares
+> - Explain when a hardened base image helps and what it still leaves you to do
+> - Tell signing apart from SBOM and provenance, and say what each one proves
+> - Check that an image was signed by the identity you expect, using Cosign or Notation
+> - Build gates that let only approved images reach production, keyed to the digest
+> - Use an SBOM to answer "are we affected?" during a security incident
 
 ## 26.1 Trust Is a Chain of Evidence
 
-A container image can run correctly and still be unfit for production. It may contain a critical vulnerable library, come from an unexpected build system, use an unapproved base image, or have been replaced after review.
+An image can start up, pass every test, serve traffic correctly, and still have no business running in production.
 
-Supply-chain security turns "we built this" into a series of testable claims:
+It might contain a library with a serious known flaw. It might have been built on somebody's laptop instead of by your pipeline. It might sit on a base image nobody approved. Or the tag you reviewed last week might now point at completely different bytes.
+
+None of that shows up when you run it. The container works. That is the whole problem: correctness and trustworthiness are separate questions, and only one of them is answered by "it starts."
+
+**Supply-chain security** is the practice of answering the second question with evidence instead of assumption. It replaces "we built this, it should be fine" with a set of claims you can actually test:
 
 1. **Identity** — which immutable digest is being evaluated?
 2. **Origin** — which source, builder, and process produced it?
@@ -24,7 +28,7 @@ Supply-chain security turns "we built this" into a series of testable claims:
 5. **Authorization** — did an approved person or workload sign it?
 6. **Policy** — does the evidence satisfy this environment's rules?
 
-No single product answers every question. Docker Scout analyzes content and policy posture. Docker Hardened Images provide a curated base-image option with signed evidence. Cosign and Notation verify signatures and identities. Registries and admission controls enforce decisions before untrusted content reaches production.
+No single tool answers all six. Docker Scout looks at what is inside an image and whether it meets your rules. Docker Hardened Images give you a maintained base with evidence already attached. Cosign and Notation check signatures and who created them. Registries and admission controllers are where the decision gets enforced, before anything runs.
 
 ```mermaid
 flowchart LR
@@ -51,17 +55,21 @@ flowchart LR
 
 ### In plain terms
 
-Docker Scout creates an inventory of an image and correlates its packages with vulnerability data. It helps answer which vulnerabilities exist, where they came from, whether a newer base image improves the result, and whether an image passes configured policies.
+**Docker Scout** lists every package inside an image and matches those packages against published vulnerability data. A **CVE** is one such published flaw — Common Vulnerabilities and Exposures, the industry's shared numbering system for security bugs.
 
-Scout is not merely a "critical count." A useful review considers exploitability, package location, available fixes, base-image lineage, exceptions, and whether the analyzed digest is the digest that will be deployed.
+Why run it? Because you did not write most of what is in your image. A Python service is a few hundred lines of your code sitting on top of thousands of packages from a base image and a dependency list. Scout tells you which of those have known problems, which ones already have a fix available, and whether a newer base image would clear several at once.
 
-Scout analyzes images for CVEs and policy issues against your repos. It helps prioritize remediation, not magically patch running clusters. You might think a green Scout local scan equals prod safety—prod must run the same digest you scanned.
+What it will not do is fix anything. Scout is a report. Turning the report into safety requires you to rebuild, retest, and redeploy — and that gap is where most of the real work lives.
+
+Resist reading the output as a single number. "Four criticals" tells you almost nothing. What matters is whether the vulnerable code is reachable from outside, whether a fix exists yet, whether it came from your base image or your own dependency list, and how a new release compares with the one already running.
+
+One more thing to check, and it is the one people miss. Scanning `task-api:latest` on your laptop tells you about whatever bytes that tag pointed at when you pulled it. Production may be running something else entirely. Scan the exact digest you intend to deploy.
 
 > ⚠️ **Common Pitfall:** Scanning `:latest` locally while prod runs an older digest.
 
 ### Under the hood
 
-Analyze a local or registry image:
+Here are the commands, from a quick look to a full policy check. Analyze a local or registry image:
 
 ```bash
 $ docker scout quickview registry.example.com/textbook/task-api:1.4.0
@@ -98,9 +106,9 @@ Replace the placeholder with a real digest resolved by the build. Policy capabil
 
 ### In production
 
-**Ownership:** App teams remediate findings; security owns severity gates in CI.
+**Ownership:** App teams fix the findings in their own images. The security team sets the severity thresholds that CI enforces.
 
-**Failure mode:** Critical CVE in prod digest. Detect with continuous registry scanning on deployed digests. Mitigate with digest promote and rebuild SLAs.
+**Failure mode:** A critical vulnerability is disclosed for something already running in production. Detect it by continuously rescanning the digests that are actually deployed, not just the ones being built. Respond with a promotion path that moves one tested digest forward and an agreed deadline for how fast a critical fix must ship.
 
 | Do | Don't |
 |----|-------|
@@ -120,15 +128,19 @@ Replace the placeholder with a real digest resolved by the build. Policy capabil
 
 ### In plain terms
 
-Docker Hardened Images, or DHI, are security-focused images maintained by Docker. They emphasize minimal contents, reduced attack surface, frequent updates, and verifiable supply-chain metadata.
+**Docker Hardened Images**, or **DHI**, are base images that Docker maintains with security as the main goal. They contain as little as possible, they are updated often, and they ship with signed evidence about their contents already attached.
 
-They can reduce the work involved in producing and documenting a trusted base. They do not make the application layered on top automatically secure, and access to particular images or features may require an appropriate Docker subscription.
+Why start from one? Because most of the vulnerabilities in a typical image are not yours. They come from the operating system packages in the base — a shell, a package manager, text utilities, libraries your app never calls. Remove what you do not need and two things improve at once: there is less for an attacker to use after a break-in, and there are far fewer findings for your team to triage every week.
 
-Hardened/minimal base images reduce attack surface and CVE noise. Switching bases is a rebuild+test change, not a tag swap. You might think distroless means “no debugging forever”—plan ephemeral debug differently.
+Some of these bases are **distroless**, meaning they contain the runtime for your language and essentially nothing else. No shell. No package manager. That is the point, and it is also the surprise.
+
+Two consequences follow, and both cost people a rollout. Anything in your setup that quietly assumed a shell stops working — a health check written as a shell command, an entrypoint that runs a small script, a container you were used to opening with `exec` to look around. And changing base image is not a one-line edit; it is a rebuild plus a real test cycle. Plan how you will debug before you remove the shell, not after.
 
 > ⚠️ **Common Pitfall:** Moving to distroless without fixing shell-based healthchecks and entrypoints.
 
 ### Under the hood
+
+Here is the pattern that makes a minimal runtime work, plus how to check its evidence.
 
 DHI repositories are distributed through Docker's hardened-image service and include variants suited to different build and runtime needs. A minimal runtime variant may omit a shell and package manager. That removes tools an attacker could abuse, but it also changes debugging and installation assumptions.
 
@@ -167,9 +179,9 @@ $ docker scout attest get \
 
 ### In production
 
-**Ownership:** Platform may publish approved bases; app teams rebase and test.
+**Ownership:** The platform team publishes the list of approved base images. App teams move to them and test the result.
 
-**Failure mode:** Broken entrypoint after rebase → rollout failure. Detect in staging soak. Mitigate with approved base catalog and compatibility checklist.
+**Failure mode:** After changing base images the entrypoint or health check breaks, and the rollout fails. Catch it during a soak period in staging rather than in production. Reduce the risk with a maintained catalog of approved bases and a short compatibility checklist covering shell use, user IDs, and file paths.
 
 | Do | Don't |
 |----|-------|
@@ -189,9 +201,13 @@ $ docker scout attest get \
 
 ### In plain terms
 
-A signature binds an identity or key to a digest. Verification asks whether the signature is cryptographically valid and whether the signer matches policy.
+A **signature** is a cryptographic mark that ties a known identity to one exact image. **Verification** is the check that runs later, and it has two halves: is the signature mathematically valid, and is the signer someone you actually approved?
 
-An SBOM says what is inside. Provenance says how a build happened. A signature says an approved identity endorsed particular bytes or a particular statement. These controls complement one another.
+Why is a signature worth adding on top of everything else? Because scanning and provenance both describe an image, and neither one says "we agreed to ship this." A signature is the endorsement. It is how a cluster can tell an image your release pipeline produced from an identical-looking image somebody pushed by hand.
+
+Keep the three straight, because they answer three different questions. An SBOM says *what is inside*. Provenance says *how it was made*. A signature says *who approved it*. You want all three, and none substitutes for another.
+
+One thing a signature explicitly does not mean: that the code is good. It proves the publisher is who they claim to be. A trusted publisher can sign an image full of bugs, and the signature will verify perfectly.
 
 ```mermaid
 flowchart TB
@@ -207,15 +223,15 @@ flowchart TB
 
 *Figure 26.2: SBOM, provenance, and signature answer different questions that policy combines into one decision.*
 
-Cosign is part of Sigstore and supports key-based and keyless signing. Notation is a CNCF Notary Project tool implementing the Notary Project signature model. Both store signatures as OCI-related artifacts in supporting registries, but their trust-policy formats and ecosystems differ.
+Two tools dominate. **Cosign** is part of the Sigstore project and supports both traditional keys and **keyless signing**, where a short-lived certificate is issued to a verified workload identity so there is no private key sitting around to be stolen. **Notation** comes from the CNCF Notary Project and implements its own signature model. Both store signatures in the registry alongside the image, but their trust policies are written differently and are not interchangeable.
 
-Sign digests (Notary/cosign/etc.); verify at admit/deploy time. Signing without verification is incomplete. You might think signature proves “safe code”—it proves identity of builder/publisher, not absence of bugs.
+Here is the mistake that makes all of this pointless. Teams sign images in CI, verify the signature in the very next CI step, and consider themselves done — while the cluster happily runs whatever image a manifest names. Signing is worth nothing without verification at the moment something is admitted to run.
 
 > ⚠️ **Common Pitfall:** Verifying signatures only in CI while the cluster admits unsigned digests.
 
 ### Under the hood
 
-First resolve and retain the immutable digest after pushing:
+Here is the sequence with both tools. First resolve and retain the immutable digest after pushing:
 
 ```bash
 $ docker buildx imagetools inspect \
@@ -260,9 +276,9 @@ $ notation verify \
 
 ### In production
 
-**Ownership:** Security/platform own signing keys and admission verify; CI signs on build.
+**Ownership:** The security and platform teams own the signing keys and the verification rule at admission. CI does the signing as part of the release build.
 
-**Failure mode:** Unsigned or wrong identity admitted. Detect with admission denials and registry audits. Mitigate with enforce mode after warn soak.
+**Failure mode:** An unsigned image, or one signed by the wrong identity, gets admitted and runs. Detect it by watching admission denials and by auditing what the registry actually holds. Roll the control out by warning first, fixing what breaks, then switching to enforce.
 
 | Do | Don't |
 |----|-------|
@@ -282,17 +298,23 @@ $ notation verify \
 
 ### In plain terms
 
-A policy gate converts evidence into a decision: allow, warn, quarantine, or reject. The registry is a useful collection point, but a registry scan alone cannot guarantee that only approved content runs. Enforcement should also occur near deployment.
+A **policy gate** is the point where all that evidence turns into a decision: allow it, warn about it, quarantine it, or refuse it outright. Without a gate, everything earlier in this chapter is just data collection.
 
-Promotion is safer than rebuilding. The same tested digest moves from a development repository or label to a production-approved location while evidence remains attached.
+**Digest promotion** is the practice these gates protect. You build an image once, and from then on you move that exact digest through your environments — dev, then staging, then production — instead of rebuilding at each stage.
 
-Gates block deploy unless scan/sign/attestation policy passes. This is change safety for artifacts. You might think registry ACLs alone are enough—clusters need admission policy too.
+> 💡 **In one line:** Build once and promote the same digest everywhere, because the moment you rebuild for production you are shipping bytes nobody scanned, tested, or signed.
+
+Why does rebuilding break things? Because a rebuild produces different bytes. Base images shift, package mirrors update, timestamps change. The result may be fine, but it is not the artifact your tests passed against, and your scan result and signature both belong to the old one. Promotion keeps the evidence and the artifact attached to each other.
+
+Where the gate lives matters too. Registry permissions control who can push, but they cannot stop a cluster from pulling something unapproved. You need a check at admission, right before a Pod is allowed to start.
+
+Finally, keep the rules consistent across environments. When staging enforces something production does not, or the other way round, people learn to route around whichever one is stricter. Same evidence, same gates, one promotion path.
 
 > ⚠️ **Common Pitfall:** Different rules in staging vs prod without a promotion path—teams learn to bypass staging.
 
 ### Under the hood
 
-A release policy can require all of the following:
+Here is what a release policy actually checks:
 
 ```text
 Identity:
@@ -346,9 +368,9 @@ sequenceDiagram
 
 ### In production
 
-**Ownership:** Platform owns gate enforcement; app teams fix failing evidence.
+**Ownership:** The platform team owns the gates and keeps them enforcing. App teams fix whatever evidence is missing rather than asking for an exception.
 
-**Failure mode:** Bypass → unreviewed digest in prod. Detect with admission audit. Mitigate with break-glass that still logs and expires.
+**Failure mode:** Someone routes around the gate and an unreviewed image reaches production. Detect it by auditing what admission actually allowed, not what the pipeline claims it shipped. Keep the emergency path safe by making the break-glass route log who used it and expire on its own.
 
 | Do | Don't |
 |----|-------|
@@ -370,17 +392,19 @@ sequenceDiagram
 
 ### In plain terms
 
-Generating an SBOM is only inventory creation. Consuming it means using that inventory to answer operational questions: Are we affected by this vulnerability? Do we ship a prohibited license? Which image contains this package? What changed between releases?
+Producing an SBOM is the easy half. **Consuming** one means using that list to answer a real question under time pressure: are we affected by this vulnerability, which image contains this package, do we ship a license our lawyers prohibit, what changed between these two releases?
 
-An SBOM is a snapshot associated with a specific image digest. It becomes stale only when interpreted against changing external knowledge; the component list for immutable bytes does not change.
+Why does this deserve its own section? Because the difference between a two-minute answer and a two-day answer is entirely about preparation. At 9 a.m. a serious flaw is announced in a common library. If your SBOMs are stored next to your images and searchable by digest, someone runs a query and names the affected services before the first meeting. If they are not, every team starts grepping their own dependency files.
 
-SBOMs answer “what’s inside?” for incident CVE response. Store and query them by digest. You might think generating SBOM at build is enough—on-call must know where to fetch it in five minutes.
+Note what does and does not go stale here. The list of packages in a fixed set of bytes never changes. What changes is the outside world's knowledge about those packages. That is why you keep the SBOM and rescan it later, rather than regenerating it.
+
+The common failure is storage. An SBOM attached to a CI job log is gone in two weeks. The image it describes may run for two years. Store it where the image lives, keyed to the digest, and make sure your on-call runbook says exactly how to fetch it.
 
 > ⚠️ **Common Pitfall:** SBOMs in CI logs that expire in 14 days while images live for years.
 
 ### Under the hood
 
-Common formats include SPDX and CycloneDX. Tools differ in package coverage and identifiers, so preserve format, generator, version, subject digest, and creation time.
+Here is how to retrieve and search one. Common formats include SPDX and CycloneDX. Tools differ in package coverage and identifiers, so preserve format, generator, version, subject digest, and creation time.
 
 Docker Scout can retrieve SBOM-related attestations where available:
 
@@ -399,13 +423,13 @@ Predicate types vary by producer. List attestations first rather than assuming t
 
 During an incident, query the SBOM for package names, package URLs, versions, and file evidence. A name-only match can produce false positives because ecosystems reuse names. Package URL, namespace, version, architecture, and dependency path provide stronger identification.
 
-VEX complements an SBOM by communicating whether a known vulnerability affects the product under stated conditions. VEX is an assertion requiring source and signature evaluation; it is not permission to erase the underlying CVE.
+**VEX** stands for Vulnerability Exploitability eXchange. It is a companion statement that says whether a known vulnerability actually affects this product, given how the product uses the vulnerable code. It is useful, and it is still only a claim: check who issued it and whether it is signed. VEX explains a finding. It does not delete one.
 
 ### In production
 
-**Ownership:** Security owns SBOM retention; app teams ensure builds emit them.
+**Ownership:** The security team owns how long SBOMs are kept and where. App teams make sure their builds produce them in the first place.
 
-**Failure mode:** Cannot answer “are we affected?” during a CVE storm. Detect with missing-SBOM reports per prod digest. Mitigate with registry-stored SBOMs and runbook links.
+**Failure mode:** A widely reported vulnerability lands and nobody can say which services are affected. Detect the exposure in advance by reporting which production digests have no SBOM stored. Close it by keeping SBOMs in the registry beside the image and linking the lookup steps directly from the on-call runbook.
 
 | Do | Don't |
 |----|-------|
@@ -486,13 +510,16 @@ It must be linked to an immutable digest, searchable using reliable package iden
 
 ## 26.10 Key takeaways
 
-- Supply-chain trust combines identity, contents, origin, integrity, authorization, and policy.
-- Docker Scout supports vulnerability analysis, comparisons, and organization policy evaluation.
-- Docker Hardened Images reduce base-image attack surface and provide verifiable evidence, but do not replace application security.
-- Signing endorses a digest; SBOM and provenance describe it.
-- Verification policy must constrain approved keys or workload identities.
-- Carry one immutable digest through build, test, scan, sign, promotion, and deployment.
-- SBOM value appears when inventory is searchable and connected to deployed workloads.
+- An image that runs correctly can still be unfit to ship. Those are separate questions.
+- Scan the digest you will deploy, not a tag you happened to pull.
+- Scout reports. It does not fix. The rebuild and redeploy are still yours.
+- A smaller base image means fewer findings and less for an attacker to use.
+- Distroless removes the shell. Fix your health checks and debug plan before you switch.
+- SBOM says what is inside. Provenance says how it was made. A signature says who approved it.
+- A signature proves the publisher, not that the code is good.
+- Build once, promote that digest everywhere. Rebuilding for production discards your evidence.
+- Verifying only in CI is not verifying. The gate belongs at admission.
+- Store SBOMs beside the image, keyed to the digest, for as long as the image lives.
 
 
 

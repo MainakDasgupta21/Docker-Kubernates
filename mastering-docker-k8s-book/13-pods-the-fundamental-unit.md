@@ -104,13 +104,17 @@ Treat every Pod as replaceable. Never build anything that depends on a Pod name 
 
 ### In plain terms
 
-**Init containers** are stagehands who set the stage before the actors appear. They run to completion in order; only then do app containers start. The problem they solve is "this app cannot safely start until X is true"—DNS for a dependency is resolvable, a schema migration finished, a config file was fetched into a shared volume.
+An **init container** is a container that runs and finishes *before* your app containers start. If you list several, they run one at a time, in order.
 
-Without inits, teams stuff sleep loops into the main entrypoint or race the first request against an unready database. That turns startup ordering into folklore inside the app image. Init containers move that folklore into the Pod spec, where operators can see it and where failures show up as clear Pod events instead of mysterious CrashLoops in the main container.
+You need this whenever your app cannot safely start until something else is true. Maybe a database name must resolve in DNS. Maybe a schema migration must finish. Maybe a config file must be downloaded into a shared volume first.
+
+Think of init containers as stagehands. They set the stage, then leave, and only then do the actors walk on. Without them, teams hide sleep loops inside the app's start command, or let the first request race an unready database. That buries startup order inside the app image, where nobody can see it. Put it in the Pod spec instead, and failures show up as clear Pod events rather than a confusing crash loop in your main container.
 
 > ⚠️ **Common Pitfall:** You might think init containers are just "sidecars that stop." They are not. Sidecars (or native sidecar containers) keep running alongside the app; inits must exit successfully before the app starts, and a failing init blocks the Pod from becoming Ready forever (or until backoff succeeds).
 
 ### Under the hood
+
+Here is what that looks like in a Pod spec:
 
 ```yaml
 apiVersion: v1
@@ -139,7 +143,7 @@ NAME            READY   STATUS     RESTARTS   AGE
 task-api-init   0/1     Init:1/2   0          8s
 ```
 
-`STATUS Init:1/2` means the first init succeeded and the second is running. If an init container fails, the Pod restarts according to `restartPolicy` (for init, failures keep retrying until success for Always/OnFailure semantics as documented). Init containers can use different images and stricter security contexts than the app.
+`STATUS Init:1/2` means the first init finished successfully and the second one is running now. If an init container fails, the Pod restarts according to `restartPolicy` (for init, failures keep retrying until success for Always/OnFailure semantics as documented). An init container can use a different image and a stricter security context than your app.
 
 **What breaks if an init never succeeds:** the app containers never start; the Pod stays non-Ready; Services never get an endpoint. Watch events for `Failed` / `BackOff` on the init container name.
 
@@ -155,9 +159,9 @@ flowchart LR
 
 **Ownership:** app teams own init logic; platform teams own base images allowed for wait/migrate helpers (and often ban `latest` / unpinned busybox in prod).
 
-Keep inits small and idempotent. Do not hide long migrations in init containers without Job-based migration strategies for shared databases. Resource requests on inits count toward scheduling; size them honestly.
+Keep inits small, and make them safe to run twice. Do not hide long migrations in an init container; for a shared database, run the migration as a Job instead. Requests you set on an init container count toward scheduling, so size them honestly.
 
-**Failure mode:** a flaky `nslookup` loop or a non-idempotent migrate blocks every rollout. **Detect:** Pods stuck in `Init:` with rising restart counts; Deployment progress deadline exceeded. **Mitigate:** move schema changes to a Job that runs once per release; keep wait-loops short and backed by readiness of the dependency Service.
+**Failure mode:** a flaky `nslookup` loop, or a migration that is not safe to repeat, blocks every rollout. **Detect:** Pods stuck in `Init:` with rising restart counts; Deployment progress deadline exceeded. **Mitigate:** move schema changes to a Job that runs once per release; keep wait-loops short and backed by readiness of the dependency Service.
 
 **Do:** give each init its own requests/limits and a clear name in events. **Don't:** run a 20-minute migration as an init on every replica of a 10-replica Deployment.
 
@@ -173,15 +177,17 @@ Keep inits small and idempotent. Do not hide long migrations in init containers 
 
 ### In plain terms
 
-Sometimes the pea pod holds more than one pea: an app plus a helper that must share `localhost` or files—log shippers, proxies, adapters. The problem this solves is co-located helpers without a second Pod (and second IP) that cannot see the app's filesystem or loopback.
+A **sidecar** is a helper container that runs next to your app inside the same Pod for the Pod's whole life. Log shippers, network proxies, and format adapters are the usual examples.
 
-You might think "just run another Deployment for the helper." That works when the helper talks over the network. It fails when the helper must tail a file the app writes locally, or when a service-mesh proxy must intercept traffic on the Pod's network namespace. Multi-container Pods exist for *shared fate and shared namespaces*, not for every companion process in your architecture.
+You need a sidecar when the helper must see what the app sees. A separate Pod gets its own IP and its own filesystem, so it cannot read a file your app just wrote locally, and it cannot intercept traffic on your app's `localhost`.
+
+Sometimes the pea pod really does hold more than one pea. But be strict about when. You might think "just run another Deployment for the helper" — and that is correct whenever the helper talks over the network. Multi-container Pods exist for *shared fate and shared namespaces*, not for every companion process in your architecture.
 
 > ⚠️ **Common Pitfall:** Stuffing unrelated processes into one Pod "to save money" on IPs. If they do not need shared volumes or localhost, separate Pods (and Services) keep blast radius and rollouts independent.
 
 ### Under the hood
 
-Classic patterns:
+Here are the three patterns you will see named in design docs:
 
 | Pattern | Idea |
 |---------|------|
@@ -189,7 +195,7 @@ Classic patterns:
 | **Ambassador** | Outbound proxy hiding external complexity |
 | **Adapter** | Normalize output (logs/metrics) for the platform |
 
-Native **sidecar containers** (restartable init-style sidecars) let you mark containers that should start before the main app and keep running with independent restart behavior—useful for service mesh proxies. Check your 1.36 cluster docs/feature enablement if you rely on the dedicated sidecar field semantics.
+Kubernetes also has native **sidecar containers**, written as init containers with a restart policy. They start before the main app, keep running alongside it, and restart on their own — exactly what a service mesh proxy needs. Check your 1.36 cluster's docs and feature settings if you depend on those specific field semantics.
 
 ```yaml
 spec:
@@ -221,7 +227,7 @@ api access-log
 
 **Ownership:** platform often owns mesh/logging sidecars injected by admission; app teams own app containers and must budget resources for injected helpers.
 
-Every sidecar burns CPU/memory and complicates probes. Prefer remote agents when process co-location is unnecessary. Keep sidecar images as carefully patched as app images—and pin them by digest the same way.
+Every sidecar costs CPU and memory, and it makes probes harder to reason about. If the helper does not need to sit next to the app, run it as a remote agent instead. Patch sidecar images as carefully as app images, and pin them by digest the same way.
 
 **Do:** document which container is the "main" one for `kubectl logs` / debug. **Don't:** leave sidecars without memory limits on busy nodes.
 
@@ -237,9 +243,13 @@ Every sidecar burns CPU/memory and complicates probes. Prefer remote agents when
 
 ### In plain terms
 
-Probes are Kubernetes asking "are you alive?", "may I send traffic?", and "are you still starting?" Wrong answers cause thrashing or blackhole traffic. The problem they solve is the gap between "process is running" and "process is safe to receive work"—a process can be up while still loading caches, or wedged while still holding a TCP port.
+A **probe** is a check the kubelet runs against your container on a schedule. There are three kinds, and each asks a different question: "are you still starting?", "are you healthy?", and "may I send you traffic?"
 
-You might think one `/health` endpoint covers everything. It does not. Liveness failures restart the container; readiness failures only remove it from Service endpoints. Mixing those meanings is how a slow database turns into a cluster-wide restart storm.
+Probes exist because "the process is running" and "the process can do work" are not the same thing. A process can be up while it is still loading a cache. It can also be stuck and useless while still holding its TCP port open. Only your app knows the difference, so your app has to answer.
+
+You might think one `/health` endpoint covers all three questions. It does not, and the difference matters. A failed liveness check *restarts the container*. A failed readiness check only *takes it out of the Service*. Mix those two meanings and one slow database turns into a cluster-wide restart storm.
+
+> 💡 **In one line:** Readiness decides whether traffic reaches you; liveness decides whether your container gets restarted. Never point both at the same dependency check.
 
 > ⚠️ **Common Pitfall:** One endpoint for both liveness and readiness that checks the database. When the DB is slow, Kubernetes restarts every Pod, amplifying the outage.
 
@@ -279,7 +289,7 @@ Liveness:   http-get http://:8000/healthz delay=0s timeout=1s period=10s #succes
 Readiness:  http-get http://:8000/readyz delay=0s timeout=1s period=5s #success=1 #failure=3
 ```
 
-Prefer HTTP or gRPC probes for apps that speak them; use `exec` sparingly (fork cost). Distinguish liveness (process wedged) from readiness (dependency down)—do not restart the world because a dependency blipped.
+Use HTTP or gRPC probes when your app speaks those protocols. Use `exec` rarely, because it forks a process on every check. Keep the two meanings apart: liveness means *this process is stuck*, readiness means *a dependency is down*. Do not restart the world because a dependency blipped.
 
 **What breaks if readiness is missing:** rolling updates mark Pods Ready as soon as the process starts; Services send traffic to cold or broken instances; rollouts look "successful" while users see errors.
 
@@ -314,12 +324,12 @@ Probe mechanisms you can configure:
 
 **Ownership:** app teams own probe paths and SLOs; platform teams enforce "readiness required for Services" via policy on Deployments.
 
-1. Always define readiness for Services behind rollouts.
-2. Use startupProbe for slow JVMs/cold caches so liveness does not kill booting pods.
-3. Make `/healthz` cheap; never touch a remote DB on every liveness tick unless you accept cascading failure.
-4. Align probe timeouts with real SLOs.
+1. Always define a readiness probe for anything behind a Service and a rolling update.
+2. Use a startupProbe for slow starters, such as a JVM or a cold cache, so liveness does not kill a booting Pod.
+3. Keep `/healthz` cheap. Never call a remote database on every liveness check unless you are willing to fail in a chain.
+4. Match probe timeouts to the latency your service actually promises.
 
-**Failure mode:** restart storms or empty EndpointSlices during dependency blips. **Detect:** rising `RESTARTS`, `kubectl get endpointslices` empty while Pods show Running, Deployment progressing with 5xx at the edge.
+**Failure mode:** restart storms, or empty EndpointSlices while a dependency is briefly slow. **Detect:** rising `RESTARTS`, `kubectl get endpointslices` empty while Pods show Running, Deployment progressing with 5xx at the edge.
 
 **Do:** separate `/healthz` (liveness) from `/readyz` (readiness). **Don't:** set `failureThreshold` so low that one GC pause kills the container.
 
@@ -335,9 +345,11 @@ Probe mechanisms you can configure:
 
 ### In plain terms
 
-**Requests** are what the scheduler reserves. **Limits** are the ceiling. Together they place your Pod into a **Quality of Service (QoS)** class that decides who gets evicted first under pressure. The problem they solve is sharing a node without hoping every team "plays nice"—without requests, the scheduler packs by guesswork and noisy neighbors win until the kubelet starts killing.
+A **request** is the amount of CPU and memory the scheduler sets aside for your container. A **limit** is the most it is ever allowed to use. Together, these two numbers put your Pod into a **QoS class** (Quality of Service), which decides who gets removed first when a node runs out of room.
 
-You might think setting only limits is enough "to protect the node." Limits cap a running container; they do not tell the scheduler how much to reserve. Pods with no requests are BestEffort and leave first when memory is tight.
+You need these numbers because a node is shared. Without requests, the scheduler is guessing how much space is left, and the loudest workload wins until the kubelet starts killing things. Requests turn "please play nice" into a rule the scheduler can enforce.
+
+You might think setting only limits protects the node well enough. It does not. A limit caps a container that is already running; it tells the scheduler nothing about how much space to reserve. A Pod with no requests at all lands in the BestEffort class and is the first thing evicted when memory runs short.
 
 > ⚠️ **Common Pitfall:** Copying huge requests "to be safe." Over-requesting wastes nodes and leaves Pending Pods while CPUs sit idle—capacity is reserved, not used.
 
@@ -364,7 +376,7 @@ $ kubectl get pod task-api-single -o jsonpath='{.status.qosClass}{"\n"}'
 Burstable
 ```
 
-CPU limits throttle; memory limits OOM-kill. Requests drive bin-packing—under-request and you oversubscribe; over-request and you waste nodes.
+The two limits behave very differently. Hitting a CPU limit only slows the container down (**throttling**). Hitting a memory limit kills it outright (an **OOM kill**, for out of memory). Requests are what pack Pods onto nodes: request too little and you oversubscribe the node, request too much and you pay for idle machines.
 
 **What breaks if memory limit is below real peak:** the container gets OOMKilled (`Last State: OOMKilled` in `describe`); the Pod may CrashLoop while the node still looks fine.
 
@@ -384,7 +396,7 @@ flowchart TB
 
 **Ownership:** app teams propose requests from load tests; platform enforces minimums via LimitRange/admission and may require Guaranteed for latency-critical namespaces.
 
-Require requests on every container via policy. Set memory limits thoughtfully. Prefer Guaranteed for latency-critical pods that must resist eviction. Watch for CPU throttling before blindly raising limits.
+Require requests on every container through admission policy. Choose memory limits carefully, because hitting one kills the container. Use the Guaranteed class for latency-critical Pods that must survive node pressure. Check for CPU throttling before you raise a limit, so you change the number that is actually hurting.
 
 **Do:** size requests from p95 usage plus headroom. **Don't:** leave production Pods BestEffort.
 
@@ -400,15 +412,17 @@ Require requests on every container via policy. Set memory limits thoughtfully. 
 
 ### In plain terms
 
-The **Downward API** lets a Pod learn facts about itself—name, namespace, labels, resource requests—without hard-coding them or calling the API server from application code. The problem it solves is correlation and self-configuration: logs need a Pod name, clients need the Pod IP, and agents need to know their own requests without a second control plane round-trip.
+The **Downward API** is a way to hand a Pod facts about itself — its name, its namespace, its labels, its own resource requests — as environment variables or files.
 
-You might think "just query the Kubernetes API with the service account." That works and is heavier: it needs network access to the API, RBAC, and failure handling. The Downward API injects a snapshot (and some live updates for volume-mounted labels/annotations) as env or files.
+Why do you need it? Because a Pod's name changes every time it is replaced, so you cannot write it into a config file ahead of time. Yet your logs need that name to be useful, and your tracing needs the Pod IP. The Downward API supplies those values at start time, with no code changes and no API call.
+
+You might think "just query the Kubernetes API using the service account token." That works, and it costs more: network access to the API server, RBAC rules, and error handling for when the call fails. The Downward API gives you a snapshot instead, plus live updates for labels and annotations that you mount as files.
 
 > ⚠️ **Common Pitfall:** Assuming `resourceFieldRef` shows live usage. It exposes the *requested* (or limited) amounts from the Pod spec—not metrics-server usage.
 
 ### Under the hood
 
-Inject as environment variables or files:
+You can inject these values as environment variables, as files, or both:
 
 ```yaml
 apiVersion: v1
@@ -473,7 +487,7 @@ version="1.0"
 
 **Ownership:** app teams choose which fields to inject; platform may require standard log labels via a mutating policy.
 
-Use Downward API for correlation IDs, log fields, and client-side defaults. Prefer it over mounting a service-account token just to read your own metadata. Remember resourceFieldRef values are the *requested* amounts, not live usage.
+Use the Downward API for correlation IDs, log fields, and defaults your client code needs. Choose it over mounting a service-account token just to read your own metadata. Remember that `resourceFieldRef` gives you the *requested* amounts, not live usage.
 
 **Do:** inject `metadata.name` and `metadata.namespace` into structured logs. **Don't:** grant `get pods` cluster-wide so the app can discover its own name.
 
@@ -489,9 +503,11 @@ Use Downward API for correlation IDs, log fields, and client-side defaults. Pref
 
 ### In plain terms
 
-**Ephemeral containers** are temporary debug sidecars you attach to a *running* Pod when the main image is distroless or you need `tcpdump` without rebuilding. The problem they solve is production debugging without shipping a shell in every image—security wants distroless; operators still need a way in during an incident.
+An **ephemeral container** is a temporary container you attach to a Pod that is already running, so you can look around inside it. You remove it when you are done.
 
-You might think SSH DaemonSets on every node are the only answer. Ephemeral containers share the target container's namespaces (when `--target` is supported) so you debug *that* Pod's network and filesystem view without a standing privileged agent.
+You need this because good production images are stripped bare. A **distroless** image — one with no shell and no package manager — is the secure choice, and it is also the image where `kubectl exec` gives you nothing to work with. Ephemeral containers let you bring your own tools, such as `tcpdump`, without rebuilding and redeploying during an incident.
+
+You might think a privileged SSH DaemonSet on every node is the only way in. It is not, and it leaves a permanent back door running. With `--target`, an ephemeral container joins the target container's namespaces, so you see *that Pod's* network and filesystem view and nothing more.
 
 > ⚠️ **Common Pitfall:** Leaving `kubectl debug` RBAC wide open for every developer. Ephemeral containers can be as powerful as exec into the workload—treat them like break-glass access.
 
@@ -507,7 +523,7 @@ $ kubectl debug -it task-api-single --image=busybox:1.36 --target=api
 # You normally use kubectl debug rather than hand-editing
 ```
 
-Ephemeral containers cannot be permanently declared in the original create-time Pod template for ordinary apps; they are added at runtime for debugging. They do not restart with the Pod's normal lifecycle the way app containers do.
+You cannot declare an ephemeral container in a normal Pod template. They are added to a running Pod, on purpose, for debugging. They also do not restart with the Pod's normal lifecycle the way app containers do.
 
 **What breaks if the runtime/node disables ephemeral containers:** `kubectl debug` fails; you fall back to a privileged debug Pod on the node or a rebuilt image with a shell—plan that path before an incident.
 
@@ -515,7 +531,7 @@ Ephemeral containers cannot be permanently declared in the original create-time 
 
 **Ownership:** platform owns who may `create` ephemeral containers (RBAC); app teams use them under incident procedure.
 
-Gate who may `kubectl debug` via RBAC. Prefer distroless/CHA apps with on-demand debug rather than shipping shells in every image. Remove the need for standing SSH DaemonSets when ephemeral containers suffice.
+Control who may run `kubectl debug` through RBAC. Ship distroless images and debug on demand, instead of shipping a shell in every image. Retire standing SSH DaemonSets wherever ephemeral containers do the job.
 
 **Do:** document the approved debug image digest. **Don't:** grant cluster-admin so someone can "just debug."
 
@@ -533,15 +549,17 @@ Gate who may `kubectl debug` via RBAC. Prefer distroless/CHA apps with on-demand
 
 ### In plain terms
 
-**Static Pods** are Pods the kubelet creates from manifests on disk—without the scheduler and without a controlling Deployment. Control-plane components on kubeadm nodes often run this way. The problem they solve is chicken-and-egg bootstrap: the API server itself cannot depend on the API server to be scheduled.
+A **static Pod** is a Pod that the kubelet reads from a file on the node's disk and runs by itself. No scheduler is involved, and no Deployment owns it.
 
-You might think deleting the Pod with `kubectl delete` stops it. For static Pods, the kubelet resurrects them from the on-disk file; you only removed the mirror object.
+Why would anyone want that? Because of a chicken-and-egg problem at startup. The API server cannot be scheduled by a cluster that needs the API server to schedule anything. So on kubeadm clusters, the control plane components run as static Pods, started straight from disk. That is why they show up in `kube-system` with no controller above them.
+
+You might think `kubectl delete` stops one. It does not. The object in the API is only a read-only mirror. Delete it and the kubelet re-creates it from the file that is still sitting on disk.
 
 > ⚠️ **Common Pitfall:** Managing application workloads as static Pods "because kubeadm does it." App workloads belong in the API so scheduling, RBAC, and garbage collection work normally.
 
 ### Under the hood
 
-Place a Pod manifest in the kubelet's static Pod path (commonly `/etc/kubernetes/manifests`). The kubelet starts it and mirrors a read-only object to the API server.
+Drop a Pod manifest into the kubelet's static Pod directory, usually `/etc/kubernetes/manifests`. The kubelet starts it and publishes a read-only copy of the object to the API server.
 
 ```bash
 # On a kubeadm control-plane node (not required on kind for this concept check):
@@ -553,7 +571,7 @@ $ kubectl get pods -n kube-system -o wide | findstr apiserver
 kube-apiserver-mastering-k8s-control-plane   1/1   Running   0   20m   ...   mastering-k8s-control-plane
 ```
 
-Static Pods are invisible to the scheduler and are bound to that node. Deleting the API mirror object does not stop them—you must remove or change the on-disk file (or the node).
+The scheduler cannot see a static Pod, and it stays on that one node forever. Deleting the mirrored object in the API does not stop it. To stop it you must change or remove the file on disk, or remove the node.
 
 **What breaks if the static Pod YAML is invalid:** the control-plane component may fail to start; `kubectl` against that cluster may hang—you fix it on the node filesystem, not via a Deployment rollout.
 
@@ -561,7 +579,7 @@ Static Pods are invisible to the scheduler and are bound to that node. Deleting 
 
 **Ownership:** platform / cluster-lifecycle teams own static Pod manifests; app teams never should.
 
-Leave static Pods to system components unless you deeply understand node bootstrap. Application workloads belong in API-managed controllers so GC, scheduling, and RBAC work normally. Back up `/etc/kubernetes/manifests` as part of control-plane DR.
+Leave static Pods to system components unless you fully understand how a node boots. Application workloads belong to controllers in the API, so that cleanup, scheduling, and RBAC all work normally. Back up `/etc/kubernetes/manifests` along with your control-plane disaster recovery plan.
 
 **Do:** version-control and back up static manifests with etcd backups. **Don't:** put Task API in `/etc/kubernetes/manifests`.
 
@@ -577,9 +595,11 @@ Leave static Pods to system components unless you deeply understand node bootstr
 
 ### In plain terms
 
-**RuntimeClass** selects *how* containers run—default runc, a sandboxed runtime (gVisor, Kata), or another handler configured on nodes. The problem it solves is multi-tenant isolation without a second cluster: untrusted workloads get a stronger sandbox while trusted apps keep the default runtime.
+A **RuntimeClass** is a named choice of *which* container runtime runs your Pod. The default is `runc`. Others give you a **sandbox**, meaning a stronger wall between the container and the host kernel — gVisor and Kata Containers are the common ones.
 
-You might think setting `securityContext` alone equals a sandbox. Seccomp and dropped capabilities help, but a sandboxed RuntimeClass changes the *execution boundary* (user-space kernel or lightweight VM), which is a different threat model.
+You need this when one cluster runs code you do not trust, such as customer-submitted jobs or CI builds. Instead of buying a second cluster, you give the risky workloads a sandboxed runtime and leave trusted apps on the default.
+
+You might think a strict `securityContext` already gives you a sandbox. Seccomp filters and dropped capabilities genuinely help, but they harden the same boundary. A sandboxed RuntimeClass *moves* the boundary, running the container against a user-space kernel or inside a lightweight VM. That is a different threat model, not a stronger version of the same one.
 
 > ⚠️ **Common Pitfall:** Selecting a RuntimeClass whose handler is missing on the node. The Pod stays Pending with a clear scheduling / runtime error—verify node support before mandating the class in policy.
 
@@ -612,7 +632,7 @@ NAME     HANDLER   AGE
 gvisor   runsc     2d
 ```
 
-Nodes must advertise support for the handler. Scheduling can use `scheduling.nodeSelector` / tolerations on the RuntimeClass to land Pods only on capable nodes.
+A node must advertise that it supports the handler. Set `scheduling.nodeSelector` and tolerations on the RuntimeClass so its Pods only land on nodes that can run them.
 
 **What breaks if the app needs unsupported syscalls under gVisor/Kata:** cryptic runtime failures or performance cliffs—benchmark before forcing sandboxes on syscall-heavy databases.
 
@@ -620,7 +640,7 @@ Nodes must advertise support for the handler. Scheduling can use `scheduling.nod
 
 **Ownership:** platform installs and names RuntimeClasses; app teams may select allowed classes per namespace policy.
 
-Use sandboxed runtimes for untrusted multi-tenant workloads. Benchmark syscall-heavy apps—some sandboxes trade performance for isolation. Document which namespaces may select which RuntimeClass.
+Use sandboxed runtimes for untrusted workloads that share a cluster. Benchmark anything that makes heavy use of system calls, because some sandboxes trade speed for isolation. Write down which namespaces may select which RuntimeClass.
 
 **Do:** pin which namespaces can use privileged vs sandboxed classes. **Don't:** assume every node pool has every handler.
 
@@ -636,9 +656,11 @@ Use sandboxed runtimes for untrusted multi-tenant workloads. Benchmark syscall-h
 
 ### In plain terms
 
-**Lifecycle hooks** let Kubernetes run a command or HTTP call when a container starts or just before it stops—useful for warm-up and graceful shutdown. The problem they solve is coordinating with the process around SIGTERM and endpoint removal without rewriting every app immediately.
+A **lifecycle hook** is a command or HTTP call Kubernetes runs for you at two moments: just after a container starts (`postStart`) and just before it is asked to stop (`preStop`).
 
-You might think `preStop: sleep 5` is a complete graceful-shutdown design. It is a race-condition bandage for slow endpoint propagation. Prefer handling SIGTERM in the app; use sleep only when you must wait for kube-proxy / EndpointSlice updates.
+The `preStop` hook is the one that matters in production. When a Pod is going away, its removal from the Service and the shutdown signal to your process happen at nearly the same time. For a few moments, traffic may still arrive at a container that is already shutting down. A `preStop` hook gives you a place to hold the door open, or to tell the app to drain, without editing the application's code today.
+
+You might think `preStop: sleep 5` is a complete shutdown design. It is a patch over a timing gap, not a design. Handle the shutdown signal (**SIGTERM**, the polite "please stop" signal) inside your app, and use a sleep only to wait out kube-proxy and EndpointSlice updates.
 
 > ⚠️ **Common Pitfall:** A long `preStop` that exceeds `terminationGracePeriodSeconds`. The hook is cut short and SIGKILL still wins—budget grace period to include the hook.
 
@@ -654,7 +676,7 @@ lifecycle:
       command: ["/bin/sh", "-c", "sleep 5; curl -X POST http://127.0.0.1:8000/shutdown"]
 ```
 
-`postStart` runs asynchronously after the container is created—it may race your main process. `preStop` runs before SIGTERM during Pod termination; it counts against termination grace period.
+`postStart` runs at the same time as your main process, not before it, so never assume it finishes first. `preStop` runs before SIGTERM when the Pod is shutting down, and its time counts against the termination grace period.
 
 ```mermaid
 flowchart LR
@@ -674,7 +696,7 @@ Termination sequence (simplified): remove from endpoints → preStop → SIGTERM
 
 **Ownership:** app teams own SIGTERM handling and grace period; platform owns drain procedures and expects PDBs (Chapter 14 / 24) so voluntary drains do not remove all replicas at once.
 
-Prefer application-handled SIGTERM for graceful shutdown; use `preStop` sleep only as a last resort to race kube-proxy/endpoint propagation. Set `terminationGracePeriodSeconds` long enough for draining work, short enough for fast rollouts.
+Handle SIGTERM inside the application for a clean shutdown. Use a `preStop` sleep only to cover the delay while kube-proxy and EndpointSlices catch up. Set `terminationGracePeriodSeconds` long enough to finish in-flight work, and short enough that rollouts still move.
 
 > 🏭 **Production floor:** Before draining a node, ensure a **PodDisruptionBudget** exists for the workload (Chapter 14 cross-ref; full design in Chapter 24). Hooks and grace periods help *one* Pod leave politely; PDBs keep enough Pods available while many leave for maintenance.
 
@@ -692,15 +714,17 @@ Prefer application-handled SIGTERM for graceful shutdown; use `preStop` sleep on
 
 ### In plain terms
 
-Historically, changing CPU/memory meant recreating the Pod. **In-place resize** updates resources on a live Pod when the runtime and node support it—less disruption for vertical scaling. The problem it solves is expensive restarts: JVMs, warm caches, and sticky connections hate being killed just to gain 100m CPU.
+**In-place resize** means changing a running container's CPU or memory without recreating the Pod.
 
-You might think this replaces HorizontalPodAutoscaler. It does not. In-place resize is vertical; HPA is horizontal. Many platforms will use both carefully so they do not fight.
+For years this was impossible. Any change to resources meant a new Pod, which meant losing everything the old one had built up. That restart is expensive for a JVM that takes a minute to warm, for a filled cache, or for long-lived connections. Giving a container 100m more CPU should not cost you an outage.
+
+You might think this replaces the HorizontalPodAutoscaler. It does not. Resizing makes one Pod bigger, which is **vertical scaling**. The HPA adds more Pods, which is **horizontal scaling**. Run both if you like, but configure them carefully so they are not editing the same fields.
 
 > ⚠️ **Common Pitfall:** Memory downsize with `restartPolicy: NotRequired` on a runtime that cannot reclaim safely—watch for `PodResizePending` and be ready for a restart policy instead.
 
 ### Under the hood
 
-On Kubernetes **1.36**, in-place Pod vertical scaling is mature (container-level resize GA as of 1.35; Pod-level resource resize continued graduating—verify feature gates on custom clusters). Mark containers with a resize policy:
+Here is how you enable it. On Kubernetes **1.36**, in-place Pod vertical scaling is mature (container-level resize GA as of 1.35; Pod-level resource resize continued graduating—verify feature gates on custom clusters). Mark containers with a resize policy:
 
 ```yaml
 apiVersion: v1
@@ -730,7 +754,7 @@ $ kubectl patch pod task-api-resizable --subresource resize --patch '
 {"spec":{"containers":[{"name":"api","resources":{"requests":{"cpu":"300m","memory":"384Mi"},"limits":{"cpu":"700m","memory":"768Mi"}}}]}}'
 ```
 
-Requires **cgroup v2**, a CRI runtime that implements resource update, and node capacity for upsizing. Status conditions such as `PodResizePending` / `PodResizeInProgress` explain stalls.
+This needs three things: **cgroup v2**, a CRI runtime that supports updating resources, and free capacity on the node when you size up. When a resize stalls, the Pod's status conditions tell you why — look for `PodResizePending` and `PodResizeInProgress`.
 
 **What breaks if the node lacks allocatable headroom for the new requests:** resize stays pending; the Pod keeps old resources until you free capacity or move the Pod.
 
@@ -738,7 +762,7 @@ Requires **cgroup v2**, a CRI runtime that implements resource update, and node 
 
 **Ownership:** platform enables and documents resize support; app/SRE teams use it via VPA or controlled patches—not ad-hoc weekend patches on prod without change tickets.
 
-Use in-place resize for stateful or slow-to-start processes where restart cost is high. Still set sane upper bounds. Test memory downsizes carefully—some policies require restart. Combine with VPA carefully to avoid fighting controllers.
+Use in-place resize for stateful or slow-starting processes, where a restart costs you real time. Keep sensible upper bounds anyway. Test shrinking memory carefully, because some policies still force a restart. If you also run VPA, configure it so the two do not overwrite each other.
 
 **Do:** verify cgroup v2 and CRI support in the node pool first. **Don't:** assume every managed 1.36 cluster has every resize feature gate on.
 
@@ -754,9 +778,11 @@ Use in-place resize for stateful or slow-to-start processes where restart cost i
 
 ### In plain terms
 
-With **user namespaces**, the container's UID 0 is mapped to an unprivileged host UID. A breakout no longer yields host root—defense in depth you have wanted since Docker security basics. The problem it solves is the historical "container root ≈ host root" failure mode when isolation slips.
+A **user namespace** makes root inside the container into an ordinary, powerless user on the host. Container UID 0 gets mapped to some unprivileged host UID, so the two roots are no longer the same account.
 
-You might think `runAsNonRoot: true` makes userns unnecessary. Non-root is still best practice; userns adds a mapping layer so even container root is remapped. They are complementary.
+This closes an old and painful gap. For years, if a container escaped its isolation, container root *was* host root, and one bug became a compromised machine. With user namespaces, the same escape lands you as a nobody user with nothing worth taking.
+
+You might think `runAsNonRoot: true` already covers this. Running as non-root is still the right default, and you should keep it. But some images genuinely need UID 0 inside the container. User namespaces let those images have their root without it meaning anything on the host. The two settings work together.
 
 > ⚠️ **Common Pitfall:** Enabling `hostUsers: false` without testing volume drivers. Some CSI / hostPath paths lack idmapped mount support and fail with permission errors at start.
 
@@ -778,7 +804,7 @@ spec:
         runAsUser: 0
 ```
 
-Needs a compatible kernel, runtime, and **idmapped mounts** for volumes so ownership appears correct inside the userns without recursive `chown`. Capabilities become namespaced—`CAP_NET_ADMIN` inside the userns does not rule the host.
+This needs a recent kernel, a runtime that supports it, and **idmapped mounts** for volumes. An idmapped mount shifts file ownership as the volume is mounted, so files look correctly owned inside the user namespace without a slow recursive `chown`. Capabilities also become local to the namespace: holding `CAP_NET_ADMIN` inside the user namespace does not give you control of the host's network.
 
 ```bash
 $ kubectl apply -f task-api-userns.yaml
@@ -795,10 +821,10 @@ $ kubectl get pod task-api-userns -o yaml | findstr hostUsers
 
 **Ownership:** platform validates node OS / runtime / CSI support; security teams set policy on which namespaces must opt in.
 
-1. Roll out on workloads that need multi-tenant isolation first (CI jobs, untrusted tenants).
-2. Validate CSI drivers and hostPath assumptions—some volume types lag idmapped mount support.
-3. GA means API stability, not "enabled on every Pod by default"—you still set `hostUsers: false`.
-4. Combine with non-root images when possible; userns is complementary, not a substitute for least privilege.
+1. Start with the workloads that need the strongest isolation: CI jobs and untrusted tenants.
+2. Test your CSI drivers and any hostPath assumptions first. Some volume types still lack idmapped mount support.
+3. GA means the API is stable, not that the feature is on. You still set `hostUsers: false` on each Pod.
+4. Keep using non-root images where you can. User namespaces add a layer; they do not replace least privilege.
 
 > 📘 **Deep Dive (optional):** See the Kubernetes 1.36 blog on user namespaces GA for CVE-class breakout mitigations and idmapped mount history.
 
@@ -870,7 +896,7 @@ spec:
       emptyDir: {}
 ```
 
-Use this shape inside a Deployment template (Chapter 14), not as a long-lived bare Pod. Replace the digest placeholder with the digest your CI promoted; tags alone are not enough when two registries or caches disagree.
+Put this shape inside a Deployment template (Chapter 14). Do not run it as a long-lived bare Pod. Replace the digest placeholder with the digest your CI promoted. A tag alone is not enough, because two registries or caches can disagree about what that tag means.
 
 > 🏭 **Production floor:** Digest pinning is a change-management control: PR → CI scan → promote digest → rollout → rollback to previous digest. Paste the digest and Deployment revision into the incident ticket when a bad image ships.
 
@@ -955,12 +981,17 @@ It opts the Pod into user namespaces (GA in 1.36), mapping container UIDs (inclu
 
 ## 13.17 Key takeaways
 
-- Pods are the schedulable unit; containers inside share network and volumes.
-- Init containers, sidecars, probes, and QoS define startup order, helpers, health, and eviction risk.
-- **Downward API**, **ephemeral containers**, **static Pods**, **RuntimeClass**, and **lifecycle hooks** round out day-2 Pod mechanics.
-- **In-place resize** reduces disruption for vertical scaling on cgroup v2 nodes.
-- **User namespaces** (`hostUsers: false`) are **GA in 1.36**—use them deliberately for isolation.
-- Prefer controller-managed Pod templates over naked Pods in any lasting environment.
+- Kubernetes schedules Pods, not containers. Containers inside one Pod share an IP, volumes, and their fate.
+- Init containers run first and must finish. Sidecars run the whole time.
+- Readiness moves traffic. Liveness restarts containers. Startup buys a slow app time to boot.
+- Requests get you scheduled, limits cap you, and QoS decides who is evicted first.
+- The **Downward API** hands a Pod its own name, namespace, IP, and requests — no API call needed.
+- **Ephemeral containers** are how you debug a distroless image during an incident.
+- **Static Pods** come from files on a node, so `kubectl delete` cannot stop them.
+- **RuntimeClass** picks the runtime; a sandboxed one moves the security boundary.
+- **In-place resize** changes CPU and memory without a restart, on cgroup v2 nodes.
+- **User namespaces** (`hostUsers: false`) are **GA in 1.36**. Container root stops meaning host root.
+- Never leave a bare Pod running anything that matters. Wrap it in a controller.
 
 ---
 

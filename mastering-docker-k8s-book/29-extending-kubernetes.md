@@ -4,20 +4,26 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Define CustomResourceDefinitions (CRDs) and use custom resources like built-in types
-> - Explain the operator pattern and when a controller earns its keep
-> - Describe the API aggregation layer and how extension API servers plug in
-> - Configure validating and mutating admission webhooks responsibly
-> - Write **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** (GA in Kubernetes 1.36) with CEL
-> - Choose between webhooks, in-process CEL policies, and operators for a given extension need
+> - Teach the Kubernetes API a new object type with a CustomResourceDefinition (CRD), and use it just like a built-in one
+> - Explain what an operator does, and decide when writing one is worth the trouble
+> - Describe how a separate API server can be plugged in behind the main one
+> - Set up admission webhooks without giving your cluster a new way to break
+> - Write cluster rules in CEL using **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** (both stable in Kubernetes 1.36)
+> - Pick the right tool for the job: a webhook, a built-in CEL policy, or a full operator
 
 ---
 
 ## 29.1 Opening story: the platform that grew rooms
 
-Kubernetes ships a useful apartment building: Pods, Deployments, Services, Jobs. Real platforms need extra rooms—databases as APIs, certificates as APIs, tenant quotas as APIs. The project anticipated that. Instead of forking the apiserver for every idea, Kubernetes gives you **extension points**: new resource types (CRDs), reconcilers that drive them (operators), optional aggregated APIs, and admission hooks that enforce house rules when objects enter the building.
+Kubernetes arrives as a well-built apartment building. It has Pods, Deployments, Services, and Jobs. For most people that is enough.
 
-On Kubernetes **1.36**, declarative admission took a major step forward: **MutatingAdmissionPolicy** joined **ValidatingAdmissionPolicy** as stable, CEL-powered, in-process policies. Many “tiny webhook” use cases can now live entirely inside the apiserver.
+Real platforms want more rooms. A team wants to ask for a database by writing a few lines of YAML. Another wants certificates issued the same way. Someone in finance wants tenant quotas to be a real object you can list and audit.
+
+The Kubernetes authors expected this. Rather than making everyone fork the API server, they left doors open on purpose. These are the **extension points**, and there are four of them.
+
+You can add new object types with CRDs. You can write controllers, called operators, that act on those objects. You can plug in a whole separate API server behind the main one. And you can add rules that inspect objects as they arrive, before anything is saved.
+
+Kubernetes **1.36** made the last of those much easier. **MutatingAdmissionPolicy** joined **ValidatingAdmissionPolicy** as a stable feature. Both let you write rules in a small expression language that the API server runs itself. A lot of jobs that used to need a separate service running in your cluster no longer do.
 
 ---
 
@@ -25,13 +31,19 @@ On Kubernetes **1.36**, declarative admission took a major step forward: **Mutat
 
 ### In plain terms
 
-A **CustomResourceDefinition** teaches the API server a new noun. After you apply a CRD for `BackupSchedule`, `kubectl get backupschedules` works like `kubectl get pods`. The API stores your objects in etcd; it does not automatically *do* anything with them until a controller watches and reconciles.
+A **CustomResourceDefinition**, or **CRD**, teaches the Kubernetes API a new kind of object. Apply a CRD for `BackupSchedule`, and from that moment `kubectl get backupschedules` works exactly like `kubectl get pods`.
 
-CRDs extend the API with new resource types. They are contracts—breaking schemas break controllers and users. You might think CRDs are “just YAML”—they are API surface with upgrade duties.
+Why is that useful? Because your new object gets everything the built-in ones have, for free. It is validated against a schema, stored in etcd, protected by RBAC, versioned, watchable, and visible to `kubectl`. Writing that yourself would be a project. Writing a CRD is a YAML file.
+
+Be clear about what it does not do. A CRD stores your object; it does not act on it. Create a `BackupSchedule` and nothing gets backed up. The CRD is the form; something still has to read the form and do the work, which is the controller in the next section.
+
+The other thing to understand is that a CRD is a promise. Once teams write YAML against your new type, that schema is an API they depend on. Rename a field or tighten a rule and their manifests stop applying and your controller may stop working. Real APIs get new versions rather than edits, with both versions served and a conversion path between them, so nobody has to rewrite everything on your schedule. That is why "it's just YAML" is the wrong way to think about it.
 
 > ⚠️ **Common Pitfall:** Shipping CRDs without conversion strategy when changing versions.
 
 ### Under the hood
+
+Here is a complete CRD and what using it looks like.
 
 Minimal CRD for a namespaced `TaskBatch` in group `tasks.example.com`:
 
@@ -133,9 +145,9 @@ Versioning tips:
 
 ### In production
 
-**Ownership:** Platform/extension owners own CRD lifecycle; app teams consume documented versions only.
+**Ownership:** Whoever ships the CRD owns its whole lifecycle, including versions and upgrades. App teams use only the versions that are documented.
 
-**Failure mode:** Breaking CRD change → controller mass failure. Detect with webhook/conversion errors. Mitigate with served versions and staged deprecation.
+**Failure mode:** A breaking schema change makes every controller that reads the type fail at once. Detect it through conversion and webhook errors, which spike immediately. Prevent it by serving the old version alongside the new one and deprecating in stages.
 
 | Do | Don't |
 |----|-------|
@@ -155,13 +167,21 @@ Versioning tips:
 
 ### In plain terms
 
-An **operator** is a controller (often packaged with its CRDs) that encodes human operational knowledge: provision a database, rotate its certificates, take backups, fail over. Users declare *what* they want (`kind: PostgresCluster`); the operator continuously drives the cluster toward that desire.
+An **operator** is a program that runs in your cluster, watches your custom objects, and does whatever it takes to make reality match them. It usually ships together with the CRDs it understands.
 
-Operators reconcile desired CR state to reality. Bugs amplify with cluster-admin. You might think more operators always mean more automation—each adds failure domain and RBAC surface.
+The point of an operator is to capture what an experienced human would do. Provision the database. Rotate its certificates before they expire. Take a backup every night. Promote a replica when the primary dies. A user writes `kind: PostgresCluster` with three replicas, and the operator handles the rest, forever, without being asked again.
+
+This works the same way the built-in controllers do. It is a loop: look at what was asked for, look at what exists, and change what exists until the two agree. That loop is called **reconciliation**, and it never stops. Delete a Pod the operator created and it comes back, because from the operator's point of view reality just drifted.
+
+> 💡 **In one line:** A CRD is the request form; the operator is the person who reads it and does the work, over and over.
+
+That persistence is also the risk. An operator with a bug does not make one mistake, it makes the same mistake in a loop, as fast as the API will accept it. So privilege matters enormously here. An operator granted `cluster-admin` "just to get it working" can delete anything in the cluster, and a bad reconcile will. Give each one a ServiceAccount with permissions for exactly the resources it touches, and remember that every operator you install is one more thing that can break and needs someone on call.
 
 > ⚠️ **Common Pitfall:** Operators running as cluster-admin “to get it working.”
 
 ### Under the hood
+
+Here is what that loop looks like in practice.
 
 The reconciliation loop is the same idea as built-in controllers:
 
@@ -233,9 +253,9 @@ spec:
 
 ### In production
 
-**Ownership:** Platform approves operators; owners on-call for their controllers.
+**Ownership:** The platform team approves every operator before it is installed. Whoever owns an operator is on call for it.
 
-**Failure mode:** Reconcile loops gone wrong → cascading changes. Detect with leader metrics and audit of operator SA. Mitigate with least-privilege Roles and rate limits.
+**Failure mode:** A reconcile loop goes wrong and makes the same change over and over across the cluster. Detect it with leader-election metrics and by auditing what the operator's ServiceAccount is actually doing. Contain it with Roles that grant only what the operator needs and rate limits on its actions.
 
 | Do | Don't |
 |----|-------|
@@ -255,13 +275,19 @@ spec:
 
 ### In plain terms
 
-CRDs extend the *same* apiserver process with new types. The **aggregation layer** lets you run a *separate* extension API server and register it so that `kubectl` and clients still talk to the front door (`kube-apiserver`), which proxies specific API groups to your backend.
+The **aggregation layer** lets you run your own separate API server and hide it behind the main one. Clients keep talking to `kube-apiserver` as usual, and it quietly forwards requests for certain API groups to your server.
 
-Aggregation mounts extension API servers behind the main API. Powerful and operationally heavy. You might think aggregation is required for every CRD—CRDs usually suffice.
+Compare that with a CRD. A CRD adds new types inside the existing API server, and those objects are stored in etcd like everything else. Aggregation gives you a different program entirely, with its own code and its own storage, that merely looks like part of the Kubernetes API from outside.
+
+You need that in a small number of cases: when the data should not live in etcd, when you need query behavior CRDs cannot express, or when the data is computed on demand rather than stored. The best-known example is **metrics-server**, which serves live CPU and memory readings. Storing those in etcd would be absurd, so it does not.
+
+For almost everything else, a CRD with a controller is the right answer, and it is far less work. Aggregation means you now run an API server: it needs high availability, certificates, and monitoring, and when it is down, every request for its API group fails. Reach for it only when a CRD genuinely cannot do the job.
 
 > ⚠️ **Common Pitfall:** Choosing aggregation when a CRD+controller would do.
 
 ### Under the hood
+
+Here is how the registration and the request path work.
 
 You register an `APIService` that maps a group-version to a Service running your extension server:
 
@@ -317,9 +343,9 @@ Front-proxy certificates (chapter 28’s `front-proxy-ca`) authenticate the apis
 
 ### In production
 
-**Ownership:** Platform owns aggregated API HA and authn wiring.
+**Ownership:** The platform team owns keeping aggregated API servers highly available and wiring up their authentication.
 
-**Failure mode:** Extension API down → clients fail for those resources. Detect with apiservice availability. Mitigate with HA extension servers and documented dependencies.
+**Failure mode:** The extension server goes down and every request for its resources fails, even though the main API is fine. Detect it by monitoring the availability of each `APIService`. Reduce it by running the extension server with more than one replica and writing down what depends on it.
 
 | Do | Don't |
 |----|-------|
@@ -339,13 +365,19 @@ Front-proxy certificates (chapter 28’s `front-proxy-ca`) authenticate the apis
 
 ### In plain terms
 
-Admission webhooks are **phone-a-friend** checks during API requests. After authentication and authorization, the apiserver can call your HTTPS endpoint to **mutate** (change) or **validate** (allow/deny) the object before it is persisted.
+An **admission webhook** is a service of yours that the API server calls in the middle of handling a request, after it has checked who you are and what you may do, but before it saves anything. Your service can **mutate** the object, meaning change it, or **validate** it, meaning allow or reject it.
 
-Validating/mutating webhooks enforce policy at admit time. Failure policy and timeouts are production settings. You might think a down webhook only blocks bad objects—`Fail` can block the API for matching resources.
+This is how a cluster enforces house rules. Every Deployment must have an owner label. No image may come from an unapproved registry. Every Pod gets a sidecar injected. The rule lives in your code, and the API server asks before letting anything in.
+
+The catch is easy to miss. Your webhook is now on the critical path for every matching request. The setting `failurePolicy` decides what happens when it cannot be reached. With `Ignore`, the request proceeds unchecked, and your rule silently stops applying. With `Fail`, the request is rejected, which is safe from a policy point of view and means an outage of your little service becomes an outage of the Kubernetes API for those resources.
+
+Neither answer is free, so treat webhooks as production services. Run more than one replica, keep the timeout short, and scope the match rules narrowly so a failure cannot block the whole cluster. Above all, never let a webhook match the namespace it runs in, or a restart can leave you unable to fix it.
 
 > ⚠️ **Common Pitfall:** `failurePolicy: Fail` without HA webhooks on critical resources.
 
 ### Under the hood
+
+Here are the two configuration kinds and how a request flows through them.
 
 Two configuration kinds:
 
@@ -391,9 +423,9 @@ Ordering and risk:
 
 ### In production
 
-**Ownership:** Platform owns webhook HA and failurePolicy; policy teams own rules.
+**Ownership:** The platform team owns webhook availability and the `failurePolicy` setting. The policy team owns the rules the webhook enforces.
 
-**Failure mode:** Webhook outage → create/update failures cluster-wide for matched resources. Detect with webhook latency/error and API error rates. Mitigate with HA, timeouts, and careful namespace selectors.
+**Failure mode:** The webhook goes down and creates and updates fail cluster-wide for every resource it matches. Detect it by watching webhook latency and error rates alongside API server error rates. Reduce it with multiple replicas, short timeouts, and namespace selectors that keep the blast radius small.
 
 > 🏭 **Production floor:** A single-replica validating webhook with `failurePolicy: Fail` on Pods is a cluster-wide outage waiting to happen. Treat webhook HA like control-plane HA.
 
@@ -415,13 +447,21 @@ Ordering and risk:
 
 ### In plain terms
 
-A **ValidatingAdmissionPolicy** is a validating webhook written as **declarations and CEL expressions** inside the apiserver. No sidecar service, no TLS bundle rotation for your app, no extra Deployment to page on. You express rules like “every Pod must set `runAsNonRoot`” in CEL; the API server evaluates them in-process.
+A **ValidatingAdmissionPolicy** is a rule you write as a short expression, which the API server evaluates itself. It does the same job as a validating webhook, without any service of yours running anywhere.
 
-In-process CEL policies reduce webhook sprawl for many validation cases (stable path on modern clusters). You might think CEL replaces all webhooks—complex side effects still need webhooks/operators.
+The expressions are written in **CEL**, the Common Expression Language, a small read-only language built for exactly this: look at an object and return true or false. A rule like "every Pod must set `runAsNonRoot`" is one line of CEL.
+
+Why prefer this over a webhook? Because it deletes an entire production dependency. No Deployment to keep running, no certificates to rotate, no timeout to tune, no pager at 3 a.m. because the policy service crashed and now nobody can create a Pod. The rule lives in the API server, so if the API server is up, the rule works.
+
+CEL does not replace webhooks entirely. It can only inspect the object in front of it: no database lookups, no external calls, no side effects. Anything needing outside information still needs a webhook or an operator. But a large share of real-world rules are simple checks, and those belong here.
+
+Roll new policies out gently. A binding can be set to `Warn` or `Audit` before `Deny`, so you can see what a rule would have rejected before it starts rejecting. A policy that denies broadly on day one will break deployments nobody expected it to touch.
 
 > ⚠️ **Common Pitfall:** Policies that deny broadly without warn/dry-run rollout.
 
 ### Under the hood
+
+Here are the two objects involved and some working examples.
 
 ValidatingAdmissionPolicy has been stable since Kubernetes 1.30 and remains the validation half of the CEL admission story on 1.36. You typically create:
 
@@ -481,9 +521,9 @@ validations:
 
 ### In production
 
-**Ownership:** Platform owns policy engine enablement; security owns policy content rollouts.
+**Ownership:** The platform team owns turning the policy engine on. The security team owns the rules themselves and how they are rolled out.
 
-**Failure mode:** Bad policy → mass deny. Detect with deny metrics and audit annotations. Mitigate with warn → enforce and staged namespace matchers.
+**Failure mode:** One bad policy rejects a huge number of valid requests at once. Detect it with metrics on denials and with the audit annotations policies leave behind. Prevent it by shipping every policy as `Warn` first, then enforcing, and by matching a few namespaces before the whole cluster.
 
 | Do | Don't |
 |----|-------|
@@ -503,13 +543,19 @@ validations:
 
 ### In plain terms
 
-If ValidatingAdmissionPolicy is the bouncer who rejects bad outfits, **MutatingAdmissionPolicy** is the stylist who quietly adds the missing badge on the way in. As of Kubernetes **1.36**, MutatingAdmissionPolicy is **GA** (`admissionregistration.k8s.io/v1`), enabled by default—mutations via CEL without running a mutating webhook server.
+A **MutatingAdmissionPolicy** changes an object on its way into the cluster, using CEL, with no webhook server involved. It is the other half of the pair: if ValidatingAdmissionPolicy is the bouncer who turns people away, this is the stylist who quietly clips on the missing badge as they walk in.
 
-MutatingAdmissionPolicy (GA in **1.36**) mutates objects in-API with CEL-oriented policies—another way to enforce defaults without a webhook. You might think mutation order does not matter—managers and webhooks still interact.
+As of Kubernetes **1.36** it is generally available in `admissionregistration.k8s.io/v1` and on by default. That matters because setting defaults used to be the most common reason teams ran a mutating webhook, and now most of those can be a few lines of policy instead.
+
+Typical uses are small and repetitive: stamp a `managed-by` label on everything, add a default security context, set an imagePullPolicy nobody remembers to set. Things you want to be true everywhere and do not want to ask every team to type.
+
+There is one real hazard, and it is about ownership rather than syntax. If Helm sets a field, the developer's manifest sets it, and a policy also sets it, they take turns overwriting each other. Server-side apply tracks who owns which field, and it will report conflicts when two managers claim the same one. So decide in advance which fields belong to policy and which belong to the user, write it down, and roll mutations out in stages so you can see the conflicts before everyone else does.
 
 > ⚠️ **Common Pitfall:** Mutating the same fields from Helm, SSA, and policies without a field-owner story.
 
 ### Under the hood
+
+Here are the pieces and a worked example.
 
 Core pieces:
 
@@ -599,9 +645,9 @@ Use match conditions so you do not stack duplicate sidecars on every update. Pol
 
 ### In production
 
-**Ownership:** Platform owns mutation policy rollout; document field ownership vs SSA managers.
+**Ownership:** The platform team owns rolling out mutation policies, and writes down which fields belong to policy versus to the teams applying manifests.
 
-**Failure mode:** Fighting managers → apply errors. Detect with SSA conflict metrics. Mitigate with clear owner per field and staged mutation.
+**Failure mode:** Two managers claim the same field and every apply turns into a conflict error. Detect it with server-side apply conflict metrics. Prevent it by naming one owner per field and enabling new mutations in stages.
 
 | Do | Don't |
 |----|-------|
@@ -727,11 +773,14 @@ They determine whether API requests fail closed or open when the webhook is down
 
 ## 29.12 Key takeaways
 
-- **CRDs** add nouns; **operators** add verbs that reconcile them.
-- The **aggregation layer** proxies specialized APIs through the front door when CRDs are not enough.
-- **Admission webhooks** remain powerful but operationally heavy—HA, TLS, and blast radius matter.
-- **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** (GA in 1.36) bring CEL policies in-process for the common validation and mutation cases.
-- Pick the **smallest extension point** that meets the need; not every platform problem deserves a new webhook service.
+- A **CRD** adds a new kind of object. An **operator** is what actually does something about it.
+- A CRD with no controller stores your YAML and nothing else happens. That is expected, not a bug.
+- Your CRD schema is an API other people depend on. Add versions; do not edit fields in place.
+- Use the **aggregation layer** only when a CRD truly cannot store or serve what you need.
+- An **admission webhook** puts your service on the critical path. Run it with replicas and scope it narrowly.
+- **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** run CEL rules inside the API server, with no service to operate.
+- Ship every new policy as `Warn` before `Deny`, and to a few namespaces before all of them.
+- Choose the **smallest extension** that solves the problem. Most platform problems do not need a new service.
 
 ---
 

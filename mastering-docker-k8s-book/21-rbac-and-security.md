@@ -4,33 +4,35 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain ServiceAccounts and how Pods authenticate to the API
-> - Create Roles, ClusterRoles, and bindings with least privilege
-> - Apply security contexts to Pods and containers
-> - Configure Pod Security Admission (PSS) at namespace level
-> - Attach image pull secrets for private registries
-> - Enable and reason about cluster audit logging basics
-> - Combine RBAC, admission, NetworkPolicy, and auditing into layered defense
+> - Explain what a ServiceAccount is and how a Pod proves who it is to the API server
+> - Write Roles, ClusterRoles, and bindings that grant the smallest set of rights that works
+> - Use security contexts to limit what a container process is allowed to do
+> - Turn on Pod Security Admission for a namespace, and pick the right level
+> - Give Pods credentials to pull images from a private registry
+> - Turn on audit logging and know what to look for in it
+> - Stack RBAC, admission, NetworkPolicy, and audits so no single mistake is fatal
 
 ---
 
 ## 21.1 Keys, badges, and building codes
 
-A modern office building does not hand every contractor a master key. Receptionists get lobby access. Electricians get badge access to utility floors. Fire codes dictate where walls and sprinklers must exist—rules that apply even if someone has a badge. Security cameras record who walked where, so incidents are reconstructable.
+An office building does not hand every contractor a master key. The receptionist can open the lobby. The electrician's badge opens the utility floors and nothing else. Fire codes decide where walls and sprinklers go, and those rules apply to everyone, badge or no badge. Cameras record who walked where, so that after something goes wrong, somebody can piece the night together.
 
 ![Keys and badges for RBAC and cluster access control](assets/analogy-keys-badges.png)
 
 *Figure 21.A: Who you are (subject) plus your badge (RoleBinding) decides which doors open.*
 
-Kubernetes security works the same way:
+Kubernetes security is built from the same four ideas:
 
-- **RBAC** is the badge system (who may call which API verbs on which resources)
-- **ServiceAccounts** are machine identities for Pods
-- **Security contexts** and **Pod Security Admission** are building codes for how processes run
-- **Audit logging** is the camera system for the API server
-- **NetworkPolicies** ([Chapter 19](19-k8s-networking-cni-and-policies.md)) and **Secrets** ([Chapter 17](17-configuration-and-secrets.md)) close remaining gaps
+- **RBAC** (role-based access control) is the badge system. It decides which actions each identity may take on which objects.
+- **ServiceAccounts** are the badges themselves, issued to Pods rather than to people.
+- **Security contexts** and **Pod Security Admission** are the building codes. They limit how a process may run, even for a workload with a valid badge.
+- **Audit logging** is the camera system. It records every request the API server received.
+- **NetworkPolicies** ([Chapter 19](19-k8s-networking-cni-and-policies.md)) and **Secrets** ([Chapter 17](17-configuration-and-secrets.md)) close the gaps the other four leave open.
 
-Default clusters are often too open for production. This chapter tightens the bolts without locking you out of learning.
+Notice the pattern. Each control catches a different kind of failure, and none of them catches all of it. A badge system does not stop a fire. A sprinkler does not stop a thief with a key.
+
+A fresh cluster ships wide open, because that is the friendliest setting for learning. This chapter closes it down step by step, without locking you out of your own lab.
 
 ---
 
@@ -38,13 +40,19 @@ Default clusters are often too open for production. This chapter tightens the bo
 
 ### In plain terms
 
-Humans authenticate with kubeconfigs and cloud IAM. Pods need their own badges: **ServiceAccounts**. Every namespace has a `default` ServiceAccount; production apps should use a dedicated one with minimal rights.
+A **ServiceAccount** is an identity for a workload. It answers the question "who is this Pod?" the same way your kubeconfig file answers "who is this person?"
 
-Identity without least privilege is a stolen-token incident waiting to happen. You might think “my app never calls the API” means the SA does not matter—sidecars, operators, and debug tooling still inherit that identity.
+Why do Pods need an identity at all? Because the API server has to decide whether to answer their requests. A Pod that lists other Pods, reads a ConfigMap, or updates a custom resource is making an authenticated call, and something has to be on the other end of that call. The ServiceAccount is that something.
+
+Every namespace comes with one named `default`, and every Pod that does not name a different one gets it automatically. That is convenient and it is also the problem. If you grant rights to `default`, you have granted them to every Pod in the namespace, including the ones you did not write. Give each application its own ServiceAccount with only the rights it actually needs.
+
+One belief to let go of early: "my app never calls the API, so the ServiceAccount does not matter." The token is mounted into the container whether your code uses it or not. Sidecars use it. Debug tooling uses it. And anyone who breaks into that container finds a working credential sitting on the filesystem.
 
 > ⚠️ **Common Pitfall:** Assuming “no API calls in my app” means the ServiceAccount does not matter. Sidecars, operators, and opportunistic tooling still inherit that identity.
 
 ### Under the hood
+
+Here is a dedicated identity and a Pod that uses it:
 
 ```yaml
 apiVersion: v1
@@ -94,7 +102,7 @@ What breaks if you leave automount enabled on a Pod that never needs the API: a 
 
 ### In production
 
-**Ownership:** App teams own per-workload ServiceAccounts; platform owns default SA hygiene and projected token defaults. Detect unused automounted tokens via admission checks. Mitigate with `automountServiceAccountToken: false` when unused.
+**Ownership:** App teams create and own the ServiceAccount for each workload. The platform team keeps the `default` ServiceAccount clean and sets the token defaults. Find tokens mounted into Pods that never use them with an admission check. Remove them by setting `automountServiceAccountToken: false` on those Pods.
 
 | Do | Don't |
 |----|-------|
@@ -114,13 +122,21 @@ What breaks if you leave automount enabled on a Pod that never needs the API: a 
 
 ### In plain terms
 
-RBAC answers: *may this identity perform this verb on this resource in this scope?* Roles are permission menus; bindings hand those menus to subjects (Users, Groups, ServiceAccounts).
+**RBAC** answers one question on every API request: may this identity perform this action on this kind of object, here? The action is called a **verb** — `get`, `list`, `create`, `delete`, and a few others.
 
-Least privilege is change safety for the control plane: every extra verb widens blast radius when a token leaks. You might think `cluster-admin` in CI is fine “until we harden”—tokens leak; the blast radius becomes the entire cluster.
+RBAC splits that into two objects, and this is the part worth slowing down for. A **Role** is a list of permissions and nothing more. It grants nobody anything on its own. A **RoleBinding** attaches a Role to a **subject**, which is a user, a group, or a ServiceAccount. A role is the menu; a binding is handing that menu to someone.
+
+Then there is scope. A **Role** only works inside one namespace. A **ClusterRole** is the same idea but written once for the whole cluster, and it is what you need for objects that do not live in any namespace, such as nodes or PersistentVolumes. A ClusterRole is also reusable: bind it with a RoleBinding and its permissions apply in just that one namespace, which is how you write "read-only" once and grant it in twenty places.
+
+> 💡 **In one line:** A Role lists permissions inside one namespace, a ClusterRole lists them cluster-wide or for reuse, and neither does anything until a binding hands it to somebody.
+
+Why be strict about all this? Because every extra verb you grant is a verb an attacker gets for free if that token ever leaks. Granting `cluster-admin` to a CI pipeline "just until we harden it" is the version of this mistake that shows up in real postmortems. That pipeline's token now controls every namespace, every Secret, and every node.
 
 > ⚠️ **Common Pitfall:** Binding `cluster-admin` to a CI ServiceAccount “just for now.” Tokens leak; blast radius becomes the entire cluster.
 
 ### Under the hood
+
+Here are the four objects and exactly what each one covers:
 
 | Object | Scope | Purpose |
 |--------|-------|---------|
@@ -193,7 +209,7 @@ What breaks if `roleRef` name/kind typos: the binding exists but grants nothing�
 
 ### In production
 
-**Ownership:** Platform owns cluster-admin break-glass and CI deployer roles; app teams own namespace Roles for their SAs. Separate human admin, CI deployer, and runtime SA identities. Detect privilege creep with periodic `auth can-i --list` and audit alerts on ClusterRoleBinding changes.
+**Ownership:** The platform team owns the emergency admin identity and the roles CI uses to deploy. App teams own the namespace Roles for their own ServiceAccounts. Keep three identities apart: the human admin, the CI deployer, and the ServiceAccount the app runs as. Catch rights that creep upward by running `auth can-i --list` on a schedule and alerting whenever a ClusterRoleBinding changes.
 
 | Do | Don't |
 |----|-------|
@@ -215,13 +231,19 @@ What breaks if `roleRef` name/kind typos: the binding exists but grants nothing�
 
 ### In plain terms
 
-A **security context** constrains *how* the process runs inside the container: which user ID, whether it can gain privileges, whether the root filesystem is writable, which Linux capabilities remain. RBAC never sees this—NetworkPolicy never sees this—yet a root container with all capabilities is a gift to an attacker who escapes the app.
+A **security context** is a block in your Pod spec that limits what the process inside a container may do on the node. Which user it runs as. Whether it can gain more privileges than it started with. Whether it can write to its own filesystem. Which special powers the Linux kernel grants it.
 
-Hardening shrinks what a compromised process can do on the node. You might think “we’re private VPC so root is fine”—identity theft and supply-chain bugs do not care about your VPC boundary.
+Why does this need its own control? Because RBAC and NetworkPolicy both work at a level above the container. RBAC decides what API calls the Pod may make. NetworkPolicy decides who it may talk to. Neither one has any opinion about a process running as root with every kernel power enabled. If an attacker finds a bug in your application, that is exactly the situation they hope to land in.
+
+A word on the powers involved. Linux splits root's abilities into **capabilities**, individual permissions such as "bind to a low-numbered port" or "load a kernel module." A container that keeps all of them is nearly root on the host. A container that drops all of them and adds back the one it truly needs is dramatically harder to escape from.
+
+The reassuring argument you will hear is "we run in a private network, so root inside the container is fine." A private network does not help here. A leaked token, a compromised dependency, or a malicious base image all start *inside* that network already.
 
 > ⚠️ **Common Pitfall:** Dropping all capabilities but leaving `allowPrivilegeEscalation: true` or a writable root FS—defense in depth means stacking controls.
 
 ### Under the hood
+
+Here is a hardened Deployment with every setting in place:
 
 ```yaml
 apiVersion: apps/v1
@@ -299,7 +321,7 @@ What breaks if the image expects to write to `/var` but you set `readOnlyRootFil
 
 ### In production
 
-**Ownership:** App teams own workload securityContext; platform owns chart defaults and exemption process for privileged DaemonSets. Detect with PSA violations and admission reports. Mitigate by making hardened context the default and documenting each exemption.
+**Ownership:** App teams write the securityContext for their own workloads. The platform team owns the hardened defaults in shared charts and runs the exemption process for the few DaemonSets that genuinely need extra privileges. Detect gaps through PSA violations and admission reports. Close them by making the hardened settings the default a team gets without asking, and by writing down the reason for every exemption.
 
 | Do | Don't |
 |----|-------|
@@ -319,13 +341,19 @@ What breaks if the image expects to write to `/var` but you set `readOnlyRootFil
 
 ### In plain terms
 
-**Pod Security Admission** enforces **Pod Security Standards** at the namespace level—like a building inspector who rejects plans that violate fire code before construction starts. Labels on the namespace choose the standard and mode.
+**Pod Security Admission** (PSA) is a check built into the API server that inspects every Pod before it is created and rejects the ones that are not hardened enough. You turn it on by putting labels on a namespace.
 
-PSA turns securityContext folklore into admission policy. You might think flipping `enforce=restricted` cluster-wide overnight is decisive leadership—it breaks hostPath DaemonSets and emergency tooling. Roll warn → audit → enforce.
+Why is this needed when you already wrote a good securityContext? Because writing one is voluntary. The next engineer, the next Helm chart, and the next copy-pasted manifest may not. PSA moves the rule from something people are asked to remember into something the cluster refuses to accept. It is the building inspector who rejects the plans before anyone pours concrete.
+
+PSA enforces the **Pod Security Standards**, three named levels that ship with Kubernetes: `privileged` allows everything, `baseline` blocks the well-known escalation tricks, and `restricted` demands the full hardened set. You choose one per namespace.
+
+You also choose a mode, and this is where rollouts succeed or fail. `warn` prints a message and allows the Pod. `audit` records it and allows the Pod. `enforce` rejects it. Turning on `enforce=restricted` across the cluster in one change sounds decisive. In practice it blocks the monitoring DaemonSet that needs a host path and the debug tooling you were about to reach for. Go `warn`, then `audit`, then `enforce`.
 
 > ⚠️ **Common Pitfall:** Enforcing `restricted` suddenly on system namespaces that need hostPath. Exempt thoughtfully; do not disable PSA everywhere.
 
 ### Under the hood
+
+Here are the three levels and exactly what each one allows:
 
 | Standard | Strictness | Summary |
 |----------|------------|---------|
@@ -363,7 +391,7 @@ What breaks if you pin `enforce-version=latest` through a Kubernetes upgrade: ne
 
 ### In production
 
-**Ownership:** Platform owns PSA label baselines per namespace class; app teams remediate workloads before enforce raises. Detect with warn/audit events before enforce. Mitigate with staged rollout and version-pinned labels.
+**Ownership:** The platform team decides which PSA level each class of namespace starts at. App teams fix their workloads before the level is raised to enforce. Find the work by reading warn and audit events while enforcement is still off. Keep the rollout safe by raising the level in stages and by pinning the PSA version in the labels rather than tracking `latest`.
 
 | Do | Don't |
 |----|-------|
@@ -383,13 +411,19 @@ What breaks if you pin `enforce-version=latest` through a Kubernetes upgrade: ne
 
 ### In plain terms
 
-Private registries need credentials. Create a `kubernetes.io/dockerconfigjson` Secret and attach it to the Pod or ServiceAccount—never paste registry passwords into Deployment env vars.
+An **image pull secret** is a credential the kubelet uses to log in to a private registry so it can download your image. It is stored as a Secret of type `kubernetes.io/dockerconfigjson`, and you attach it either to the Pod or to the ServiceAccount the Pod runs as.
 
-Pull credentials are supply-chain doors: too broad and every namespace can pull sensitive images; too fragile and rollouts fail with ImagePullBackOff. You might think env-var registry passwords are “simpler than Secrets”—they appear in process listings and manifests.
+Why does this get its own section? Because it is the one credential that has to exist before your container does. Get it wrong and the Pod never starts at all — it sits in `ImagePullBackOff`, which means the kubelet tried to download the image, was refused, and is waiting to try again. Get it too broadly shared and every namespace in the cluster can pull your private images.
+
+There is a tempting shortcut here that is worth naming. Putting the registry username and password in environment variables looks simpler than creating a Secret. It is not simpler, and it is much worse: those values show up in the Deployment manifest, in `kubectl describe` output, in the process list on the node, and in whatever Git repository holds the manifest.
+
+Where your cloud offers it, skip the password entirely. Workload identity lets the node or the Pod prove who it is to the registry, with no long-lived secret to leak or rotate.
 
 > ⚠️ **Common Pitfall:** Storing registry passwords in ConfigMaps or plaintext CI logs. Use pull secrets or cloud workload identity.
 
 ### Under the hood
+
+Here is how you create the credential and attach it:
 
 ```bash
 $ kubectl create secret docker-registry regcred \
@@ -426,7 +460,7 @@ What breaks if the pull token expires but Deployments still reference it: mass I
 
 ### In production
 
-**Ownership:** Platform owns registry identity patterns (node/workload identity preferred); app teams attach the right secret or identity annotation. Detect ImagePullBackOff and auth errors in events. Mitigate with rotation runbooks and digest-pinned production images.
+**Ownership:** The platform team decides how workloads authenticate to registries, and should prefer node or workload identity over stored passwords. App teams attach the right secret or identity annotation to their Pods. Detect trouble through ImagePullBackOff events and registry authentication errors. Reduce the risk with a written rotation procedure and by pinning production images to a digest.
 
 | Do | Don't |
 |----|-------|
@@ -446,15 +480,19 @@ What breaks if the pull token expires but Deployments still reference it: mass I
 
 ### In plain terms
 
-Auditing answers: *who did what to which object, when, and from where?* When a Deployment disappears at 2 a.m., RBAC tells you what *was allowed*; the audit log tells you what *happened*. Without audits, incident response is guesswork.
+**Audit logging** is a record the API server writes of every request it handled: who made it, what they did, to which object, at what time, and from which address.
 
-Incident evidence lives here: Subject, verb, object, time, source IP. You might think Metrics and logs are enough—neither reconstructs “who bound cluster-admin” the way API audit does.
+Why keep it? Because RBAC and audit logs answer two different questions, and during an incident you need the second one. RBAC tells you what *was allowed*. The audit log tells you what someone *actually did*. When a Deployment vanishes at 2 a.m., "the CI account was permitted to delete it" does not help. "The CI account deleted it at 02:14 from this address" does.
+
+Metrics and application logs will not fill this gap. Neither one can tell you who attached `cluster-admin` to a ServiceAccount last Thursday. Only the API audit trail records that.
+
+There is a real cost to overdoing it, though. You can ask the API server to record the full body of every request and response. On a busy cluster that produces an enormous volume of data, and it copies your Secret contents into a log file — turning your audit trail into a second thing an attacker would love to steal. Record metadata by default and raise the level only for the handful of resources that justify it.
 
 > ⚠️ **Common Pitfall:** Logging `RequestResponse` for every object at massive scale. Audit volume and sensitive data (Secret bodies) can overwhelm storage and create a second breach surface. Prefer selective rules.
 
 ### Under the hood
 
-The API server evaluates an **audit policy** that selects requests by users, verbs, resources, and namespaces, and assigns levels:
+Here is how you control what gets recorded. The API server evaluates an **audit policy** that selects requests by users, verbs, resources, and namespaces, and assigns levels:
 
 | Level | What is recorded |
 |-------|------------------|
@@ -509,7 +547,7 @@ What breaks if audits stay only on the control-plane disk: a node loss destroys 
 
 ### In production
 
-**Ownership:** Platform owns audit policy, shipping, and retention; security owns alert rules on privileged changes. Detect binding changes to `cluster-admin` and Secret deletes in prod namespaces. Mitigate with immutable storage and least-privilege access to audit streams.
+**Ownership:** The platform team owns the audit policy, where the logs are sent, and how long they are kept. The security team owns the alerts that fire on privileged changes. Watch for two things in particular: anyone binding `cluster-admin`, and Secret deletions in production namespaces. Protect the trail itself with storage that cannot be edited after the fact, and by restricting who can read the audit stream.
 
 | Do | Don't |
 |----|-------|
@@ -637,12 +675,15 @@ RBAC defines what is *allowed*. **Audit logs** record what *actually happened* (
 
 ## 21.13 Key takeaways
 
-- ServiceAccounts are workload identities; give each app its own and bind minimal RBAC.
-- Roles/ClusterRoles define verbs on resources; bindings grant them to subjects—verify with `auth can-i`.
-- Security contexts and Pod Security Admission harden *how* containers run.
-- Image pull secrets unlock private registries without embedding passwords in Pod specs.
-- Cluster auditing records API activity; ship, protect, and alert on privileged changes.
-- Layer RBAC, PSA, Secrets hygiene, NetworkPolicy, and audits—no single control is enough.
+- A Pod's identity is its ServiceAccount. Give each app its own; never load up `default`.
+- A Role lists permissions. A binding hands them out. Neither works without the other.
+- Role is one namespace. ClusterRole is cluster-wide or reusable across namespaces.
+- Prove permissions with `kubectl auth can-i --as=...`, for both the yes case and the no case.
+- Never grant `cluster-admin` to CI or to a running app. Tokens leak.
+- Security contexts limit what the process can do. RBAC has no opinion about root.
+- PSA makes hardening mandatory instead of optional. Roll it out warn, then audit, then enforce.
+- Audit logs say what happened. RBAC only says what was allowed.
+- Every control catches a different failure. Stack them.
 
 ---
 

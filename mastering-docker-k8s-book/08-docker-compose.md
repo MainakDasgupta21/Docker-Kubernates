@@ -287,13 +287,19 @@ Use profiles for debug UIs, seed jobs, and heavy optional components. Do not use
 
 ### In plain terms
 
-`depends_on: [db]` only controls *start order*. Postgres's container can be "started" long before it accepts connections. Your API can race ahead, fail, and crash. A **health check** plus `condition: service_healthy` waits for readiness.
+A **health check** is a command Compose runs inside a container again and again to decide whether the service inside is actually working.
 
-The gap this closes is the difference between *started* and *ready*. Compose can start the `db` container in milliseconds, but Postgres itself needs seconds more to initialize its data directory and open its socket. Plain `depends_on: [db]` only guarantees the db container was launched first — not that the database inside it answers. So the API connects to a port nothing is listening on yet, throws, and (depending on your restart policy) crash-loops. A health check turns "the container exists" into "the service actually works," and `condition: service_healthy` makes dependents wait for that stronger signal.
+You need it because *started* and *ready* are not the same thing. Compose can start the `db` container in milliseconds, but Postgres itself needs several more seconds to set up its data directory and open its socket. Plain `depends_on: [db]` only promises that the db container was launched first. It does not promise that the database answers. So your API connects to a port where nothing is listening yet, throws an error, and — depending on the restart policy — crash-loops.
 
-> ⚠️ **Common Pitfall:** You might read `depends_on: [db]` as "wait until the database is ready." It is not — it is purely start *ordering*. This is one of the most common Compose foot-guns: the stack works on a fast machine (db happens to be ready in time) and fails intermittently on a slow one or in CI, which looks like a flaky test but is really a readiness race.
+A health check turns "the container exists" into "the service really works." Adding `condition: service_healthy` to `depends_on` makes the API wait for that stronger signal instead of racing ahead.
+
+> 💡 **In one line:** `depends_on` on its own only sets start order. A `healthcheck` plus `condition: service_healthy` is what makes one service wait until another is genuinely ready.
+
+> ⚠️ **Common Pitfall:** You might read `depends_on: [db]` as "wait until the database is ready." It is not that at all. It is purely start *order*. This is one of the most common Compose traps: the stack works on a fast machine, because the db happens to be ready in time, and then fails now and then on a slow machine or in CI. It looks like a flaky test, but it is a readiness race.
 
 ### Under the hood
+
+Here is what actually happens on the machine when you add the check:
 
 ```yaml
 services:
@@ -331,9 +337,9 @@ flowchart LR
 
 ### In production
 
-Health checks are not a substitute for application retries, but they stop the most common "API started before DB" foot-gun in local and CI stacks. Mirror the same readiness idea later with Kubernetes probes (Chapter 13).
+Health checks do not replace retries in your application code, but they do stop the most common "API started before the database" trap in local and CI stacks. You will meet the same readiness idea again as Kubernetes probes (Chapter 13).
 
-**Who owns this:** the app team owns each service's health check (the command, interval, and `start_period`) because only the app knows what "ready" means for it. **Failure mode and detection:** two shapes recur. A health check that is too strict or lacks a `start_period` marks a still-initializing service unhealthy and stalls the whole stack; a check that is too shallow (`exit 0` on a trivial command) reports healthy while the app is broken. Detect with `docker compose ps` (the STATUS column shows `healthy`/`unhealthy`) and `docker inspect --format '{{json .State.Health}}' <ctr>` for the probe history. **Do** give slow-starting services a realistic `start_period` and a check that exercises real readiness (`pg_isready`, an HTTP `/healthz`); **don't** rely on health checks alone — apps should still retry transient connection failures.
+**Who owns this:** the app team owns each service's health check — the command, the interval, and the `start_period` — because only the app knows what "ready" means for it. **Failure mode and detection:** two shapes recur. A check that is too strict, or that has no `start_period`, marks a service unhealthy while it is still starting up and stalls the whole stack. A check that is too shallow, such as `exit 0` on a trivial command, reports healthy while the app is broken. Watch the STATUS column in `docker compose ps` for `healthy` and `unhealthy`, and read the probe history with `docker inspect --format '{{json .State.Health}}' <ctr>`. **Do** give slow-starting services a realistic `start_period` and a check that proves real readiness, such as `pg_isready` or an HTTP `/healthz` call; **don't** lean on health checks alone — the app should still retry a connection that fails once.
 
 **Before you leave this section**
 
@@ -347,15 +353,17 @@ Health checks are not a substitute for application retries, but they stop the mo
 
 ### In plain terms
 
-Bind mounts are one way to live-reload code. **Compose Watch** is another: you declare which local paths to monitor and what to do when they change — sync files into the container, rebuild the image, restart, or run a command — then leave Compose running while you edit.
+**Compose Watch** is a Compose feature that watches folders on your machine and reacts to each change the way you asked: copy the file into the container, rebuild the image, restart the service, or run a command.
 
-Watch exists because a bind mount is a blunt instrument for the dev loop: it maps a whole tree in and reflects file edits, but it does nothing intelligent about *what kind* of change happened. Editing a Python source file should just sync; changing `requirements.txt` needs a full image rebuild; changing a process config file needs a restart. Watch lets you declare that mapping per path, so Compose does the right thing automatically while you keep editing — without mounting the entire project or manually rebuilding.
+You want it because a bind mount is a blunt tool for the development loop. It maps a whole folder tree in and reflects your edits, but it does nothing clever about *what kind* of change happened. Editing a Python source file should just copy the file across. Changing `requirements.txt` needs a full image rebuild. Changing a process config file needs a restart.
 
-> ⚠️ **Common Pitfall:** You might think Watch replaces your build for shipping. It does not. Watch is a *local developer velocity* tool; the `Dockerfile` and image build remain the source of truth for how the service ships to CI and production. Wiring Watch-style syncing into a production host would let arbitrary file changes mutate running containers outside your image pipeline.
+Watch lets you declare that mapping one path at a time. Compose then does the right thing on its own while you keep editing, and you never mount the whole project or rebuild by hand.
+
+> ⚠️ **Common Pitfall:** You might think Watch replaces your build when it is time to ship. It does not. Watch only exists to make local development fast. The `Dockerfile` and the image build stay the source of truth for how the service reaches CI and production. Wiring Watch-style syncing into a production host would let stray file changes alter running containers outside your image pipeline.
 
 ### Under the hood
 
-Add a `develop.watch` list under a service (Compose Specification `develop` attribute):
+Here is what you actually write. Add a `develop.watch` list under a service (the Compose Specification `develop` attribute):
 
 ```yaml
 services:
@@ -414,9 +422,9 @@ flowchart TD
 
 ### In production
 
-Do not enable watch-based workflows against production hosts. Use Watch locally (and maybe in ephemeral preview environments). Ship immutable images built in CI for anything that faces real traffic.
+Never point a watch-based workflow at a production host. Use Watch locally, and at most in short-lived preview environments. Ship images built in CI, unchanged after the build, for anything that serves real traffic.
 
-**Who owns this:** the app team owns the `develop.watch` rules for the local loop; the platform team owns the guarantee that production runs immutable, CI-built images and nothing mutates containers in place. **Failure mode and detection:** the anti-pattern is a `sync`-based workflow creeping toward a real environment, breaking the "the image is the artifact" contract so that what runs no longer matches what was built and scanned. Detect it by ensuring deploy pipelines build and push images (never `compose watch`) and that production containers are recreated from digests, not patched live. **Do** keep Watch to laptops and ephemeral previews; **don't** point Watch at a shared or production host.
+**Who owns this:** the app team owns the `develop.watch` rules for the local loop. The platform team owns the guarantee that production runs CI-built images and that nothing edits a running container in place. **Failure mode and detection:** the bad pattern is a `sync`-based workflow creeping toward a real environment. It breaks the rule that the image is the artifact, so what runs no longer matches what was built and scanned. Check that deploy pipelines build and push images — never `compose watch` — and that production containers are recreated from digests rather than patched while running. **Do** keep Watch on laptops and short-lived previews; **don't** point Watch at a shared or production host.
 
 **Before you leave this section**
 
@@ -684,12 +692,15 @@ When optional services belong to the same project and you just want to toggle th
 
 ## 08.11 Key takeaways
 
-- Compose turns a multi-container app into one declarative `compose.yaml`, run with `docker compose up`.
-- The modern standard is the **Compose Specification**: no `version:` key, prefer `compose.yaml`, and retire "v3 syntax" as the organizing story.
-- Pillars — `services`, `networks`, `volumes` — map to earlier chapters.
-- Interpolate with `.env`, inject with `environment:` / `env_file:`, reshape with overrides, `extends`, and **profiles**.
-- Health checks plus `depends_on.condition: service_healthy` give readiness-based ordering.
-- **`develop.watch`** (Compose Watch) syncs, rebuilds, or restarts on local file changes for a fast development loop — not for production deploys.
+- One file describes the whole app. `docker compose up` runs it.
+- Use the **Compose Specification**: no `version:` key, name the file `compose.yaml`, and drop "v3 syntax" from your vocabulary.
+- Three keys, three chapters: `services` (containers), `networks` (connections), `volumes` (data).
+- Services reach each other by service name, never by `localhost` and never by IP.
+- `.env` fills `${VAR}` in the file. `environment:` and `env_file:` set variables inside the container. Layered files and **profiles** change what runs.
+- `depends_on` only orders startup. Add a `healthcheck` plus `condition: service_healthy` to wait for ready.
+- Give a datastore no published port. It does not need one.
+- **Compose Watch** (`develop.watch`) copies, rebuilds, or restarts as you edit. It is for your laptop, not for deploys.
+- `docker compose down -v` deletes the project's named volumes, database included.
 
 ---
 
