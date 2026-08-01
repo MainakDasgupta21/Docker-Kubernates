@@ -15,6 +15,8 @@ A self-contained textbook that takes you from first principles of containers to 
 
 **How to read each concept:** start with **In plain terms** for intuition, then **Under the hood** for the exact mechanism, then **In production** for how an MNC platform team would own, detect, and operate it. Look for **Before you leave this section** checklists and occasional `Production floor` callouts for blast-radius and change-safety rules.
 
+**Written simple first.** Plain-terms sections use everyday words and define each new term the first time it appears, so beginners never need the vocabulary in advance. The technical depth is not reduced—it moves into **Under the hood** and **In production**, with `In one line` summaries on the densest ideas.
+
 **Assumed versions:** Docker Engine **29.x** · Kubernetes **1.36** (supported window often discussed as 1.33–1.36)  
 **Audience:** Beginners through early-career DevOps/SRE engineers who want a clear path from laptop demos to production habits.
 

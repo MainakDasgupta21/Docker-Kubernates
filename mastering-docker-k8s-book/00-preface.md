@@ -77,6 +77,14 @@ Most major concepts are written in **three depth tiers**. Read them in order the
 | 2 | **Under the hood** | Mechanism, realistic commands or YAML, sample output, and what breaks if you get a detail wrong |
 | 3 | **In production** | Who owns it, how failures show up, how you mitigate, and a concrete do / don’t |
 
+**Simple first, exact second.** Tier 1 uses everyday words on purpose. Each new term is defined the first time you meet it, so you never have to already know the vocabulary to follow the idea. Tier 2 then gives you the precise mechanism, and Tier 3 gives you the operating rules. If a plain-terms paragraph ever feels too basic, that is by design—it is the ramp, not the destination.
+
+For the densest ideas you will also see a one-line summary you can carry away even on a fast skim:
+
+```markdown
+> 💡 **In one line:** …
+```
+
 After those three tiers you will often see a short micro-checklist:
 
 ```markdown

@@ -4,39 +4,41 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain which production problems container orchestration solves that single-host Docker cannot
-> - Contrast imperative and declarative operations, and say why declarative wins at scale
-> - Describe the reconciliation loop that makes Kubernetes self-healing
-> - Name the core vocabulary — cluster, node, control plane, Pod, object, controller — in plain language
-> - Create a local Kubernetes 1.36 cluster with kind and talk to it using `kubectl`
-> - Run the Task API first imperatively, then declaratively with a version-controlled manifest
-> - Recognize what Kubernetes deliberately does *not* do for you
+> - Say which problems Kubernetes solves that Docker on one machine cannot
+> - Tell the difference between giving commands and writing down what you want
+> - Explain the repeating loop that lets Kubernetes fix things without you
+> - Use the core words — cluster, node, control plane, Pod, object, controller — correctly
+> - Build a local Kubernetes 1.36 cluster with kind and talk to it using `kubectl`
+> - Run the Task API twice: once by command, once from a file you keep in Git
+> - Name the jobs Kubernetes deliberately leaves to you
 
 ---
 
 ## 11.1 Three in the morning
 
-Alex's phone buzzes at 03:12. The Task API — the small Flask service you packaged back in Chapter 04 — is down. A host rebooted after a kernel update, and the container that was started with `docker run -d` never came back. Alex SSHs in, runs `docker start task-api`, and goes back to bed.
+Alex's phone buzzes at 03:12. The Task API is down. That is the small Flask service you packaged back in Chapter 04. A machine rebooted after a kernel update, and the container never came back. Alex logs in over SSH, runs `docker start task-api`, and goes back to bed.
 
 ![Shipping port control tower for Kubernetes orchestration](assets/analogy-shipping-port.png)
 
 *Figure 11.A: Kubernetes is the control tower that keeps many cranes moving toward declared desired state.*
 
-At 03:40 the phone buzzes again. Different host. Same story.
+At 03:40 the phone buzzes again. Different machine. Same story.
 
-Nothing here is a mystery. The container worked. The image was fine. The *operating model* was wrong: a human being was the only component that knew the Task API was supposed to be running. Docker faithfully did what it was told — start this container, once — and nothing more.
+Nothing here is mysterious. The container worked. The image was fine. What was wrong is *how the service was operated*. Only one part of the system knew the Task API was supposed to be running, and that part was a person. Docker did exactly what it was told: start this container, once. Nothing more.
 
-Now scale that up. Forty services. Twelve machines. Launch-day traffic that triples in an hour. A bad release that needs to roll back without dropping requests. A machine that dies for good. Every one of those situations needs a decision, and every decision made by a tired human at 3 a.m. is a decision made badly.
+Now make it bigger. Forty services. Twelve machines. Traffic that triples in an hour on launch day. A bad release that must be undone without dropping requests. A machine that dies and never comes back. Each of those moments needs a decision. Decisions made by a tired human at 3 a.m. are usually bad decisions.
 
-**Container orchestration** is the practice of handing those decisions to software. **Kubernetes** — often written **K8s**, "K", eight letters, "s" — is the orchestrator that the industry standardized on, and this chapter is where your Docker knowledge starts paying compound interest.
+**Container orchestration** means handing those decisions to software instead of a person. **Kubernetes** is the orchestrator the industry settled on. People also write it **K8s** — the letter "K", then eight letters, then "s". This chapter is where your Docker knowledge starts paying off.
 
 ### The harbor master analogy
 
-Picture a busy container port. Shipping containers arrive by the thousand. Nobody wants a human running between cranes shouting instructions about which box goes on which berth.
+Picture a busy shipping port. Containers arrive by the thousand. Nobody wants a person running between cranes, shouting which box goes on which berth.
 
-Instead, the port has a **harbor master** who holds a manifest: *"There must always be three refrigerated containers on the north dock, held at 4 °C."* Cranes, trucks, and cooling units are dispatched automatically to make reality match that manifest. When a cooling unit fails, the harbor master moves the container to a working berth — nobody files a request.
+Instead the port has a **harbor master**, the one person who holds the written plan. The plan says: *"There must always be three refrigerated containers on the north dock, held at 4 °C."* Cranes, trucks, and cooling units get sent out automatically so reality matches that plan. If a cooling unit fails, the harbor master moves the container to a working berth. Nobody files a request first.
 
-Kubernetes is that harbor master. You do not describe the steps; you describe the **desired state** of the port, and Kubernetes works continuously to make the world match your description. That single idea carries the rest of this book.
+Kubernetes is that harbor master. You do not list the steps. You describe the **desired state**, which is the condition you want the system to be in. Kubernetes then works nonstop to make the world match your description. That one idea carries the rest of this book.
+
+> 💡 **In one line:** You write down the state you want; Kubernetes keeps working until the cluster looks like that.
 
 ```mermaid
 flowchart TB
@@ -67,11 +69,13 @@ flowchart TB
 
 ### In plain terms
 
-Orchestration is the difference between hiring a contractor for one afternoon and hiring a building superintendent. The contractor does exactly what you ask, when you ask. The superintendent keeps the building in the condition you agreed on — forever — noticing broken things before you do and fixing them without a conversation.
+**Orchestration** is software that decides where your containers run, restarts them when they die, and keeps the right number of copies alive. It watches many machines at once and takes action on its own.
 
-The problem orchestration solves is *scale of decisions*: every restart, placement, scale-up, discovery, and rollback is a decision someone must make. On one host you can be that someone. Across dozens of services and machines, the clipboard becomes the outage.
+Here is the problem it solves. Every restart, every choice of machine, every scale-up, and every rollback is a *decision*. On one machine you can make those decisions yourself. Across dozens of services and machines, you cannot. There are too many, they come at bad hours, and forgetting one causes an outage.
 
-Concretely, an orchestrator answers questions you would otherwise answer by hand:
+Think of it as the difference between hiring a contractor for one afternoon and hiring a building superintendent. The contractor does exactly what you ask, when you ask. The superintendent keeps the building in the agreed condition forever. He notices broken things before you do and fixes them without a conversation.
+
+An orchestrator answers questions you would otherwise answer by hand:
 
 | Question at 3 a.m. | Who answers it in Kubernetes |
 |--------------------|------------------------------|
@@ -86,7 +90,7 @@ Concretely, an orchestrator answers questions you would otherwise answer by hand
 
 ### Under the hood
 
-Kubernetes is not one program. It is a small set of cooperating components plus a lot of independent **controllers**, all coordinating through one shared, versioned datastore reached via one HTTP API.
+Here is what actually runs inside a cluster. Kubernetes is not one program. It is a small set of cooperating components plus many independent **controllers**, all coordinating through one shared, versioned datastore reached via one HTTP API.
 
 ```mermaid
 flowchart LR
@@ -99,24 +103,24 @@ flowchart LR
 
 *Figure 11.2: Every change flows through the API server; etcd holds truth while controllers and kubelets watch and act.*
 
-Three properties fall out of that design and explain most of Kubernetes's behavior:
+Three properties come out of that design, and they explain most of what Kubernetes does:
 
 1. **Everything is an object in the API.** Pods, Services, Secrets, even node heartbeats. If you can `GET` it, you can watch it, and if you can watch it, you can automate it.
-2. **Nothing talks directly to anything else.** Controllers do not call the scheduler; they write objects and let the scheduler notice. This decoupling is why Kubernetes survives components restarting.
-3. **Work is level-triggered, not edge-triggered.** Components re-derive what to do from current state rather than from a stream of events they must never miss. A missed event is not a catastrophe; the next sync fixes it.
+2. **Nothing calls anything else directly.** Controllers do not call the scheduler. They write objects and let the scheduler notice. Because the parts are kept apart this way (**decoupling**), Kubernetes keeps working when a component restarts.
+3. **Work is level-triggered, not edge-triggered.** Components look at the current state and work out what to do, instead of following a stream of events they must never miss. A missed event is not a disaster; the next check fixes it.
 
 You will trace all of this concretely in Chapter 12.
 
 ### In production
 
-Orchestration is not free, and pretending otherwise is how teams get hurt. Adopting Kubernetes means adopting:
+Orchestration is not free, and teams get hurt when they pretend it is. Running Kubernetes means taking on four new jobs:
 
-- **A new failure surface.** Your app can now fail *and* the platform can fail. You need to know which is which (Chapter 22).
-- **Capacity discipline.** Requests and limits are how the scheduler makes decisions. Skip them and you get mystery evictions (Chapter 13).
-- **Upgrade cadence.** Kubernetes ships roughly three minor releases a year and supports about the last four (this book targets **1.36**, with 1.33–1.36 as the practical support window). Clusters are living systems, not appliances.
-- **Configuration as code.** If your cluster state exists only in shell history, you have rebuilt the 3 a.m. problem with more moving parts.
+- **A second place things can break.** Your app can fail *and* the platform can fail. You must be able to tell which one broke (Chapter 22).
+- **Capacity discipline.** Requests and limits are the numbers the scheduler uses to place work. Skip them and Pods get evicted for reasons nobody can explain (Chapter 13).
+- **A regular upgrade habit.** Kubernetes ships about three minor releases a year and supports roughly the last four. This book targets **1.36**, with 1.33–1.36 as the practical support window. A cluster is a living system, not an appliance you install once.
+- **Configuration kept as code.** If your cluster state only exists in your shell history, you have rebuilt the 3 a.m. problem with more moving parts.
 
-A useful rule of thumb: adopt Kubernetes when you have **many services, more than one machine, and real uptime expectations**. One container on one small VM is a job for plain Docker or a managed container service, and choosing the boring option there is a sign of seniority, not inexperience.
+A useful rule: pick Kubernetes when you have **many services, more than one machine, and real uptime expectations**. One container on one small VM belongs on plain Docker or a managed container service. Choosing the boring option there shows experience, not the lack of it.
 
 > ⚠️ **Common Pitfall:** Adopting Kubernetes for a single container on one VM "to learn production." You learn the control plane's failure modes without the problems orchestration solves—prefer a real multi-service need, or keep the learning cluster explicitly non-production.
 
@@ -132,9 +136,11 @@ A useful rule of thumb: adopt Kubernetes when you have **many services, more tha
 
 ### In plain terms
 
-Imperative is a *recipe*: "boil water, add pasta, drain after nine minutes." Declarative is an *order*: "I would like a plate of pasta, al dente." The recipe tells someone what to do; the order tells them what you want, and lets them figure out the steps — including what to do when the water boils over.
+**Imperative** means you give step-by-step commands: do this, then this. **Declarative** means you describe the end result you want and let the system work out the steps.
 
-The problem declarative config solves is *intent that survives the operator*: the cluster remembers what should be true, not only what command last ran. That is the difference between shell history and a Git-reviewed contract.
+Why does this matter? Because commands are forgotten and results are remembered. When you write down the result, the cluster keeps that promise even after you close your laptop. When you only run commands, the knowledge lives in your head and in your shell history. That is the difference between a note nobody can find and a reviewed file in Git.
+
+Here is the everyday version. Imperative is a *recipe*: "boil water, add pasta, drain after nine minutes." Declarative is an *order*: "I would like a plate of pasta, al dente." The recipe tells someone what to do. The order tells them what you want, and lets them handle the surprises — including the water boiling over.
 
 With Docker you were imperative:
 
@@ -144,9 +150,9 @@ $ docker stop task-api
 $ docker rm task-api
 ```
 
-Each command happens once, right now. The knowledge "this service should be running" lives in your head.
+Each command happens once, right now. The fact that "this service should be running" lives only in your head.
 
-With Kubernetes you mostly write down what you want and let the cluster keep that promise:
+With Kubernetes you write down what you want, and the cluster keeps that promise:
 
 ```yaml
 # Plain English version of a manifest:
@@ -154,9 +160,10 @@ With Kubernetes you mostly write down what you want and let the cluster keep tha
 ```
 
 > ⚠️ **Common Pitfall:** You might think imperative `kubectl run` is "just as good" if you write it down in a wiki. Wikis drift; `apply` from Git is the auditable desired state.
+
 ### Under the hood
 
-Kubernetes accepts both styles, and the difference shows up in how state is stored.
+Here is what the cluster stores in each case. Kubernetes accepts both styles, and the difference shows up in what gets remembered.
 
 | Style | Command examples | What the cluster remembers |
 |-------|------------------|----------------------------|
@@ -164,7 +171,7 @@ Kubernetes accepts both styles, and the difference shows up in how state is stor
 | Imperative object config | `kubectl create -f file.yaml` | The object; fails if it already exists |
 | Declarative object config | `kubectl apply -f file.yaml` | The object **plus** a record of the fields you claim to manage |
 
-That last row is the important one. `kubectl apply` performs a three-way merge between your file, the live object, and the fields you managed last time (tracked in `metadata.managedFields`, the mechanism known as **server-side apply**). Because your intent is recorded, `apply` can tell the difference between "the user removed this field" and "the user never set this field," and it can leave fields owned by other actors — an autoscaler, a mutating policy — alone.
+That last row is the important one. `kubectl apply` merges three things: your file, the live object, and the fields you managed the last time you applied. Those managed fields are recorded in `metadata.managedFields`, and the mechanism is called **server-side apply**. Because your intent is on record, `apply` can tell "you deleted this field" apart from "you never set this field." It also leaves fields owned by someone else alone — an autoscaler, or a policy that edits objects on the way in.
 
 Run the same command twice and watch the verb change:
 
@@ -188,12 +195,12 @@ pod/task-api unchanged
 
 ### In production
 
-Declarative configuration is the entry ticket to every practice that makes clusters boring in a good way:
+Writing config declaratively is what makes every good cluster practice possible:
 
-- **Code review for infrastructure.** A YAML diff in a pull request is auditable; a Slack message saying "I scaled it" is not.
-- **Disaster recovery.** If your manifests are in Git, a lost cluster is an afternoon of rebuilding, not an archaeology project.
-- **GitOps.** Tools like Argo CD and Flux continuously apply a Git repository to a cluster and report drift. This only works if Git is authoritative.
-- **Safe collaboration.** Server-side apply lets several controllers own different fields of the same object without fighting each other.
+- **Code review for infrastructure.** A YAML diff in a pull request can be audited later. A Slack message saying "I scaled it" cannot.
+- **Disaster recovery.** If your manifests are in Git, rebuilding a lost cluster takes an afternoon instead of a dig through history.
+- **GitOps.** Tools such as Argo CD and Flux keep applying a Git repository to a cluster and report any **drift**, meaning differences between Git and the live cluster. This only works when Git is the source of truth.
+- **Safe collaboration.** Server-side apply lets several controllers own different fields of the same object without overwriting each other.
 
 > ⚠️ **Warning:** `kubectl edit` and `kubectl scale` change the cluster but not your files. The next `apply` will silently revert your change, usually at the worst possible moment. Treat live edits as emergency surgery: allowed, then immediately reflected back into the repository.
 
@@ -211,13 +218,17 @@ Declarative configuration is the entry ticket to every practice that makes clust
 
 ### In plain terms
 
-A thermostat does not need to be told to turn the heat on. You set 21 °C; it measures the room, compares, and acts — over and over, forever. It does not care *why* the room got cold: an open window, a failed radiator, winter. It only cares that reality differs from the setting.
+A **reconciliation loop** is a small program that keeps comparing what you asked for with what exists, and then fixes the difference. In Kubernetes, each of these programs is called a **controller**.
 
-Kubernetes is built almost entirely out of thermostats. Each one is called a **controller**.
+Why should you care? Because this loop is the reason Kubernetes seems to repair itself. Nobody watches for a dead container and types a restart command. A loop notices the gap and closes it, at 3 a.m., without being asked.
+
+A thermostat works the same way. You set 21 °C. It measures the room, compares, and acts — over and over, forever. It does not care *why* the room got cold: an open window, a broken radiator, winter. It only cares that reality differs from the setting. Kubernetes is built almost entirely out of thermostats.
+
+> 💡 **In one line:** A controller loops forever: look at reality, compare it to your `spec`, and change reality until they match.
 
 ### Under the hood
 
-Every controller runs the same loop:
+Here is the loop each controller actually runs:
 
 1. **Observe** current state (by watching the API server).
 2. **Compare** it to desired state (the `spec` you wrote).
@@ -250,16 +261,16 @@ flowchart TD
 
 *Figure 11.4: Self-healing is reconciliation: a shortfall becomes one new Pod without a human restart command.*
 
-Nobody issued a "restart" command. One controller noticed a shortfall and wrote one object. This is why Kubernetes appears to heal itself: self-healing is just reconciliation you were not watching.
+Nobody typed a "restart" command. One controller noticed it was one Pod short and wrote one object. That is why Kubernetes looks like it heals itself. Self-healing is just reconciliation happening while you were not watching.
 
 ### In production
 
-The loop shapes how you debug and how you design:
+The loop changes how you debug and how you design:
 
-- **Read `status`, not just logs.** `kubectl describe` and `kubectl get -o yaml` show what the responsible controller believes. Conditions such as `Available`, `Progressing`, and `Ready` are the platform telling you where the loop is stuck.
-- **Expect eventual, not instant.** Reconciliation is asynchronous. "I applied it and nothing happened" usually means "give it a few seconds and then read the events."
-- **Never fight a controller.** Manually deleting a Pod that a Deployment owns just makes a new Pod. Change the desired state instead.
-- **Fix causes, not symptoms.** If Pods restart in a loop, the loop is working correctly and your container is not.
+- **Read `status`, not just logs.** `kubectl describe` and `kubectl get -o yaml` show what the controller in charge believes. Conditions such as `Available`, `Progressing`, and `Ready` tell you where the loop is stuck.
+- **Expect "soon," not "instantly."** Reconciliation happens in the background. "I applied it and nothing happened" usually means "wait a few seconds, then read the events."
+- **Never fight a controller.** Deleting a Pod that a Deployment owns just gets you a new Pod. Change the desired state instead.
+- **Fix causes, not symptoms.** If Pods restart over and over, the loop is doing its job correctly and your container is not.
 
 > 💡 **Tip:** Whenever something in the rest of this book "just fixes itself," pause and name the controller responsible. That habit turns Kubernetes from magic into mechanism.
 
@@ -277,7 +288,9 @@ The loop shapes how you debug and how you design:
 
 ### In plain terms
 
-Kubernetes has a large vocabulary but a tiny grammar. Nine words carry you through most conversations:
+Kubernetes has many words but very few rules for putting them together. Nine words carry you through most conversations, and you will meet each one again in its own chapter.
+
+Learn these nine now and the rest of the book stops sounding like code names. Every one of them is an **object**, which is simply a record the cluster stores for you.
 
 | Term | One-line meaning | Covered in |
 |------|------------------|------------|
@@ -291,9 +304,11 @@ Kubernetes has a large vocabulary but a tiny grammar. Nine words carry you throu
 | **Service** | A stable network identity for a set of Pods | Chapter 15 |
 | **Namespace** | A virtual sub-cluster for grouping and isolating objects | Chapter 12 |
 
+> ⚠️ **Common Pitfall:** You might think a Pod is just another name for a container. A Pod *holds* one or more containers and gives them a shared network address and shared storage. Chapter 13 shows why that difference matters.
+
 ### Under the hood
 
-Every object — a one-line ConfigMap or a sprawling StatefulSet — has the same four fields you write, plus one you never do:
+Here is the shape every object shares. A one-line ConfigMap and a sprawling StatefulSet both have the same four fields you write, plus one you never write:
 
 ```yaml
 apiVersion: v1        # which API group and version defines this kind
@@ -309,7 +324,7 @@ spec:                 # DESIRED state — you write this
 # status:             # OBSERVED state — Kubernetes writes this
 ```
 
-Learn to read that shape and you can read any manifest, including ones for resources that do not exist yet: custom resources added by operators follow exactly the same grammar.
+Learn to read that shape and you can read any manifest — even ones for resource types that do not exist yet. Custom resources added by operators follow exactly the same four-field pattern.
 
 ```mermaid
 flowchart TB
@@ -323,7 +338,7 @@ flowchart TB
 
 *Figure 11.5: Every object shares the same grammar: identity in metadata, intent in spec, observation in status.*
 
-`kubectl explain` is the built-in reference, generated from the API your cluster actually serves:
+`kubectl explain` is the built-in field reference. It is generated from the API your cluster actually serves, so it never goes out of date:
 
 ```bash
 $ kubectl explain pod.spec.containers.image
@@ -345,9 +360,9 @@ DESCRIPTION:
 
 ### In production
 
-- **Names are identity.** Within a namespace and kind, `metadata.name` is unique and immutable. Renaming means delete and recreate — which for a Service means a new set of endpoints, and for a StatefulSet means new Pod identities.
-- **Labels are how everything finds everything.** Services select Pods by label, controllers own Pods by label, and your dashboards group by label. Agree on a label scheme (`app`, `component`, `part-of`, `env`, `version`) on day one; retrofitting labels is tedious.
-- **Annotations are for tools.** Anything non-identifying — checksums, controller hints, change-cause notes — belongs in annotations, which are never used for selection.
+- **A name is an identity.** Inside one namespace and kind, `metadata.name` is unique and cannot be changed. Renaming means delete and recreate. For a Service that means a new set of endpoints; for a StatefulSet it means new Pod identities.
+- **Labels are how everything finds everything.** Services pick Pods by label, controllers own Pods by label, and dashboards group by label. Agree on a label scheme (`app`, `component`, `part-of`, `env`, `version`) on day one. Adding labels later is slow, manual work.
+- **Annotations are for tools.** Anything that does not identify the object — checksums, controller hints, change-cause notes — belongs in annotations. Nothing selects objects by annotation.
 
 > 📘 **Deep Dive (optional):** The `apiVersion` field encodes a group and a version, such as `apps/v1` (group `apps`) or plain `v1` (the legacy core group, whose group name is the empty string). Groups let Kubernetes evolve independently in different areas, and versions (`v1alpha1` → `v1beta1` → `v1`) encode stability promises. This book uses GA (`v1`) APIs everywhere; Chapter 12 shows how to list what your cluster serves.
 
@@ -363,18 +378,20 @@ DESCRIPTION:
 
 ### In plain terms
 
-You do not need a data center to learn Kubernetes. Several tools run a complete cluster on a laptop:
+**kind** is a tool that runs a full Kubernetes cluster on your own machine, using Docker containers as the cluster's machines. The name stands for "Kubernetes IN Docker."
 
-- **kind** — "Kubernetes IN Docker." Each node is a Docker container. Fast, disposable, ideal for CI.
-- **minikube** — A cluster in a VM or container, with many bundled add-ons.
-- **k3d / k3s** — A lightweight certified distribution, popular for edge and small clusters.
-- **Docker Desktop** — A single-node Kubernetes you can enable in settings.
+You need this because you cannot learn Kubernetes by reading. You need a cluster you can break, delete, and rebuild in a minute, without a cloud bill. Several tools do this:
 
-This book uses **kind**, because you already have Docker Engine 29.x from Part I and kind needs nothing else.
+- **kind** — Each node is a Docker container. Fast, throwaway, and good for CI.
+- **minikube** — A cluster in a VM or container, with many add-ons included.
+- **k3d / k3s** — A small certified distribution, popular for edge and small clusters.
+- **Docker Desktop** — A single-node Kubernetes you switch on in settings.
+
+This book uses **kind**. You already have Docker Engine 29.x from Part I, and kind needs nothing else.
 
 ### Under the hood
 
-You need two binaries: `kubectl` (the client) and `kind` (the cluster creator).
+You need two programs: `kubectl` (the client you type commands into) and `kind` (the tool that builds the cluster).
 
 ```bash
 $ curl -LO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
@@ -396,7 +413,7 @@ $ kind version
 kind v0.32.0 go1.25.3 linux/amd64
 ```
 
-Create a three-node cluster (one control plane, two workers) so that later chapters can demonstrate scheduling, DaemonSets, and topology:
+Create a three-node cluster — one control plane and two workers — so later chapters can show scheduling, DaemonSets, and topology:
 
 ```yaml
 # kind-cluster.yaml
@@ -439,7 +456,7 @@ mastering-k8s-worker          Ready    <none>          58s   v1.36.0
 mastering-k8s-worker2         Ready    <none>          58s   v1.36.0
 ```
 
-`kubectl` learned about this cluster from a **kubeconfig** file (default `~/.kube/config`), which stores clusters, credentials, and **contexts** that pair the two. kind added a context and made it active.
+How did `kubectl` know where the cluster is? It read a **kubeconfig** file, the file that lists clusters and login credentials (by default `~/.kube/config`). A **context** is one named pairing of a cluster and a credential. kind added a context for your new cluster and made it the active one.
 
 ```bash
 $ kubectl config current-context
@@ -453,7 +470,7 @@ kind-mastering-k8s
 
 ### In production
 
-Your laptop cluster is a learning environment, not a small production cluster. Real clusters differ in ways worth knowing now:
+Your laptop cluster is a place to learn, not a small production cluster. Real clusters differ in ways worth knowing now:
 
 | Concern | kind on a laptop | Production |
 |---------|------------------|------------|
@@ -463,7 +480,7 @@ Your laptop cluster is a learning environment, not a small production cluster. R
 | Storage | Local path provisioner | CSI drivers with real disks and snapshots |
 | Access control | Your kubeconfig is cluster-admin | RBAC per team, short-lived credentials (Chapter 21) |
 
-The habit worth building today is context hygiene: check `kubectl config current-context` before anything destructive. "I thought I was on staging" is the single most expensive sentence in cluster operations.
+Start one habit today: check `kubectl config current-context` before you run anything that deletes or changes things. "I thought I was on staging" is the most expensive sentence in cluster operations.
 
 > ⚠️ **Common Pitfall:** Treating kind as a tiny production cluster—single control plane, no real LB, local storage. Use it to learn APIs; do not invent HA stories from it.
 
@@ -479,11 +496,13 @@ The habit worth building today is context hygiene: check `kubectl config current
 
 ### In plain terms
 
-We will run the Task API two ways: the quick imperative way, to see something work in ten seconds, and then the declarative way we use for the rest of the book.
+You will now run the Task API twice. First the quick command-driven way, so you see something work in ten seconds. Then the file-driven way, which is how the rest of the book works.
+
+Doing it twice is the point. The first version teaches you the shape of a Pod. The second version teaches you the habit you will keep for the next twenty chapters.
 
 ### Under the hood
 
-**Imperatively**, one command creates a Pod:
+Here is the quick way first. **Imperatively**, one command creates a Pod:
 
 ```bash
 $ kubectl run task-api --image=ghcr.io/mastering-k8s/task-api:1.0 --port=8000
@@ -502,7 +521,7 @@ NAME       READY   STATUS    RESTARTS   AGE
 task-api   1/1     Running   0          14s
 ```
 
-Pod IPs are internal to the cluster network, so reach it through a local tunnel:
+A Pod's IP address only works inside the cluster network. To reach it from your laptop, open a temporary tunnel:
 
 ```bash
 $ kubectl port-forward pod/task-api 8000:8000
@@ -581,7 +600,7 @@ $ kubectl apply -f task-api-pod.yaml
 pod/task-api configured
 ```
 
-The verb changed from `created` to `configured`: Kubernetes computed the difference and applied only that. Inspect what it recorded, including the `status` you never wrote:
+The verb changed from `created` to `configured`. Kubernetes worked out the difference and changed only that. Now look at what it recorded, including the `status` you never wrote:
 
 ```bash
 $ kubectl get pod task-api -o wide
@@ -620,18 +639,18 @@ Events:
   Normal  Started    49s   kubelet            Started container task-api
 ```
 
-Read the **Events** block bottom-up whenever something misbehaves; it is the cluster narrating what it attempted.
+When something goes wrong, read the **Events** block from the bottom up. It is the cluster telling you, in order, what it tried to do.
 
 > ⚠️ **Warning:** A bare Pod is not self-healing. Delete it, or lose its node, and nothing brings it back — no controller ever recorded that it should exist. Production workloads are wrapped in a Deployment (Chapter 14). We used a raw Pod here to keep the first example honest and minimal.
 
 ### In production
 
-The declarative version of this same workload, made production-shaped, gains four things you will add over the next chapters: a **Deployment** for replicas and rollouts, a **Service** for a stable address, **probes** so traffic only reaches healthy Pods, and **resource requests** so the scheduler can place it. The manifest you just wrote is the seed of all of them.
+This same workload, shaped for production, gains four things you will add over the next few chapters. A **Deployment** for copies and rollouts. A **Service** for a stable address. **Probes** so traffic only reaches healthy Pods. And **resource requests** so the scheduler knows how much room the Pod needs. The manifest you just wrote is the seed of all four.
 
 Two habits to start now:
 
-- **Store manifests in Git next to the app.** The image tag and the manifest that deploys it should move through review together.
-- **Pin image tags.** `:latest` means two nodes can run two different builds of "the same" version, and rollbacks stop being meaningful. This book always pins (`:1.0`), and digests (`@sha256:…`) are better still.
+- **Keep manifests in Git next to the app.** The image tag and the manifest that deploys it should be reviewed in the same pull request.
+- **Pin image tags.** With `:latest`, two nodes can run two different builds of "the same" version, and a rollback no longer means anything. This book always pins (`:1.0`). Digests (`@sha256:…`) are better still.
 
 > 🏭 **Production floor:** Never leave bare Pods as the production shape—wrap them in a Deployment (Chapter 14). Pin images by **digest** for regulated paths: PR → scan → promote digest → apply → rollback to the previous digest. Paste digest and context name into the incident ticket.
 
@@ -645,13 +664,13 @@ Two habits to start now:
 
 ## 11.8 What Kubernetes is not
 
-Setting expectations prevents disappointment and bad architecture:
+Knowing the limits up front prevents both disappointment and bad design:
 
-- **Not a PaaS.** Kubernetes will not build your image, choose your database, or give you `git push` deploys. Those live in layers built on top (Helm in Chapter 23, CI in Chapter 24).
-- **Not a fix for bad code.** A service that leaks memory will be restarted forever, which converts a bug into an outage with extra steps.
-- **Not a security boundary by default.** Containers still share a kernel, Pods can still run as root, and namespaces are not tenancy. Chapters 19 and 21 cover what to add.
-- **Not a stateful-database replacement.** You *can* run databases on Kubernetes (Chapters 14 and 18), but the operational care required does not go away.
-- **Not the simplest option for small deployments.** One container on one VM does not need a control plane.
+- **Not a PaaS.** Kubernetes will not build your image, pick your database, or give you `git push` deploys. Those come from layers built on top (Helm in Chapter 23, CI in Chapter 24).
+- **Not a fix for bad code.** A service that leaks memory gets restarted forever. That turns a bug into an outage with extra steps.
+- **Not a security wall on its own.** Containers still share one kernel, Pods can still run as root, and a namespace is not a separate tenant. Chapters 19 and 21 cover what you must add.
+- **Not a replacement for running databases carefully.** You *can* run databases on Kubernetes (Chapters 14 and 18), but the operational work does not disappear.
+- **Not the simplest choice for something small.** One container on one VM does not need a control plane.
 
 ---
 

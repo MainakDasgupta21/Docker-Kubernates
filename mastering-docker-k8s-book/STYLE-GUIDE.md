@@ -72,7 +72,7 @@ Short transitional sections (pitfalls, exercises, takeaways) do **not** need all
 
 | Tier | Must include |
 |------|----------------|
-| **In plain terms** | At least two substantial paragraphs; the problem this solves; one explicit misconception (`> ⚠️ **Common Pitfall:**` or a clear “you might think…”) |
+| **In plain terms** | At least two substantial paragraphs; a one-sentence plain answer to “what is this?”; the problem this solves; one explicit misconception (`> ⚠️ **Common Pitfall:**` or a clear “you might think…”) |
 | **Under the hood** | Mechanism explanation; at least one realistic command or YAML path; sample output or field walkthrough; one “what breaks if X” note |
 | **In production** | Ownership (who owns this); failure mode + how you detect it; mitigation; a concrete do / don’t decision |
 
@@ -85,6 +85,52 @@ After each major concept’s three tiers, add a short micro-checklist:
 - **Try:** …
 - **Watch in prod:** …
 ```
+
+### Simple language contract
+
+Beginners read this book first. Write so a smart newcomer with no DevOps job understands the idea before meeting the vocabulary. Simple wording is a requirement, not a nicety—and it never replaces technical accuracy.
+
+**Word choice**
+
+- Use the common word first, then the exact term: "the engine builds the filesystem (**materializes** the layers)".
+- Prefer plain verbs: *run*, *copy*, *start*, *break*, *check*, *replace*. Avoid *leverage*, *facilitate*, *orchestrate* as filler.
+- Never use an acronym or product term before defining it once in plain words.
+- First real use of a term: **bold the term** and define it in the same sentence.
+
+**Sentence shape**
+
+- In **In plain terms** blocks and opening stories, keep sentences short—average under about 22 words.
+- One idea per sentence. Break long chains into two sentences instead of using semicolons and dashes.
+- Keep paragraphs to 2–4 sentences in beginner-facing text.
+
+**Concept opening order**
+
+Every major concept's `### In plain terms` opens in this order:
+
+1. **What is it?** — one plain sentence.
+2. **Why should I care?** — the problem it solves, in everyday terms.
+3. **Analogy or story** — then the misconception callout.
+
+**Tier bridges**
+
+- `### Under the hood` stays fully technical, but opens with one plain bridge sentence, for example: "Here is what actually happens on the machine:".
+- `### In production` keeps ownership, failure mode, detection, mitigation, and do/don't—written with clear verbs instead of buzzwords.
+
+**In one line**
+
+For the densest concepts (Pod, Service, image digest, Deployment, PV/PVC, RBAC, SLO), add a skimmable summary:
+
+```markdown
+> 💡 **In one line:** …
+```
+
+Use it sparingly—only where a reader could otherwise leave without the core idea.
+
+**Never do this in the name of simplicity**
+
+- Do not delete accurate detail, commands, YAML, or sample output.
+- Do not soften a production rule into a suggestion.
+- Do not replace a precise term with a vague one; introduce both.
 
 **MNC DevOps voice**
 
@@ -213,3 +259,5 @@ Prefer canonical concept and task pages. Do not invent URLs.
 ## Tone
 
 Mentor, not manual. Explain **why** before **how**. Anticipate misconceptions. Supportive and precise. Never write `TODO` as unfinished work; never say "provided by the user" about materials.
+
+Say it simply first, then say it exactly. If a sentence needs a second read to parse, split it. If a beginner would stop reading, rewrite the opening—not the depth.

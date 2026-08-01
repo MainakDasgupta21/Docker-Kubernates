@@ -4,26 +4,28 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Choose ephemeral versus persistent volume types for real workloads
-> - Request and bind storage with PersistentVolumes, PersistentVolumeClaims, and StorageClasses
-> - Use CSI drivers for dynamic provisioning, expansion, and topology-aware binding
-> - Take VolumeSnapshots and VolumeGroupSnapshots (GA in Kubernetes 1.36)
-> - Modify volume parameters with VolumeAttributesClass and reason about storage capacity
-> - Mount durable storage into Deployments and StatefulSets without common data-loss traps
+> - Pick the right storage for a job: scratch space that disappears, or storage that lasts
+> - Ask for lasting storage with PersistentVolumes, PersistentVolumeClaims, and StorageClasses
+> - Use CSI drivers to create disks on demand, grow them, and keep them in the right zone
+> - Take VolumeSnapshots and VolumeGroupSnapshots (GA in Kubernetes 1.36) as restore points
+> - Change volume settings with VolumeAttributesClass, and check whether a class still has room
+> - Mount lasting storage in Deployments and StatefulSets without the usual data-loss traps
 
 ---
 
 ## 18.1 The hotel room and the basement inventory
 
-Imagine you check into a hotel. The room itself is temporary—housekeeping resets it for the next guest. The mini-bar, though, is stocked from a shared inventory in the basement. Guests do not own the basement; they *request* snacks, and the hotel allocates them from stock.
+Imagine you check into a hotel. The room is temporary. Housekeeping clears it out for the next guest. The mini-bar is different. It is stocked from a shared inventory down in the basement. Guests never own that basement. They simply ask for a snack, and the hotel hands one over from stock.
 
 ![Hotel mini-bar and basement inventory for persistent storage](assets/analogy-hotel-minibar.png)
 
 *Figure 18.A: Rooms reset; the basement inventory (PVs) outlives any single guest (Pod).*
 
-Kubernetes Pods are like hotel rooms: they come and go. Local container filesystems disappear when a Pod is replaced. Databases, uploaded files, and shared caches need something more durable—storage that outlives any single Pod. That durable layer is **PersistentVolume** (PV) storage, requested through **PersistentVolumeClaims** (PVCs), and often provisioned automatically via a **StorageClass** and a **CSI** driver.
+Kubernetes Pods behave like those hotel rooms. They come and go. Whatever a container wrote to its own filesystem disappears when the Pod is replaced. But databases, uploaded files, and shared caches must survive that churn.
 
-If you only use the container writable layer, you will lose data the first time a node drains, a Deployment rolls, or a Pod restarts on another machine. Ephemeral volumes are still valuable—just for the right jobs.
+So Kubernetes keeps the storage somewhere else. A **PersistentVolume** (PV) is a piece of storage that lives in the cluster, separate from any Pod. A Pod asks for one using a **PersistentVolumeClaim** (PVC), which is simply a written request for storage. A **StorageClass** is the recipe the cluster follows to create that storage automatically, usually by calling a **CSI** driver — a storage plugin that Kubernetes uses to talk to real disks.
+
+Here is the trap. If your app only writes to the container's own filesystem, the data is gone the first time a node is drained, a Deployment rolls out, or a Pod restarts on another machine. Short-lived storage is still useful. You just have to point it at the right jobs.
 
 ---
 
@@ -31,13 +33,19 @@ If you only use the container writable layer, you will lose data the first time 
 
 ### In plain terms
 
-Ephemeral volumes are sticky notes on the hotel room desk. Useful while you are there; gone when you check out. Use them for caches, scratch space shared by containers in one Pod, or projected configuration—not for the database that must survive a redeploy.
+An **ephemeral volume** is temporary storage that is created with the Pod and thrown away with the Pod. That is the whole idea. Nothing is saved for later.
 
-The problem they solve is real: containers need somewhere to write temporary files, share a scratch directory with a sidecar, or hold a short-lived cache without provisioning a cloud disk. The misconception is treating “it survived a container restart” as “it is durable.” A container restart keeps the Pod (and thus `emptyDir`); a Pod reschedule, Deployment rollout, or node drain does not.
+Why should you care? Because containers still need a place to put files while they run. They download things, unpack archives, and write cache files. A sidecar container may need to read a file the main container just wrote. None of that data needs to survive a redeploy, and paying for a cloud disk to hold it would be wasteful. Ephemeral volumes give you that scratch space for free, with no disk to order and no cleanup to remember.
+
+Think of ephemeral volumes as sticky notes on the hotel room desk. They are useful while you are staying there. They are gone the moment you check out. Use them for caches, for scratch space shared by containers in one Pod, and for configuration files projected into the Pod. Do not use them for the database that must survive a redeploy.
+
+The usual mistake is reading "it survived a container restart" as "it is safe." Those are different things. When only the container restarts, the Pod stays alive, so an `emptyDir` volume keeps its contents. When the Pod itself is rescheduled, rolled out, or evicted from a drained node, the data goes away.
 
 > ⚠️ **Common Pitfall:** You might think writing under `/tmp` in the container is “temporary but safe enough.” The container writable layer and `/tmp` die with the container or Pod—there is no reclaim policy, no snapshot, and no restore path.
 
 ### Under the hood
+
+Here is what each temporary volume type actually gives you, and how long it lasts:
 
 | Volume type | Lifetime | Typical use |
 |-------------|----------|-------------|
@@ -131,9 +139,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** App teams choose ephemeral vs durable; platform owns node disk pressure SLOs and default `emptyDir` guidance.
+**Ownership:** App teams decide ephemeral versus durable for their own data. The platform team owns node disk-pressure targets and the default `emptyDir` guidance. Those targets are written as an **SLO** (service level objective) — a number the team promises to stay within, such as "no node runs above 80% disk."
 
-**Failure mode:** A cache without `sizeLimit` fills the node disk → kubelet disk-pressure eviction of *other* workloads. Detect with node condition `DiskPressure`, kubelet eviction events, and container filesystem usage metrics. Mitigate with `sizeLimit`, Memory `emptyDir` only for small scratch, and alerts on node disk utilization.
+**Failure mode:** A cache with no `sizeLimit` fills the node disk. The kubelet then evicts *other* workloads to reclaim space. Detect it with the node condition `DiskPressure`, kubelet eviction events, and container filesystem usage metrics. Fix it with `sizeLimit` on every scratch volume, Memory `emptyDir` only for small scratch, and alerts on node disk usage.
 
 | Do | Don't |
 |----|-------|
@@ -155,13 +163,19 @@ flowchart TB
 
 ### In plain terms
 
-Kubernetes separates **who provides storage** from **who consumes it**. A **PV** is a piece of storage that exists in the cluster. A **PVC** is a namespaced request (“I need 20Gi, ReadWriteOnce”). A **StorageClass** is the recipe that creates PVs on demand. Developers claim; platform teams control how disks appear.
+Kubernetes splits storage into two halves: who *supplies* it and who *asks for* it. A **PersistentVolume** (PV) is the supply side — a real piece of storage that exists in the cluster. A **PersistentVolumeClaim** (PVC) is the demand side — a request that lives in one namespace and says something like "I need 20Gi that one node can write to." A **StorageClass** is the recipe the cluster uses to create a new PV whenever a claim arrives. Developers write claims. Platform teams decide how the disks behind those claims get made.
 
-This split exists so app teams can request capacity without knowing vendor disk APIs, while platform engineers keep reclaim policies, topology, and cost classes under change control. You might think a PVC “is” the disk—it is not. The PVC is a ticket; the PV (and the CSI volume behind it) is the inventory item. Delete the ticket under the wrong reclaim policy and the inventory item vanishes with it.
+Why bother with two objects instead of one? Because it lets each side work without knowing the other's details. An app team can ask for 20Gi without learning the disk API of Amazon, Google, or your on-prem array. A platform team can change the disk type, the zone rules, or the cost tier behind a class without editing a single app manifest. Both sides get to move independently.
+
+Picture the hotel again. The PVC is the request slip you hand to the front desk. The PV is the actual item pulled from the basement. The slip is not the item. That distinction matters when you clean up: throw away the slip under the wrong **reclaim policy** — the rule that decides what happens to the storage when its claim is deleted — and the item in the basement is destroyed along with it.
+
+> 💡 **In one line:** A PVC is the request for storage, a PV is the storage itself, and a StorageClass is the recipe that makes a new PV whenever a request shows up.
 
 > ⚠️ **Common Pitfall:** You might think deleting a PVC is as safe as deleting a Deployment. With `reclaimPolicy: Delete`, the underlying cloud disk usually goes with it—often with no recycle bin.
 
 ### Under the hood
+
+Here is the chain of objects that connects a running container to a real disk:
 
 ```text
 App (Pod) ──mounts──► PVC (request) ──bound to──► PV (actual volume)
@@ -274,9 +288,9 @@ With `WaitForFirstConsumer`, a PVC staying `Pending` until a Pod schedules is **
 
 ### In production
 
-**Ownership:** Platform owns StorageClass catalog (provisioner, reclaim, binding mode, expansion). App teams own PVC size and access-mode choice against that catalog. Incident evidence: `kubectl get pvc,pv,sc`, PVC Events, CSI controller logs.
+**Ownership:** The platform team owns the StorageClass catalog — the provisioner, reclaim policy, binding mode, and whether expansion is allowed. App teams own the PVC size and access mode they pick from that catalog. Evidence to collect during an incident: `kubectl get pvc,pv,sc`, the Events on the PVC, and CSI controller logs.
 
-**Failure mode:** Wrong access mode or class → PVC Pending forever; multi-replica Deployment + one RWO PVC → stranded replicas. Detect with Pending PVC age alerts and Deployment unavailable replicas. Mitigate with catalog docs, admission policies that reject incompatible combinations, and StatefulSet templates for per-replica disks.
+**Failure mode:** The wrong access mode or class leaves a PVC Pending forever. A multi-replica Deployment sharing one RWO PVC leaves replicas stranded and unschedulable. Detect both with alerts on how long a PVC has been Pending, and on unavailable Deployment replicas. Prevent them with a documented class catalog, admission policies that reject combinations that cannot work, and StatefulSet templates when each replica needs its own disk.
 
 | Do | Don't |
 |----|-------|
@@ -298,13 +312,19 @@ With `WaitForFirstConsumer`, a PVC staying `Pending` until a Pod schedules is **
 
 ### In plain terms
 
-CSI (Container Storage Interface) is the plug that lets Kubernetes talk to Amazon EBS, Azure Disk, GCE PD, Ceph, Longhorn, and dozens of others without baking vendor code into Kubernetes itself. Drivers run as controllers plus node plugins; your apps stay portable by changing `storageClassName`.
+**CSI** stands for **Container Storage Interface**. It is a standard set of calls that Kubernetes uses to ask any storage system to create, attach, and mount a volume. A **CSI driver** is the piece of software a storage vendor writes to answer those calls. Amazon EBS, Azure Disk, Google Persistent Disk, Ceph, and Longhorn each ship one.
 
-Without CSI, every storage vendor would need code inside Kubernetes. With CSI, the vendor ships a driver; you ship StorageClasses. The misconception is “storage is the cloud console’s problem”—from the app’s view, FailedMount and Pending PVCs *are* your outage, and the CSI DaemonSet is on the critical path.
+Why does this matter to you? Because it is the reason your manifests are portable. Without CSI, support for every storage product would have to be written into Kubernetes itself, and each new vendor would mean a new Kubernetes release. With CSI, the vendor ships a driver, you ship StorageClasses, and moving an app to a different backend is often a one-line change to `storageClassName`.
+
+Think of CSI as the standard power socket in the wall. Kubernetes supplies the socket. Every vendor builds a plug that fits it. Each driver has two halves: a **controller** that runs once per cluster and creates or deletes the volumes, and a **node plugin** that runs on every worker and does the actual mounting.
+
+The misconception here is that storage is somebody else's problem — a thing you handle in the cloud console. It is not. From your app's point of view, a `FailedMount` event or a PVC stuck in Pending *is* the outage, and the CSI node plugin sits directly on the path that starts your Pod.
 
 > ⚠️ **Common Pitfall:** You might think expanding a PVC is always online and instant. Filesystem resize can require a remount or Pod restart; shrinking is generally unsupported.
 
 ### Under the hood
+
+Here is the exact sequence that runs when you create a claim on a dynamic class:
 
 ```mermaid
 sequenceDiagram
@@ -342,13 +362,13 @@ persistentvolumeclaim/task-db-data patched
 
 Filesystem resize may require a remount or Pod restart depending on the driver. You generally **cannot shrink** PVC size.
 
-Zone-aware disks must live where the consumer runs. `WaitForFirstConsumer` lets the scheduler pick a node first; then the provisioner creates the disk in that topology. Immediate binding can trap a PVC in zone A while free capacity sits in zone B. What breaks if the CSI node plugin is down on a worker: new mounts fail with FailedMount even though the PV looks Bound.
+A zonal disk can only be attached inside its own zone, so it has to be created where the Pod will run. `WaitForFirstConsumer` handles that: the scheduler picks a node first, and only then does the provisioner create the disk in that zone. `Immediate` binding does the opposite and can trap a PVC in zone A while all the free node capacity sits in zone B. What breaks if the CSI node plugin is down on a worker: new mounts fail with FailedMount even though the PV looks Bound.
 
 ### In production
 
-**Ownership:** Platform owns CSI driver lifecycle (DaemonSet/controller health, upgrades). App teams own expansion requests and verifying the app tolerates resize. Detect CSI failure via FailedMount events, CSI controller CrashLoop, and volume attachment timeouts.
+**Ownership:** The platform team owns the CSI driver itself — controller and DaemonSet health, plus upgrades. App teams own expansion requests and confirming their app survives a resize. Spot CSI trouble through FailedMount events, a CSI controller stuck in CrashLoopBackOff, and volume attachment timeouts.
 
-**Failure mode:** CSI controller outage → new PVCs stuck Pending; node plugin outage → Pods cannot mount on that node. Mitigate with DaemonSet disruption budgets where supported, staged driver upgrades, and runbooks that check `kubectl describe pvc/pod` before blaming the app.
+**Failure mode:** When the CSI controller is down, new PVCs sit Pending. When a node plugin is down, Pods on that node cannot mount anything. Reduce the damage with disruption budgets on the DaemonSet where the driver supports them, staged driver upgrades, and a runbook that says to check `kubectl describe pvc/pod` before blaming the application.
 
 | Do | Don't |
 |----|-------|
@@ -370,13 +390,19 @@ Zone-aware disks must live where the consumer runs. `WaitForFirstConsumer` lets 
 
 ### In plain terms
 
-Mount the claim by name. The volume name inside the Pod is arbitrary; `claimName` must match the PVC. For databases, give each replica its own claim via StatefulSet templates—like assigning each musician their own locked trunk, not one shared suitcase.
+Using a claim in a workload means naming it in the Pod spec. You pick any name you like for the volume inside the Pod. The `claimName` field, however, must exactly match the name of an existing PVC in the same namespace.
 
-Deployments are for interchangeable replicas; StatefulSets are for identity-bound storage. Mixing them—N Deployment replicas on one RWO PVC—is the most common storage scheduling outage for newcomers. You might think “the Service will load-balance writes across replicas onto one disk”; the kubelet will refuse to mount that disk on a second node, and extra Pods stay Pending.
+Why is there a choice to make here at all? Because two workload types treat storage very differently. A **Deployment** runs replicas that are interchangeable copies of each other, so it gives them all the same volumes. A **StatefulSet** runs replicas that each have their own identity, and its `volumeClaimTemplates` field creates a separate PVC for every replica. Databases need the second kind. Each member must keep coming back to its own data.
+
+Think of a touring band. A StatefulSet gives every musician a locked trunk with their own name on it. A Deployment hands the whole group one shared suitcase. That works fine for a stack of identical T-shirts. It does not work for instruments.
+
+The most common newcomer outage lives right here: N Deployment replicas pointed at a single `ReadWriteOnce` PVC. You might expect the Service to spread writes across the replicas onto that one disk. It cannot. The disk can only be attached to one node at a time, so the kubelet refuses the second mount and the extra Pods sit Pending forever.
 
 > ⚠️ **Common Pitfall:** You might think deleting a StatefulSet with `kubectl delete sts` also deletes its PVCs. By default it does **not**—ordinal PVCs remain unless you delete them explicitly (or use the appropriate cleanup policy). That is usually good for data safety and surprising for cost.
 
 ### Under the hood
+
+Here is a Deployment mounting one shared claim by name:
 
 ```yaml
 apiVersion: apps/v1
@@ -445,9 +471,9 @@ What breaks if you change `storageClassName` on an existing PVC: the API rejects
 
 ### In production
 
-**Ownership:** App team owns Deployment vs StatefulSet choice and mount paths; platform owns approved StorageClasses and backup tooling. For databases, treat PVC + snapshot schedule as part of the service’s RPO/RTO, not an afterthought.
+**Ownership:** The app team picks Deployment versus StatefulSet and owns the mount paths. The platform team owns the approved StorageClasses and the backup tooling. For a database, the PVC and its snapshot schedule are part of the service's recovery promises — **RPO** (recovery point objective, how much recent data you can afford to lose) and **RTO** (recovery time objective, how long you may take to come back). Decide both up front, not after the incident.
 
-**Failure mode:** Scale Deployment with shared RWO → Pending replicas; orphaned StatefulSet PVCs after delete → cost leak. Detect with unavailable replica alerts and cost/orphan PV reports. Mitigate with architecture review gates and explicit PVC cleanup checklists.
+**Failure mode:** Scaling a Deployment that shares one RWO claim leaves replicas Pending. Deleting a StatefulSet leaves its PVCs behind, which quietly keeps costing money. Detect the first with unavailable-replica alerts, the second with a report of PVs that no workload references. Prevent both with an architecture review before go-live and a written PVC cleanup checklist for teardown.
 
 | Do | Don't |
 |----|-------|
@@ -467,15 +493,21 @@ What breaks if you change `storageClassName` on an existing PVC: the API rejects
 
 ### In plain terms
 
-A **VolumeSnapshot** is a point-in-time picture of one volume—like photographing one filing cabinet drawer. A **VolumeGroupSnapshot** (GA in Kubernetes **1.36**) photographs several drawers *at the same instant* so multi-volume apps (database data + WAL, or several tablespace PVCs) get a crash-consistent recovery point across the set.
+A **VolumeSnapshot** is a saved picture of one volume as it looked at one moment. A **VolumeGroupSnapshot**, which reached **GA** (generally available, meaning stable and supported for production) in Kubernetes **1.36**, takes that picture of several volumes at the same instant.
 
-Crash-consistent is not application-consistent: buffers not flushed to disk may be missing, just as after a power loss. For true application consistency, quiesce the app (or use its native backup) around the snapshot. Snapshots solve “I need a restore point without copying terabytes slowly”; they do not by themselves prove you can meet RTO—only a tested restore does.
+Why would you need the group version? Because many databases spread their state across more than one disk. The data files live on one PVC and the write-ahead log lives on another. Snapshot them a few seconds apart and the two copies disagree, so the restore is useless. Snapshot them together and they line up.
+
+Picture a row of filing cabinet drawers. A VolumeSnapshot photographs one drawer. A VolumeGroupSnapshot photographs several drawers in a single flash, so nobody could have moved a folder between shots.
+
+One word deserves care: **crash-consistent**. It means the copy looks exactly like the disk would after someone pulled the power cord. Anything the app was still holding in memory is missing. That is usually recoverable, because databases are built to replay their logs after a crash. It is not the same as **application-consistent**, which means the app was paused and flushed first. For that, pause the app around the snapshot or use its own backup command.
+
+Snapshots solve one problem well: getting a restore point without slowly copying terabytes. They do not prove you can actually come back within your RTO. Only a restore you have practiced proves that.
 
 > ⚠️ **Common Pitfall:** You might think “GA VolumeGroupSnapshot” means every CSI driver can do it. The API can be installed while the driver still returns “unimplemented.” Always verify driver support before promising group restore in an SLO.
 
 ### Under the hood
 
-Volume snapshots use the external snapshot APIs (CRDs). Typical kinds:
+Snapshots are not built into the core API. They arrive as add-on objects installed by the snapshot controller. Typical kinds:
 
 - `VolumeSnapshotClass` / `VolumeSnapshot` / `VolumeSnapshotContent`
 - `VolumeGroupSnapshotClass` / `VolumeGroupSnapshot` / `VolumeGroupSnapshotContent` (`groupsnapshot.storage.k8s.io/v1` in 1.36)
@@ -566,9 +598,9 @@ What breaks if `readyToUse` never becomes true: restore PVCs stay Pending; check
 
 ### In production
 
-**Ownership:** Platform owns snapshot CRDs/controllers and VolumeSnapshotClass catalog; app teams own schedule, retention, and **tested restore** for their data. RPO/RTO owners must include restore drills in the service runbook.
+**Ownership:** The platform team owns the snapshot controller, the snapshot object definitions, and the VolumeSnapshotClass catalog. App teams own their own schedule, their retention window, and a **tested restore**. Whoever signs off on RPO and RTO must also put restore drills in the service runbook.
 
-**Failure mode:** Snapshots succeed but restores never practiced → incident extends into data loss theater. Detect with restore drill cadence metrics and `readyToUse=false` age. Mitigate with automated restore-to-scratch-namespace jobs and retention that matches compliance, not “keep forever.”
+**Failure mode:** Snapshots run green for months while nobody ever restores one. The first real attempt happens during an incident, and it fails. Detect the gap by tracking how recently a restore drill ran, and how long any snapshot has sat at `readyToUse=false`. Close it with a scheduled job that restores into a scratch namespace, and a retention window that matches your compliance rules instead of "keep everything forever."
 
 | Do | Don't |
 |----|-------|

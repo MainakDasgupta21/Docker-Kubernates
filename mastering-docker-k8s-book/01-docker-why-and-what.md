@@ -4,25 +4,31 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain the “it works on my machine” problem in concrete terms
-> - Contrast virtual machines and containers with accurate boundaries
-> - Define image, container, registry, and engine in plain language
-> - Describe what Docker provides—and what it does not
-> - Recognize when containers are a good fit and when they are not
+> - Explain the “it works on my machine” problem with a real example
+> - Say how virtual machines and containers differ, and where each one stops
+> - Define image, container, registry, and engine in your own words
+> - Describe what Docker gives you—and what it leaves for you to do
+> - Decide when containers fit a job, and when they do not
 
 ---
 
 ## 01.1 Monday Morning, Three Environments
 
-Alex finishes a feature Friday night. On Alex’s laptop the API returns `200 OK`. Monday, the staging server returns `500`. The logs complain about a missing system library. Ops installs the library. Staging works. Production still fails—same library, different *version*. Someone pins the version. Now a cron job on the host breaks because it needed the old one.
+Alex finishes a feature on Friday night. On Alex’s laptop the API answers `200 OK`. Every test passes. Alex goes home happy.
+
+Monday morning, the staging server answers `500` instead. The logs blame a missing system library. Ops installs the library, and staging starts working.
+
+Production still fails. It has the same library, but a different *version*. Someone pins the version to match staging. Now a scheduled job on that same server breaks, because it needed the old version.
 
 ![Shipping containers representing portable software packages](assets/analogy-shipping-containers.png)
 
 *Figure 01.A: Like cargo boxes that move unchanged from truck to ship, container images move apps between machines.*
 
-Nobody was careless. The *unit of deployment* was wrong. The team shipped source code into environments that were each a unique snowflake of OS packages, language runtimes, and side effects.
+Nobody on this team was careless. The wrong thing was the **unit of deployment**—the package a team actually hands to a server. Alex’s team handed over source code alone.
 
-Containers attack that mismatch: ship the **application plus a known filesystem and process setup**, not “hope the server already has what we need.”
+Every machine that received that code had been set up by hand over the years. Each one had its own mix of operating system packages, language versions, and leftover settings. Engineers call such a machine a **snowflake**, because no two are alike and nobody can rebuild one exactly.
+
+Containers attack that mismatch directly. You ship the **application plus a known set of files and a known startup command**. You stop hoping the server already has what your app needs.
 
 ---
 
@@ -30,17 +36,23 @@ Containers attack that mismatch: ship the **application plus a known filesystem 
 
 ### In plain terms
 
-Traditional deployment often looks like this:
+A **container** is one app running from its own private, pre-packed set of files, isolated from the rest of the machine. The pre-packed files come from an **image**, which is the recipe and the ingredients saved together as one downloadable artifact.
 
-1. Provision a machine (physical or VM)
+You should care because of the alternative. Without containers, you install the app’s needs onto the machine by hand, one machine at a time. Traditional deployment often looks like this:
+
+1. Provision a machine (physical or virtual)
 2. Install language runtimes, OS packages, and agents
 3. Copy application files
 4. Configure environment-specific settings
-5. Start the process and pray the next machine matches
+5. Start the process and hope the next machine matches
 
-Drift between steps 2–4 is inevitable. Each environment accumulates one-off fixes—“just this OpenSSL,” “just that locale,” “just bump Node on staging”—until nobody can recreate production from scratch. The Monday-morning story in §01.1 is not bad luck; it is what happens when the *unit of deployment* is source code plus a snowflake host.
+Steps 2 through 4 drift apart over time. **Drift** means two machines that should be identical slowly stop being identical. Each environment collects one-off fixes: “just this OpenSSL,” “just that locale,” “just bump Node on staging.” After a year, nobody can rebuild production from scratch.
 
-Containers flip the model: build an **image** that already contains the runtime and app, run that image as a **container** on any host with a compatible engine, and configure only the *differences* (ports, env vars, secrets, volumes) at run time. The image becomes the thing you test, scan, and promote. The host still supplies a kernel and resources, but it stops being a treasure chest of undocumented packages.
+That is the real lesson of the Monday-morning story in §01.1. It was not bad luck. It is what happens when you ship source code onto hand-built hosts.
+
+Containers flip the order of work. You build an **image** that already holds the app and everything it runs on. You run that image as a **container** on any machine with a compatible engine. Then you set only the *differences* at start time: ports, environment variables, secrets, and storage.
+
+Think of it like a food truck versus a rented kitchen. The rented kitchen might have the pans you need, or it might not. The food truck brings its own. The image is the food truck; the host machine just supplies power and a parking space—a kernel and some CPU and memory.
 
 ```mermaid
 flowchart LR
@@ -51,17 +63,21 @@ flowchart LR
 
 *Figure 01.1: Containers move dependency soup into a rebuildable image and leave only environment-specific knobs for runtime.*
 
-> ⚠️ **Common Pitfall:** You might think containers “eliminate environment differences entirely.” They do not. Kernel version, cgroup limits, DNS, certificates injected at runtime, and volume contents still differ. Containers shrink *dependency drift*; they do not abolish ops.
+The image becomes the one thing you test, scan for security problems, and move forward to production. The host still gives you a kernel and resources. It stops being a mystery box of packages nobody documented.
+
+> 💡 **In one line:** An image is a packed-up app you can copy anywhere; a container is that image actually running as an isolated process on a machine.
+
+> ⚠️ **Common Pitfall:** You might think containers “remove environment differences entirely.” They do not. The kernel version, the memory and CPU limits, DNS settings, certificates handed in at start time, and the contents of attached storage still differ between machines. Containers shrink *dependency drift*. They do not abolish operations work.
 
 ### Under the hood
 
-The host still matters—kernel version, available resources, and security policy—but the bulk of “dependency soup” moves into a versioned, rebuildable artifact. When you later run:
+Here is what actually happens on the machine. The host still matters—kernel version, available resources, and security policy—but the bulk of the “dependency soup” now lives inside a versioned artifact you can rebuild on demand. When you later run:
 
 ```bash
 $ docker run --rm -p 8080:80 nginx:alpine
 ```
 
-you are asking an engine to materialize a filesystem from image layers, create isolated namespaces for the process, and start the image’s default command. Chapters 02–05 unpack each of those steps. For now, notice the separation: **image** (what to run) versus **runtime options** (how this instance should behave).
+you are asking an engine to do three things: build the container’s filesystem out of the image’s stored layers (**materialize** them), give the process its own isolated view of the system, and start the command the image was built to run. Chapters 02–05 unpack each step. For now, notice the split: the **image** says *what* to run, and the **runtime options** say *how this one instance* should behave.
 
 Sample pull output (abbreviated):
 
@@ -73,15 +89,15 @@ Status: Downloaded newer image for nginx:alpine
 /docker-entrypoint.sh: Configuration complete; ready for start up
 ```
 
-**What breaks if you still install app libraries on the host “just in case”:** you reintroduce the snowflake. Two hosts diverge again; the image is no longer the full story; debugging becomes “is it the image or the host package?” Prefer baking dependencies into the image and keeping the host lean.
+**What breaks if you still install app libraries on the host “just in case”:** you bring the snowflake back. Two hosts drift apart again, the image is no longer the full story, and every debugging session starts with “is it the image or the host package?” Bake dependencies into the image and keep the host lean.
 
 ### In production
 
-**Ownership:** app teams own the application image contents; platform teams own the engine/runtime baseline and registry policy. Both share the promotion contract: what digest left CI is what staging and production pull.
+**Ownership:** app teams own what goes inside the application image. Platform teams own the engine baseline and the registry rules. Both sides share one promise: the exact artifact that left CI is the artifact staging and production pull.
 
-Treat the image as the unit you promote: build once in CI, scan it, push it to a registry, and pull the *same* digest into staging and production. Configuration that differs per environment (URLs, credentials, feature flags) should enter at runtime—not as a rebuilt “prod image” that silently diverges from what you tested.
+Treat the image as the unit you move forward. Build it once in CI, scan it, push it to a registry, and pull the *same* digest into staging and production. A **digest** is a `sha256:…` fingerprint of exact image content, so two identical digests are guaranteed to be identical bytes. Settings that differ per environment—URLs, credentials, feature flags—should arrive when the container starts, not as a rebuilt “prod image” that quietly differs from the one you tested.
 
-**Failure mode:** staging runs `myapp:1.4.2` built Monday; production “uses the same tag” rebuilt Thursday with a different base patch. **Detect:** compare digests (`RepoDigests` / deploy manifests), not tag strings. **Mitigate:** promote by digest; ban floating tags in prod deploy configs.
+**Failure mode:** staging runs `myapp:1.4.2` built Monday; production “uses the same tag” rebuilt Thursday on a different base patch. **Detect:** compare digests (`RepoDigests` / deploy manifests), not tag strings. **Mitigate:** promote by digest; ban floating tags in prod deploy configs.
 
 > 🏭 **Production floor:** If you cannot answer “which image digest is running in production?”, you do not yet have a reproducible deploy story—even if containers are involved. Paste digest + change ticket into the incident notes before debating application code.
 
@@ -99,9 +115,17 @@ Treat the image as the unit you promote: build once in CI, scan it, push it to a
 
 ### In plain terms
 
-A **virtual machine** is like renting an entire apartment: its own kitchen, plumbing, and front door (a full guest operating system). A **container** is like a locked room in a shared building: private space for your stuff, but you share the building’s foundation (the host kernel).
+A **virtual machine**, or VM, is a whole fake computer running inside a real one, complete with its own operating system. A container is only an isolated process on the operating system that is already there.
 
-That analogy answers the density question teams actually care about. Ten apartments mean ten kitchens. Ten hotel rooms share one boiler room. Containers pack denser because they do not each carry a kernel and a full OS userspace. The trade-off is isolation: a broken pipe in the foundation can affect every room. Kernel bugs, hostile syscalls, and misconfigured privileges matter more when the kernel is shared.
+Why should you care about the difference? Because it decides how many workloads fit on one server, how fast they start, and how well one workload is walled off from the next. Those three answers drive most cost and security conversations.
+
+Here is the analogy. A VM is like renting an entire apartment: your own kitchen, your own plumbing, your own front door. A container is like a locked room in a shared building. You get private space for your things, but you share the building’s foundation and pipes—the **kernel**, which is the part of the operating system that talks to hardware.
+
+That picture also answers the density question teams argue about. Ten apartments mean ten kitchens. Ten hotel rooms share one boiler room. Containers pack tighter because each one does not carry its own kernel and its own full set of operating system files.
+
+The trade-off is isolation. A broken pipe in the shared foundation can reach every room. Kernel bugs, hostile system calls, and over-generous permissions matter more when everyone shares one kernel.
+
+> 💡 **In one line:** A VM copies the whole computer; a container copies only the app’s files and borrows the host’s kernel.
 
 ```mermaid
 flowchart TB
@@ -126,13 +150,13 @@ flowchart TB
 | Kernel | Guest has its own (virtualized) | Shares host kernel |
 | Best at | Different OS needs, strong isolation boundaries | Dense packaging of apps with the same kernel family |
 
-> ⚠️ **Common Pitfall:** Calling a container “a lightweight VM.” Kernel exploits and sysctl differences matter because the kernel is shared. “Lightweight” describes packing density, not VM-grade isolation.
+> ⚠️ **Common Pitfall:** Calling a container “a lightweight VM.” Because the kernel is shared, kernel exploits and kernel tuning settings (`sysctl`) reach across containers. “Lightweight” describes how densely you can pack them, not how strong the wall is.
 
 ### Under the hood
 
-A VM virtualizes hardware. Each guest typically includes a full operating system and, from the guest’s point of view, its own kernel. Hypervisors give strong isolation and flexible OS choices at the cost of heavier startup and larger footprints.
+Here is what actually happens on the machine. A VM fakes the hardware itself. Each guest usually carries a full operating system and believes it has its own kernel. The **hypervisor**, the software that creates and supervises VMs, gives you strong isolation and free choice of operating system. You pay for that with slower startup and much larger disk use.
 
-A container virtualizes the *operating system’s user space* using kernel features (on Linux: namespaces, cgroups, and a union filesystem). Containers on one host share the host kernel. Each container gets an isolated view of process IDs, network stack, mount points, and resource limits—but not a second kernel.
+A container fakes only the *user space*—everything above the kernel—using features the Linux kernel already provides: **namespaces** (separate views of processes, network, and mounts), **cgroups** (limits on CPU, memory, and other resources), and a union filesystem that stacks image layers into one view. Every container on a host shares that host’s kernel. Each container sees its own process IDs, network stack, mount points, and resource limits, but never a second kernel.
 
 ```bash
 $ docker run --rm alpine uname -r
@@ -148,9 +172,9 @@ In cloud platforms you often run containers *inside* VMs for multi-tenant isolat
 
 ### In production
 
-**Ownership:** security/platform sets the isolation bar (shared-kernel OK vs mandatory VM/sandbox per tenant); app teams choose packaging (containers) within that bar.
+**Ownership:** the security and platform teams set the isolation bar—whether a shared kernel is acceptable, or every tenant needs its own VM or sandbox. App teams then pick packaging (containers) inside that bar.
 
-Choose the boundary that matches your threat model. Multi-tenant untrusted workloads often still need VM (or stronger) isolation around groups of containers. Same-team microservices on a controlled cluster usually accept shared-kernel container isolation plus Kubernetes security controls (later chapters).
+Choose the boundary that matches the threat you actually face. Untrusted code from many different customers usually still needs VM-level isolation, or stronger, wrapped around groups of containers. Microservices owned by one company on a controlled cluster usually accept shared-kernel isolation plus the Kubernetes security controls covered in later chapters.
 
 **Failure mode:** a privileged container or kernel exploit affects neighbors on the same node. **Detect:** runtime security alerts, unexpected host-level changes, noisy-neighbor CPU/memory on the node. **Mitigate:** drop capabilities, avoid privileged mode, separate trust tiers onto different node pools or VMs, keep engines patched.
 
@@ -168,7 +192,7 @@ Choose the boundary that matches your threat model. Multi-tenant untrusted workl
 
 ## 01.4 Core Vocabulary
 
-Learn these four words thoroughly; everything else is elaboration.
+Four words carry most of this book: image, container, registry, and engine. Learn them well. Almost everything later is detail added on top.
 
 ```mermaid
 flowchart LR
@@ -183,28 +207,32 @@ flowchart LR
 
 #### In plain terms
 
-An **image** is an immutable template—like a class definition or a biscuit cutter. You *build* or *pull* images; you do not “log into” an image. The problem an image solves is repeatability: the same bytes (ideally the same digest) should start the same way on every machine that can run them.
+An **image** is a read-only package that holds an app and every file it needs to start. It never changes after it is built; the word for that is **immutable**.
 
-You might think of an image as “the running app.” It is not. An image is inert until an engine creates a container from it. Confusing the two leads to people “SSH-ing into images,” tagging chaos, and deleting the wrong thing during cleanup.
+Why care? Because an image gives you repeatability. The same bytes—ideally checked by the same digest—should start the same way on every machine that can run them. That is what makes “build once, run anywhere with the same engine” true instead of a slogan.
 
-> ⚠️ **Common Pitfall:** Saying “I restarted the image.” You restart a *container*; you rebuild or re-pull an *image*.
+Think of a biscuit cutter, or a class definition in code. The cutter shapes the biscuits, but you never eat the cutter. You *build* images or *pull* them from a registry. You do not log into an image.
+
+You might picture an image as “the running app.” It is not. An image just sits on disk until an engine creates a container from it. Mixing up the two words is how people end up trying to SSH into images, making a mess of tags, and deleting the wrong thing during cleanup.
+
+> ⚠️ **Common Pitfall:** Saying “I restarted the image.” You restart a *container*. You rebuild or re-pull an *image*.
 
 #### Under the hood
 
-An image is layered filesystem snapshots plus metadata: default command, environment, exposed ports, working directory, user, labels, and more. Layers are content-addressed and shared across images and containers when identical.
+Here is what actually happens on the machine. An image is a stack of filesystem snapshots (**layers**) plus metadata: default command, environment, exposed ports, working directory, user, labels, and more. Layers are content-addressed, meaning each one is named by a hash of its contents, so identical layers are stored once and shared across images and containers.
 
 ```bash
 $ docker image ls
 $ docker inspect nginx:alpine --format 'ID={{.Id}} Digests={{json .RepoDigests}} Cmd={{json .Config.Cmd}}'
 ```
 
-**What breaks if you treat a mutable tag as identity:** yesterday’s `myapp:prod` is not today’s `myapp:prod`. CI and prod can disagree while everyone swears they deployed “the same tag.”
+**What breaks if you treat a movable tag as identity:** a **tag** is only a label someone can repoint at any time, so yesterday’s `myapp:prod` is not today’s `myapp:prod`. CI and production can be running different code while everyone insists they deployed “the same tag.”
 
 #### In production
 
-**Ownership:** app teams own image contents and tags; platform owns registry retention, scan gates, and which digests may enter prod.
+**Ownership:** app teams own image contents and tags. The platform team owns how long the registry keeps images, which security scans must pass, and which digests are allowed into production.
 
-Prefer tags that encode version (`1.4.2`) for humans, and digests (`sha256:…`) for machines that promote artifacts. Treat `latest` as a demo convenience, not a release pin (Chapter 03).
+Use tags that carry a version number (`1.4.2`) for humans, and digests (`sha256:…`) for the systems that move artifacts forward. Treat `latest` as a demo convenience, never as a release pin (Chapter 03).
 
 **Do:** record digests in release notes or GitOps. **Don’t:** promote only `:latest` or a floating `:prod` tag.
 
@@ -212,13 +240,21 @@ Prefer tags that encode version (`1.4.2`) for humans, and digests (`sha256:…`)
 
 #### In plain terms
 
-A **container** is a *running* (or stopped) instance created from an image—like an object created from a class, or a biscuit cut from the cutter. It has a thin writable layer, runtime config, and a process tree. Stopping it keeps the writable layer; removing it deletes that instance.
+A **container** is one instance created from an image, either running or stopped. If the image is the biscuit cutter, the container is the biscuit.
 
-The misconception: a container is a little VM you customize forever. In healthy teams, containers are cattle. Hand-editing a long-lived container creates a pet that nobody can rebuild.
+Why care? Because the container is the thing that can be replaced without ceremony. You can start ten of them from one image, kill any of them, and start fresh ones in seconds. That is what makes scaling and quick rollback possible.
 
-> ⚠️ **Common Pitfall:** Installing packages with `docker exec` and calling the problem fixed. The next replaceable instance will not have those packages—bake fixes into a new image.
+Each container gets a thin **writable layer**—scratch space stacked on top of the read-only image, where any file the app changes is stored. It also gets its own runtime settings and its own tree of processes. Stopping a container keeps that writable layer. Removing the container deletes it.
+
+The common misconception is that a container is a small VM you keep tweaking forever. Healthy teams treat containers as cattle, not pets: interchangeable, replaceable, never hand-fed. Editing a long-lived container by hand creates a pet that nobody can rebuild from scratch.
+
+> 💡 **In one line:** A container is one disposable, running copy of an image, plus a scratch layer that dies with it.
+
+> ⚠️ **Common Pitfall:** Installing packages with `docker exec` and calling the problem fixed. The next instance that replaces this one will not have those packages. Bake the fix into a new image.
 
 #### Under the hood
+
+Here is the whole lifecycle in four commands:
 
 ```bash
 $ docker create --name demo nginx:alpine
@@ -227,13 +263,13 @@ $ docker ps --filter name=demo
 $ docker rm -f demo
 ```
 
-**What breaks if you remove an image while containers still reference it:** `docker rmi` refuses (or you force and strand yourself). Remove or recreate containers first; understand references with `docker ps -a`.
+**What breaks if you remove an image while containers still reference it:** `docker rmi` refuses (or you force it and strand yourself with containers pointing at nothing). Remove or recreate the containers first. Use `docker ps -a` to see which containers still point at the image.
 
 #### In production
 
-**Ownership:** whoever deploys owns container runtime flags (ports, env, limits); the image owner owns what is inside.
+**Ownership:** whoever deploys owns the container’s runtime flags—ports, environment variables, and resource limits. The image owner owns what is inside.
 
-Prefer disposable cattle over pets. Debug with logs and controlled reproduction; bake lasting fixes into a new image rather than hand-editing a long-lived container.
+Keep containers disposable. Debug with logs and by reproducing the fault on purpose. Put lasting fixes into a new image instead of editing a long-lived container by hand.
 
 **Failure mode:** snowflake container that only works on one host. **Detect:** “works after exec install” but fails on fresh `docker run`. **Mitigate:** rebuild image; redeploy clean instances.
 
@@ -241,13 +277,17 @@ Prefer disposable cattle over pets. Debug with logs and controlled reproduction;
 
 #### In plain terms
 
-A **registry** is a library warehouse for images—Docker Hub, GitHub Container Registry, Amazon ECR, Google Artifact Registry, or a self-hosted registry. Without a registry, images live only on the laptop that built them—fine for a demo, fatal for a team.
+A **registry** is a server that stores images so other machines can download them. Docker Hub, GitHub Container Registry, Amazon ECR, and Google Artifact Registry are registries, and you can also run your own.
 
-> ⚠️ **Common Pitfall:** Treating Docker Hub anonymous pulls as an infinite free CDN for CI. Rate limits and flaky networks are production incidents waiting to happen—use authenticated pulls and caches.
+Why care? Because without a registry, an image lives only on the laptop that built it. That is fine for a demo and fatal for a team. The registry is how the artifact you built travels to CI, to staging, and to every production node.
+
+Picture a library warehouse. Anyone with a card can borrow a copy, and every copy is identical to the one on the shelf.
+
+> ⚠️ **Common Pitfall:** Treating anonymous Docker Hub pulls as an unlimited free download service for CI. Pull limits and flaky networks turn into outages. Log in for pulls and keep a local cache or mirror.
 
 #### Under the hood
 
-You **push** images to share them and **pull** them to run elsewhere. References look like `registry/namespace/repository:tag` or `…@sha256:…`. Authentication, rate limits, and mirroring appear again in later security and CI chapters.
+Here is what actually happens on the machine. You **push** an image to share it and **pull** an image to run it somewhere else. A reference looks like `registry/namespace/repository:tag`, or `…@sha256:…` when you name the exact digest. Authentication, pull limits, and mirroring come back in the later security and CI chapters.
 
 ```bash
 $ docker pull python:3.12-slim
@@ -255,38 +295,42 @@ $ docker tag python:3.12-slim registry.example.com/team/python:3.12-slim
 # $ docker push registry.example.com/team/python:3.12-slim   # when you have a registry
 ```
 
-**What breaks if registry auth expires mid-deploy:** nodes cannot pull; new replicas stay `ImagePullBackOff` (Kubernetes) or fail create (Docker). Keep pull credentials rotated and monitored—not only push credentials.
+**What breaks if registry credentials expire in the middle of a deploy:** nodes cannot download the image. New replicas sit in `ImagePullBackOff` on Kubernetes, or fail to be created on Docker. Rotate and monitor the credentials used for *pulls*, not just the ones used for pushes.
 
 #### In production
 
-**Ownership:** platform/security owns registry policy; app teams own repositories for their services.
+**Ownership:** platform and security own registry policy. App teams own the repositories for their own services.
 
-Use a private registry (or org namespace) for internal apps. Control who can push, scan on push, and retain digests of what you deployed.
+Use a private registry, or at least your organization’s namespace, for internal apps. Control who may push, scan every image on push, and keep a record of the digests you deployed.
 
 ### Engine (Daemon)
 
 #### In plain terms
 
-The **Docker Engine** is the kitchen that actually cooks. The `docker` command is usually a waiter (client) placing orders. If the kitchen is down, the waiter’s menu still looks fine—every order fails.
+The **Docker Engine** is the background program that does the real work of building images and running containers.
+
+Why care? Because the `docker` command you type is not the thing doing the work. It only sends requests. When something “does not work,” knowing which half is broken saves you an hour.
+
+The engine is the kitchen that actually cooks. The `docker` command is the waiter taking your order to that kitchen. If the kitchen is closed, the menu still looks perfectly fine—and every order fails. Chapter 02 takes this split apart in detail.
 
 #### Under the hood
 
-`dockerd` is the background service that builds images, runs containers, manages networks and volumes, and speaks the Docker API. Modern engines delegate low-level runtime work to **containerd** and an OCI runtime such as **runc** (Chapter 02).
+Here is what actually happens on the machine. `dockerd` is the background service that builds images, runs containers, manages networks and volumes, and answers the Docker API. Modern engines hand the low-level work of starting a process to **containerd** and to an OCI runtime such as **runc** (Chapter 02).
 
 ```bash
 $ docker version
 $ docker info
 ```
 
-**What breaks if untrusted workloads get the Docker socket:** they can start privileged containers and often reach root on the host. Treat socket mount as root-equivalent.
+**What breaks if untrusted workloads reach the Docker socket:** the **socket** is the file the CLI uses to talk to the engine, so anything that can write to it can start a fully privileged container and usually become root on the host. Mounting the socket is the same as handing out root.
 
 #### In production
 
-**Ownership:** platform owns engine install, upgrades, and socket exposure; developers own images and container specs within policy.
+**Ownership:** the platform team owns engine installation, upgrades, and who can reach the socket. Developers own images and container settings within that policy.
 
-Monitor engine health, disk usage for images and logs, and API exposure.
+Watch engine health, disk usage for images and logs, and who can reach the API.
 
-**Do:** restrict who can talk to the socket; monitor disk. **Don’t:** mount `docker.sock` into random app containers “for convenience.”
+**Do:** restrict who can talk to the socket, and monitor disk. **Don’t:** mount `docker.sock` into app containers “for convenience.”
 
 **Before you leave this section**
 
@@ -300,15 +344,17 @@ Monitor engine health, disk usage for images and logs, and API exposure.
 
 ### In plain terms
 
-**Docker** is a platform—and a set of tools—for building, shipping, and running containers. In day-to-day practice you will use the Docker CLI, the Engine, Dockerfiles, and often Compose for multi-container apps on one host.
+**Docker** is a set of tools for building, shipping, and running containers. Day to day you will use four of them: the `docker` command line, the Engine, **Dockerfiles** (text files that describe how to build an image), and often **Compose** (a tool for running several containers together on one machine).
 
-The problem Docker solved historically was not inventing isolation from scratch—it was making a coherent *workflow* popular: Dockerfile → image → registry → `docker run`. Teams could share a portable unit without inventing their own packaging ritual every quarter.
+Why care about the name? Because “Docker” gets used loosely, and that vagueness hides what you still have to do yourself. Docker gives you packaging and a way to run things. It does not give you a running platform.
 
-> ⚠️ **Common Pitfall:** Equating “we use Docker” with “we are cloud-native / production-ready.” Docker is packaging and a runtime. Production still needs limits, health checks, secrets hygiene, digests, and an operational plan.
+Docker did not invent container isolation. The Linux kernel features already existed. What Docker did was make one clear workflow popular: Dockerfile, then image, then registry, then `docker run`. Suddenly teams could share a portable unit instead of inventing a new packaging ritual every quarter.
+
+> ⚠️ **Common Pitfall:** Reading “we use Docker” as “we are cloud-native and production-ready.” Docker is packaging plus a way to run containers. Production still needs resource limits, health checks, careful secret handling, digests, and a plan for operating the thing.
 
 ### Under the hood
 
-Docker popularized a workflow so strongly that people say “Docker” when they mean “OCI containers.” Under the hood, modern Docker builds and runs images that follow open standards (OCI image and runtime specs). Other tools exist; the concepts transfer.
+Here is what actually happens on the machine. Docker made its workflow so popular that people say “Docker” when they really mean “OCI containers.” **OCI**, the Open Container Initiative, is the group that writes the open standards for image format and runtime behavior. Modern Docker builds and runs images that follow those standards, so other tools can read the same images and the concepts carry over.
 
 A first mental model of `docker run`:
 
@@ -347,22 +393,22 @@ This message shows that your installation appears to be working correctly.
 ...
 ```
 
-**What breaks if the daemon cannot reach the registry:** step 2 fails; you see pull/TLS/timeout errors, not an application stack trace. Diagnose network and auth before rewriting the app.
+**What breaks if the daemon cannot reach the registry:** step 2 fails. You get pull, TLS, or timeout errors instead of an application stack trace. Check the network and your credentials before you start rewriting the app.
 
 ### In production
 
-**Ownership:** developers own Dockerfiles and app images; platform owns Engine/Desktop baselines, registry integrations, and what “approved base images” means.
+**Ownership:** developers own Dockerfiles and application images. The platform team owns Engine and Desktop versions, registry integration, and the list of approved base images.
 
-Docker is packaging and a single-host (or Desktop) runtime. It is **not**:
+Docker is packaging plus a way to run containers on one machine. It is **not**:
 
 - A full cluster orchestrator (that is Kubernetes, Nomad, Swarm mode, and friends)
 - A substitute for application architecture (a messy monolith in a container is still messy)
 - Automatic security (privileged containers and root processes are still dangerous)
 - A VM replacement for every workload (different kernels, some devices, and specialized hardware need care)
 
-**Failure mode:** treating Docker Desktop on a laptop as the production topology. **Detect:** “works on my Mac” with bind mounts and published ports that do not match Linux CI or cluster networking. **Mitigate:** CI on Linux runners that match prod architecture; promote digests; learn orchestration separately (Part II).
+**Failure mode:** treating Docker Desktop on a laptop as if it were the production layout. **Detect:** “works on my Mac,” with folder mounts and published ports that behave differently on Linux CI or in a cluster. **Mitigate:** run CI on Linux machines that match the production CPU architecture, promote by digest, and learn orchestration on its own (Part II).
 
-**Do:** use Docker to standardize the artifact. **Don’t:** stop at `docker run` on one VM and call the platform done.
+**Do:** use Docker to standardize the artifact. **Don’t:** stop at `docker run` on one VM and call the platform finished.
 
 > 📘 **Deep Dive (optional):** The Open Container Initiative (OCI) defines image and runtime specs. Learning OCI vocabulary makes it easier to evaluate alternatives (Podman, containerd directly, nerdctl) without relearning the whole world.
 
@@ -378,11 +424,15 @@ Docker is packaging and a single-host (or Desktop) runtime. It is **not**:
 
 ### In plain terms
 
-Containers excel when you deploy the same app across environments, need dense packing of many services, want immutable artifacts (build once, promote the image), practice clear process boundaries, or care about reproducible CI.
+Containers are a tool with a shape, and not every job has that shape. This section is the honest fit check.
 
-They are a weaker fit when you need a different kernel than the host provides, depend on highly specialized host devices without container support, only ever run one long-lived pet server with no repeat deploys, or face policies that forbid container runtimes.
+Why care? Because forcing the wrong workload into a container costs you weeks and gives back nothing. Knowing the boundary early is cheaper than discovering it during a migration.
 
-The honest question is not “are containers cool?” It is “does packaging + shared-kernel isolation solve *our* pain?” If your pain is a single pet server with no second environment, containers may add ceremony without payoff. If your pain is Monday-morning drift across five environments, they are aimed squarely at you.
+Containers work well when you deploy the same app to several environments, pack many services onto shared machines, want an unchanging artifact you build once and promote, keep clear boundaries between processes, or need CI runs that match production.
+
+They fit poorly when you need a different kernel than the host runs, when you depend on unusual hardware the container cannot reach, when you run exactly one long-lived hand-tuned server that is never redeployed, or when policy forbids container runtimes outright.
+
+The real question is not “are containers cool?” It is “does packaging plus shared-kernel isolation fix *our* pain?” One hand-tuned server with no second environment gets ceremony and no payoff. Monday-morning drift across five environments is exactly the pain containers were built for.
 
 ```mermaid
 flowchart TD
@@ -397,11 +447,11 @@ flowchart TD
 
 *Figure 01.5: A quick fitness check before containerizing everything — packaging wins when environments repeat and the kernel matches.*
 
-> ⚠️ **Common Pitfall:** Containerizing everything on day one—including a GUI tool, a kernel module workflow, and a one-off laptop script—then blaming Docker when the fit was wrong.
+> ⚠️ **Common Pitfall:** Containerizing everything on day one—a desktop GUI tool, a kernel module workflow, a one-off laptop script—and then blaming Docker when the fit was wrong from the start.
 
 ### Under the hood
 
-Fit often tracks isolation and packaging needs:
+Fit usually follows two questions: how much isolation you need, and whether the dependencies can be packed into an image.
 
 | Strong fit | Weaker fit |
 |------------|------------|
@@ -415,17 +465,17 @@ Fit often tracks isolation and packaging needs:
 $ docker run --rm -p 8080:80 nginx:alpine
 ```
 
-**What breaks if you force-fit a wrong workload:** endless privileged mode, hostPath mounts of the entire machine, or “just use the host network for everything”—you keep the complexity of containers and lose the isolation benefits.
+**What breaks if you force the wrong workload into a container:** you end up running everything in privileged mode, mounting the whole machine into the container, or putting every service on the host network. You keep all the complexity of containers and throw away the isolation you were paying for.
 
 ### In production
 
-**Ownership:** architecture/platform steers the fitness decision; app teams execute containerization within the approved pattern.
+**Ownership:** architecture and platform decide whether a workload should be containerized. App teams then do the work inside the approved pattern.
 
-Do a short fitness check before containerizing everything: Will multiple environments run this? Can we express dependencies in an image? Do we have a plan for logs, health, and data? If the answer is “no” three times, fix those first—or accept that containers alone will not deliver the win.
+Run a short fit check first. Will more than one environment run this? Can the dependencies live inside an image? Is there a plan for logs, health checks, and data? Three “no” answers mean you fix those things first, or accept that containers alone will not pay off.
 
-**Failure mode:** a “containerized” monolith that still requires hand-crafted host packages and host networking. **Detect:** runbooks that say “also install X on the node.” **Mitigate:** either finish moving dependencies into the image, or keep the workload on VMs until the plan is real.
+**Failure mode:** a “containerized” monolith that still needs packages installed on the node by hand and still uses host networking. **Detect:** runbooks that say “also install X on the node.” **Mitigate:** either finish moving the dependencies into the image, or leave the workload on VMs until the plan is real.
 
-**Do:** containerize repeatable services with clear process boundaries. **Don’t:** equate “Dockerfile exists” with “fit is proven.”
+**Do:** containerize repeatable services with clear process boundaries. **Don’t:** treat “a Dockerfile exists” as proof that the fit is right.
 
 **Before you leave this section**
 
