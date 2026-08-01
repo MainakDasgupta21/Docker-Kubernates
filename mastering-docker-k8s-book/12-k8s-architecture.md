@@ -179,6 +179,8 @@ The **API server** (`kube-apiserver`) is a web service that sits in front of the
 
 Why does that matter to you? Because one door means one place for checks. Login, permissions, policy, validation, and the audit log all happen there, once. It also tells you what to expect during an outage. If the API server is down, nothing new can be created or changed. Containers that are already running keep serving traffic. What stops is *change*, not service.
 
+> 💡 **In one line:** The API server is the only door into the cluster, so it is also the only place where permissions, policy, and audit are enforced.
+
 ### Under the hood
 
 Here is the path every single request takes:
@@ -706,7 +708,7 @@ kube-system       Active   26m
 | `kube-public` | World-readable, even unauthenticated; holds the `cluster-info` ConfigMap used during bootstrap |
 | `kube-node-lease` | One Lease per node for heartbeats (§12.8) |
 
-Namespaced versus cluster-scoped is a real distinction:
+Some objects live in a namespace and some belong to the whole cluster. That difference is real and worth checking:
 
 ```bash
 $ kubectl api-resources --namespaced=false | head -n 8
@@ -753,14 +755,14 @@ $ kubectl config set-context --current --namespace=tasks
 Context "kind-mastering-k8s" modified.
 ```
 
-DNS follows namespaces: a Service `task-db` in namespace `tasks` is reachable as `task-db` from inside `tasks`, and as `task-db.tasks.svc.cluster.local` from anywhere in the cluster (Chapter 15).
+DNS names follow namespaces. A Service named `task-db` in the `tasks` namespace answers to `task-db` from inside `tasks`, and to `task-db.tasks.svc.cluster.local` from anywhere in the cluster (Chapter 15).
 
 ### In production
 
-- **Namespace per team, per environment, or per application — pick one axis and be consistent.** Mixed conventions make RBAC and quotas unmaintainable.
-- **Attach policy to namespaces, not to hope.** ResourceQuota and LimitRange bound consumption; Pod Security admission labels (`pod-security.kubernetes.io/enforce`) bound privilege; NetworkPolicies bound traffic (Chapter 19). A namespace without these is just a naming convention.
-- **Namespaces are not a security boundary between untrusted tenants.** Nodes, kernel, and many cluster-scoped resources are shared. Hostile multi-tenancy needs separate clusters or virtual control planes.
-- **Deleting a namespace deletes everything in it,** asynchronously, and can hang on finalizers. `kubectl get namespace <ns> -o yaml` and looking at `spec.finalizers` and `status.conditions` explains a stuck `Terminating`.
+- **Pick one rule for namespaces and stick to it:** one per team, one per environment, or one per application. Mixing conventions makes RBAC and quotas impossible to maintain.
+- **Attach real limits to every namespace.** ResourceQuota and LimitRange cap how much it can consume. Pod Security admission labels (`pod-security.kubernetes.io/enforce`) cap what its Pods may do. NetworkPolicies cap what it can talk to (Chapter 19). Without these, a namespace is only a naming convention.
+- **A namespace is not a wall between untrusted tenants.** Nodes, the kernel, and many cluster-wide resources are still shared. Truly hostile tenants need separate clusters or virtual control planes.
+- **Deleting a namespace deletes everything inside it.** The deletion happens in the background and can hang on finalizers. Run `kubectl get namespace <ns> -o yaml` and read `spec.finalizers` and `status.conditions` to explain a namespace stuck in `Terminating`.
 
 **Before you leave this section**
 
@@ -774,11 +776,13 @@ DNS follows namespaces: a Service `task-db` in namespace `tasks` is reachable as
 
 ### In plain terms
 
-Labels are sticky notes on objects: `app=task-api`, `env=prod`, `version=1.0`. Selectors are queries over those notes. This one idea is how Services find Pods, how controllers claim Pods, and how you slice a cluster in a dashboard.
+A **label** is a key-value sticky note on an object, such as `app=task-api`, `env=prod`, or `version=1.0`. A **selector** is a query over those notes: "give me everything labeled `app=task-api`."
 
-Kubernetes has no foreign keys. It has labels.
+This one small idea is how the whole system is wired together. Services find their Pods by label. Controllers claim their Pods by label. Your dashboards group by label. A database would use foreign keys for this. Kubernetes uses labels, and nothing else.
 
 ### Under the hood
+
+Here is what labels look like on an object:
 
 ```yaml
 metadata:
@@ -790,7 +794,7 @@ metadata:
     env: dev
 ```
 
-Equality and set-based selection from the command line:
+You can select by exact match, by set membership, or by the absence of a label:
 
 ```bash
 $ kubectl get pods -l app.kubernetes.io/name=task-api
@@ -812,17 +816,17 @@ spec:
     app.kubernetes.io/name: task-api
 ```
 
-Two neighboring concepts that are *not* labels:
+Two nearby ideas that are *not* labels:
 
-- **Annotations** — arbitrary metadata for tools and humans (`kubernetes.io/change-cause`, config checksums, controller hints). Never selectable.
-- **Field selectors** — queries over object fields rather than labels: `kubectl get pods --field-selector status.phase=Running,spec.nodeName=mastering-k8s-worker`.
+- **Annotations** — free-form notes for tools and people, such as `kubernetes.io/change-cause`, config checksums, and controller hints. You can never select by them.
+- **Field selectors** — queries over the object's own fields instead of its labels: `kubectl get pods --field-selector status.phase=Running,spec.nodeName=mastering-k8s-worker`.
 
 ### In production
 
-- **Adopt the recommended `app.kubernetes.io/*` labels.** They are what Helm, dashboards, and service meshes already understand.
-- **A Deployment's `spec.selector` is immutable.** Choose selector labels you will never need to change, and keep volatile information (version, build ID) in *template* labels and annotations only.
-- **Beware overlapping selectors.** Two controllers whose selectors match the same Pods will fight over them, producing endless creation and deletion. Include a unique `app` label in every selector.
-- **Label for cost and ownership too.** `team`, `cost-center`, and `env` labels are how you answer "who owns this and what does it cost" six months later.
+- **Use the recommended `app.kubernetes.io/*` labels.** Helm, dashboards, and service meshes already understand them.
+- **A Deployment's `spec.selector` cannot be changed after creation.** Pick selector labels you will never need to edit. Keep anything that changes often — version, build ID — in the Pod *template* labels and annotations instead.
+- **Watch out for selectors that overlap.** Two controllers whose selectors match the same Pods will fight over them, creating and deleting Pods forever. Put a unique `app` label in every selector.
+- **Label for cost and ownership too.** `team`, `cost-center`, and `env` labels are how you answer "who owns this, and what does it cost" six months from now.
 
 **Before you leave this section**
 
@@ -836,13 +840,15 @@ Two neighboring concepts that are *not* labels:
 
 ### In plain terms
 
-When you delete a Deployment, its ReplicaSets and Pods disappear too. Nothing about the Deployment controller does that. Instead, each created object carries a note: *"I belong to that object."* A dedicated **garbage collector** watches for owners that no longer exist and deletes the orphans.
+An **owner reference** is a note on a child object that says *"I belong to that parent."* The **garbage collector** is a controller that looks for children whose parent no longer exists, and deletes them.
 
-It is a will, not a cleanup script: the child object states its parent, and the estate is settled automatically.
+This is why deleting a Deployment also removes its ReplicaSets and Pods. The Deployment controller does not delete them. Each child simply names its parent, and when the parent is gone, the collector cleans up. Knowing this saves you from hunting for leftover objects by hand.
+
+Think of it as a will rather than a cleanup script. The child records who it belongs to, and the estate is settled automatically.
 
 ### Under the hood
 
-The note is `metadata.ownerReferences`:
+The note lives in `metadata.ownerReferences`:
 
 ```bash
 $ kubectl get pod -l app=task-api -o jsonpath='{.items[0].metadata.ownerReferences}' | python -m json.tool
@@ -861,13 +867,13 @@ $ kubectl get pod -l app=task-api -o jsonpath='{.items[0].metadata.ownerReferenc
 ]
 ```
 
-Key rules:
+Three rules govern how this works:
 
-- **Owner and dependent must be in the same namespace** (or the owner is cluster-scoped). A namespaced object cannot own an object in another namespace; a mismatch makes the dependent look permanently orphaned.
-- **`controller: true`** marks the one owner that actively manages the object. This is what prevents two ReplicaSets from both claiming a Pod.
-- **`blockOwnerDeletion: true`** makes foreground deletion wait for this dependent.
+- **Parent and child must share a namespace,** unless the parent is cluster-scoped. A namespaced object cannot own an object in another namespace. Get this wrong and the child looks permanently orphaned.
+- **`controller: true`** marks the one owner that actively manages the object. This is what stops two ReplicaSets from both claiming the same Pod.
+- **`blockOwnerDeletion: true`** makes foreground deletion wait until this child is gone.
 
-Three deletion propagation policies:
+There are three ways deletion spreads from parent to child:
 
 | Policy | Behavior | How to request |
 |--------|----------|----------------|
@@ -895,16 +901,16 @@ task-api-7d9f8c5b64-8m2xp   1/1     Running   0          9m
 task-api-7d9f8c5b64-q4tzn   1/1     Running   0          9m
 ```
 
-The Pods keep serving traffic while you replace the controller above them — a real technique during risky migrations.
+The Pods keep serving traffic while you swap out the controller above them. That is a real technique during risky migrations.
 
-Beyond owner references, two related cleanup mechanisms are worth knowing: **finalizers** (a list in `metadata.finalizers` that blocks deletion until a controller does its cleanup and removes its entry) and the kubelet's own **image and container garbage collection** on each node, which reclaims disk by removing unused images and dead containers.
+Two related cleanup mechanisms are worth knowing. **Finalizers** are entries in `metadata.finalizers` that block deletion until some controller finishes its cleanup and removes its entry. Separately, the kubelet runs its own **image and container garbage collection** on each node, reclaiming disk by deleting unused images and dead containers.
 
 ### In production
 
-- **A stuck `Terminating` object is almost always a finalizer.** Inspect `metadata.finalizers` and find the controller that owes you cleanup. Force-removing finalizers works and leaks whatever the finalizer was protecting — do it knowingly, not reflexively.
-- **Cross-namespace owner references are a real bug class.** Custom controllers that get this wrong create objects the garbage collector immediately deletes, producing baffling churn.
-- **Do not rely on cascading deletes for data safety.** Deleting a StatefulSet does not delete its PersistentVolumeClaims by default; that asymmetry is deliberate and has saved many databases (Chapter 18).
-- **Monitor node disk and image GC thresholds.** Nodes that never reclaim images hit `DiskPressure` and start evicting Pods for reasons that have nothing to do with your application.
+- **An object stuck in `Terminating` is almost always waiting on a finalizer.** Read `metadata.finalizers` and find the controller that owes you cleanup. Deleting the finalizer by force does work, and it leaks whatever the finalizer was protecting. Do that on purpose, never by reflex.
+- **Owner references across namespaces are a common bug.** A custom controller that gets this wrong creates objects the garbage collector deletes right away, and the resulting churn is baffling to debug.
+- **Never count on cascading deletes to protect data.** Deleting a StatefulSet does not delete its PersistentVolumeClaims by default. That difference is deliberate, and it has saved many databases (Chapter 18).
+- **Monitor node disk and image cleanup thresholds.** A node that never reclaims images hits `DiskPressure` and starts evicting Pods for reasons that have nothing to do with your application.
 
 **Before you leave this section**
 
@@ -918,7 +924,9 @@ Beyond owner references, two related cleanup mechanisms are worth knowing: **fin
 
 ### In plain terms
 
-The Kubernetes API is not one flat list. It is grouped by area (`apps`, `batch`, `networking.k8s.io`) and versioned within each group (`v1alpha1` → `v1beta1` → `v1`). That is how new features can appear without breaking anything, and how you can tell how much to trust a resource.
+The Kubernetes API is not one flat list of resources. It is split into **API groups** by subject area — `apps`, `batch`, `networking.k8s.io` — and each group has its own versions, moving from `v1alpha1` to `v1beta1` to `v1`.
+
+Why should you care? The version tells you how much to trust a resource. A `v1` resource is supported long-term and safe to build on. A `v1alpha1` resource can change or disappear in the next release. Grouping and versioning together are how Kubernetes adds features without breaking the manifests you already wrote.
 
 ### Under the hood
 
@@ -969,13 +977,13 @@ What the stability levels mean:
 
 Every manifest in this book uses GA APIs: `v1`, `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `discovery.k8s.io/v1`, `coordination.k8s.io/v1`, `autoscaling/v2`, `policy/v1`, `storage.k8s.io/v1`, `rbac.authorization.k8s.io/v1`.
 
-Objects are stored once and served in any supported version of their group, which is why `kubectl get deployment -o yaml` always shows `apps/v1` even if you applied an older version — and why upgrades that remove an old version break manifests, not stored data.
+Each object is stored once and can be served in any supported version of its group. That is why `kubectl get deployment -o yaml` always shows `apps/v1`, even if you applied an older version. It is also why an upgrade that removes an old version breaks your manifests, not your stored data.
 
 ### In production
 
-- **Audit for deprecated APIs before every upgrade.** `kubectl-convert`, `pluto`, and cloud upgrade insights read your manifests and cluster and tell you what a release will remove.
-- **Feature gates matter.** Alpha features are off by default; beta features are usually on. Managed providers choose for you, so verify rather than assume.
-- **Custom resources join the same system.** A CRD adds a group and version and then behaves like everything else — same `kubectl`, same RBAC, same garbage collection. That uniformity is what makes operators feel native (Chapter 23).
+- **Check for deprecated APIs before every upgrade.** `kubectl-convert`, `pluto`, and your cloud provider's upgrade insights read your manifests and your cluster, then list what the next release removes.
+- **Feature gates matter.** Alpha features are off by default and beta features are usually on. Managed providers make these choices for you, so check rather than assume.
+- **Custom resources use the same system.** A CRD adds a group and a version, and then behaves like everything else: same `kubectl`, same RBAC, same garbage collection. That sameness is why operators feel built in (Chapter 23).
 
 > 💡 **Tip:** `kubectl explain --recursive deployment.spec` prints the full field tree your cluster actually supports. It beats searching the web when you need to know whether a field exists in *your* version.
 
@@ -991,7 +999,9 @@ Objects are stored once and served in any supported version of their group, whic
 
 ### In plain terms
 
-You now have the vocabulary to look at any cluster and understand what you see. Here is the tour worth running whenever you meet a new cluster.
+You now know enough words to look at any cluster and understand what you see. This section is the short tour to run whenever you meet a cluster for the first time.
+
+Run it on a healthy cluster first. Knowing what normal looks like is what makes an unhealthy cluster obvious later.
 
 ### Under the hood
 
@@ -1046,19 +1056,19 @@ I0725 18:44:02.118512  1 eventhandlers.go:206] "Add event for scheduled pod" pod
 I0725 18:44:12.884713  1 leaderelection.go:288] "Successfully renewed lease" lease="kube-system/kube-scheduler"
 ```
 
-That last line is §12.8 in the wild: the scheduler renewing its leader-election Lease.
+That last line is §12.8 happening for real: the scheduler renewing its leader-election Lease.
 
 ### In production
 
 A five-minute health sweep, in order:
 
-1. `kubectl get nodes` — any node not `Ready`, and how old are the Leases?
+1. `kubectl get nodes` — is any node not `Ready`, and how fresh are the Leases?
 2. `kubectl get pods -A --field-selector=status.phase!=Running` — what is not running, and why?
 3. `kubectl get events -A --sort-by=.lastTimestamp | tail -n 30` — what has the cluster been complaining about?
-4. `kubectl top nodes` — is anything near capacity (requires metrics-server; Chapter 22)?
-5. `kubectl get --raw='/readyz?verbose'` — is the API server itself healthy in every subsystem?
+4. `kubectl top nodes` — is anything close to full? (Needs metrics-server; Chapter 22.)
+5. `kubectl get --raw='/readyz?verbose'` — is every part of the API server healthy?
 
-Write those five commands down. They resolve a surprising share of incidents before you ever look at application logs.
+Write those five commands down. They solve a surprising number of incidents before you ever open an application log.
 
 **Before you leave this section**
 
@@ -1178,14 +1188,18 @@ The CRI is the gRPC interface between the kubelet and a container runtime, cover
 
 ## 12.18 Key takeaways
 
-- A cluster has two halves: a **control plane** that decides and **nodes** that do. All communication flows through the API server, and nodes always dial out.
-- **kube-apiserver** is the only door (authentication → authorization → admission → validation → etcd), and **etcd** is the only truth. Back etcd up and encrypt it.
-- The **scheduler** only sets `spec.nodeName`, using requests and constraints; the **kubelet** is what actually starts containers, through the **CRI**, with limits enforced by **cgroup v2**.
-- **kube-controller-manager** hosts the built-in loops; the **cloud-controller-manager** holds the cloud-specific ones (node metadata, load balancers, routes).
-- **Leases** do double duty: kubelet heartbeats in `kube-node-lease` and leader election in `kube-system`. They also explain the five-minute delay before Pods move off a dead node.
-- **Namespaces** scope names, quotas, and RBAC — not the kernel. **Labels and selectors** are the only wiring mechanism Kubernetes has.
-- **Owner references** plus the garbage collector implement cascading deletes; `--cascade=orphan` and finalizers are the escape hatches you will eventually need.
-- Know which **API groups and versions** your cluster serves, and build production on GA APIs.
+- A cluster has two halves: the **control plane** decides, and **nodes** do the work.
+- Everything talks through the API server, and nodes always start the conversation.
+- **kube-apiserver** is the only door: login, permissions, admission, validation, then etcd.
+- **etcd** is the only truth. Back it up, test the restore, and encrypt it.
+- The **scheduler** only writes `spec.nodeName`, based on requests and constraints.
+- The **kubelet** is the only thing that starts containers, through the **CRI**, with limits enforced by **cgroup v2**.
+- **kube-controller-manager** runs the built-in loops. The **cloud-controller-manager** runs the cloud ones: node labels, load balancers, routes.
+- **Leases** do two jobs: node heartbeats in `kube-node-lease` and leader election in `kube-system`. They also explain the five-minute wait before Pods leave a dead node.
+- **Namespaces** scope names, quotas, and RBAC. They do not scope the kernel.
+- **Labels and selectors** are the only wiring Kubernetes has. Get them right on day one.
+- **Owner references** plus the garbage collector are what make deletes cascade. `--cascade=orphan` and finalizers are the escape hatches.
+- Build production on GA (`v1`) APIs, and check for removed APIs before every upgrade.
 
 ---
 

@@ -4,25 +4,31 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain how the kube-scheduler filters, scores, and binds Pods to nodes
-> - Use `nodeSelector`, node affinity, and Pod affinity/anti-affinity
-> - Apply taints and tolerations to reserve or isolate nodes
-> - Spread replicas with topology spread constraints
-> - Configure PriorityClass and reason about preemption
-> - Distinguish node-pressure eviction from API-initiated eviction
-> - Diagnose Pending Pods caused by placement rules without over-constraining the cluster
+> - Explain how the kube-scheduler rules nodes out, ranks the rest, and picks a winner
+> - Use `nodeSelector`, node affinity, and Pod affinity or anti-affinity to steer placement
+> - Use taints and tolerations to hold nodes back for specific workloads
+> - Spread replicas evenly across zones and hosts with topology spread constraints
+> - Set up PriorityClass, and know when one Pod pushes another out
+> - Tell the two kinds of eviction apart: the kubelet saving a node, and a planned drain
+> - Work out why a Pod is stuck Pending, without piling on more rules that make it worse
 
 ---
 
 ## 20.1 The concert seating chart
 
-A touring band’s road manager does not seat musicians randomly. Drummers need space near power. Backup singers should not all sit in the same collapsing row. VIPs get a roped-off section. Some seats are broken and marked “do not use.” When the venue is full, lower-priority guests may be asked to leave so headliners can perform.
+A touring band's road manager never seats people at random. Drummers need space and a power outlet. The backup singers should not all sit in one row that might collapse. VIPs get a roped-off section of their own. A few seats are broken and marked "do not use." And when the venue fills up, standby guests are asked to leave so the headliners can go on.
 
 ![Concert seating chart for Kubernetes scheduling placement](assets/analogy-concert-seating.png)
 
 *Figure 20.A: The scheduler assigns seats (nodes) using rules, not random placement.*
 
-The **kube-scheduler** is that road manager for Pods. Every new Pod without a `nodeName` enters the scheduling queue. The scheduler **filters** nodes that cannot run the Pod, **scores** the remaining nodes, and binds the Pod to the winner. **Priority** and **preemption** decide who yields when capacity is tight. Your job is to express constraints clearly—without over-constraining so nothing can schedule.
+The **kube-scheduler** is that road manager. Its job is to decide which node each new Pod runs on. Every Pod that does not already name a node joins a queue and waits for that decision.
+
+The decision has three steps. First the scheduler **filters**, which means it throws out every node that simply cannot run this Pod. Then it **scores** the survivors, giving each one a number based on how good a fit it is. Then it **binds** the Pod to the highest scorer, which just means writing that node's name onto the Pod.
+
+Two more ideas cover the case where the cluster is full. **Priority** is a number that says how important a Pod is. **Preemption** is what happens when an important Pod cannot fit: the scheduler removes a less important one to make room.
+
+Your job in all of this is to describe what your Pod needs, clearly and no more strictly than necessary. Every rule you add removes nodes from consideration. Add enough of them and nothing can be scheduled anywhere.
 
 ---
 
@@ -30,13 +36,17 @@ The **kube-scheduler** is that road manager for Pods. Every new Pod without a `n
 
 ### In plain terms
 
-Scheduling is a matchmaking problem: find a node that *can* run this Pod, then pick the *best* among those that can. If nobody qualifies, the Pod stays **Pending** and Events explain why.
+Scheduling is matchmaking. The scheduler finds every node that *can* run your Pod, then picks the *best* one from that list. If no node qualifies, the Pod stays in the **Pending** state, which means it has been accepted by the cluster but is not running anywhere yet.
 
-The scheduler exists so humans do not pin every Pod by hand and so capacity, taints, and volume topology are considered consistently. You might think Pending means “the cluster is broken”—usually it means your constraints eliminated every node. Read Events before adding more affinity.
+Why let software make this call? Because a human cannot. Every placement decision has to weigh free CPU and memory on each node, the labels you asked for, the nodes reserved for other teams, and the zone your disk lives in. That is hundreds of checks per Pod, and the answer changes every minute as workloads come and go.
+
+The scheduler also leaves you a trail. Every Pending Pod carries **Events**, short messages attached to the object, and those messages name the exact reason each node was rejected. Read them first. Pending almost never means the cluster is broken. It usually means your own rules eliminated every candidate, and adding another rule will only make that worse.
 
 > ⚠️ **Common Pitfall:** You might think omitting resource requests “lets the Pod start faster.” Without requests the filter cannot place fairly, and under pressure your Pod becomes an easy eviction victim.
 
 ### Under the hood
+
+Here is what the scheduler actually evaluates, in order:
 
 1. **Filtering (predicates):** Enough CPU/memory? Match selectors? Tolerate taints? Volume zone OK? Priority preemption candidates?
 2. **Scoring (priorities):** Prefer less loaded nodes, honor soft affinity, spread where asked
@@ -73,9 +83,9 @@ What breaks if every node fails a hard filter: the Pod stays Pending indefinitel
 
 ### In production
 
-**Ownership:** Platform owns scheduler health and node capacity headroom; app teams own requests and placement constraints. Incident evidence: `kubectl describe pod` Events, node allocatable vs requests, taints list.
+**Ownership:** The platform team keeps the scheduler healthy and keeps spare node capacity available. App teams own their resource requests and their placement rules. Evidence to gather during an incident: `kubectl describe pod` Events, how much each node can allocate versus what is already requested, and the full list of taints.
 
-**Failure mode:** Over-constraint → Pending during incidents when you need scale-out most. Detect with Pending age alerts. Mitigate by preferring soft rules and keeping spare capacity for drains/preemption.
+**Failure mode:** Too many strict rules leave Pods Pending exactly when you need to scale out during an incident. Detect it with an alert on how long Pods have been Pending. Reduce the risk by writing soft rules wherever a hard one is not truly required, and by keeping enough spare capacity to absorb a drain or a preemption.
 
 | Do | Don't |
 |----|-------|
@@ -95,13 +105,19 @@ What breaks if every node fails a hard filter: the Pod stays Pending indefinitel
 
 ### In plain terms
 
-Nodes wear nametags (`disktype=ssd`, `topology.kubernetes.io/zone=us-east-1a`). Pods say which nametags they require or prefer. `nodeSelector` is the simple hard pin; **node affinity** adds operators and soft preferences.
+Nodes wear nametags. In Kubernetes those nametags are **labels**, simple key-value pairs such as `disktype=ssd` or `topology.kubernetes.io/zone=us-east-1a`. A Pod can then say which nametags it needs.
 
-Labels are a shared contract between platform (what exists on nodes) and apps (what they require). You might think a typo in a label key is “obvious”—it silently Pendings Pods. Soft preferences keep partial outages schedulable; hard pins do not.
+Why do you need this? Because nodes are not identical. Some have fast local disks, some have GPUs, some sit in a different data center. A Pod that must read from a fast disk should not land on the node with the slow one, and only labels can tell the scheduler which is which.
+
+There are two ways to ask. `nodeSelector` is the short form: list the labels, and the Pod goes nowhere else. **Node affinity** is the longer form, and it buys you two things `nodeSelector` cannot. It supports operators such as "in this list" or "label not present." And it supports **soft** rules — a preference the scheduler tries to honor but will happily ignore rather than leave your Pod Pending.
+
+That soft-versus-hard choice matters more than it looks. A hard rule during a partial outage means no Pod schedules at all. A soft rule means your Pod lands somewhere less ideal and keeps serving traffic. Also treat labels as a contract you cannot typo: the platform team decides which labels exist, and a single misspelled key leaves Pods Pending with no obvious clue.
 
 > ⚠️ **Common Pitfall:** You might think changing affinity moves running Pods. Scheduling rules apply at schedule time; roll the Deployment to reshuffle.
 
 ### Under the hood
+
+Here is how you read and set node labels, then use them:
 
 ```bash
 $ kubectl get nodes --show-labels
@@ -173,7 +189,7 @@ What breaks if a node pool loses the `disktype=ssd` label during a rebuild: ever
 
 ### In production
 
-**Ownership:** Platform owns label taxonomy on node pools; app teams consume documented keys only. Detect with Pending failed predicates naming label mismatches. Mitigate with soft preferences for non-critical hardware affinity.
+**Ownership:** The platform team decides which labels exist on which node pools and writes them down. App teams use only the documented keys. Detect mistakes through Pending Pods whose Events name a label mismatch. Reduce the damage by using soft preferences whenever the hardware requirement is a nice-to-have rather than a must.
 
 | Do | Don't |
 |----|-------|
@@ -193,15 +209,17 @@ What breaks if a node pool loses the `disktype=ssd` label during a rebuild: ever
 
 ### In plain terms
 
-Sometimes placement depends on **other Pods**: keep a cache near the API, or keep replicas off the same host and spread across zones. **Topology spread** is the modern, expressive way to keep counts even across failure domains.
+These three features place a Pod based on where *other Pods* already are. **Pod affinity** pulls a Pod toward its friends. **Pod anti-affinity** pushes it away from its own kind. **Topology spread** goes further and keeps the counts roughly even across a set of places.
 
-Blast radius shrinks when replicas do not share a host or zone—but hard anti-affinity with more replicas than domains guarantees Pending. You might think hard rules are “more HA”; soft spread plus PDBs usually survive partial failures better.
+Why does any of this matter? Because of what happens when one machine dies. If all four replicas of your API happen to land on the same node, that node's failure takes your whole service down. Spread those four across four nodes, or across two zones, and a single failure costs you a fraction of your capacity instead of all of it. The set of things that fail together — a node, a rack, a zone — is called a **failure domain**.
+
+Here is the trap. Strict rules feel safer, so people reach for hard anti-affinity. But hard anti-affinity on hostname with four replicas and three nodes has exactly one outcome: the fourth Pod is Pending forever, and it stays Pending during the next incident too. Soft spread plus a PodDisruptionBudget almost always survives real failures better than a strict rule that cannot be satisfied.
 
 > ⚠️ **Common Pitfall:** Hard Pod anti-affinity with `topologyKey: kubernetes.io/hostname` and more replicas than nodes guarantees Pending Pods.
 
 ### Under the hood
 
-Hard Pod anti-affinity (no two `app=task-api` Pods on the same node):
+Here are the three forms side by side. Hard Pod anti-affinity (no two `app=task-api` Pods on the same node):
 
 ```yaml
 affinity:
@@ -266,7 +284,7 @@ What breaks if `whenUnsatisfiable: DoNotSchedule` meets a single-zone outage: ne
 
 ### In production
 
-**Ownership:** App teams own spread/anti-affinity for their SLOs; platform owns zone labels and node counts per failure domain. Detect with skew metrics and Pending during zone loss. Mitigate with soft spread + PDB ([Chapter 24](24-production-best-practices.md)).
+**Ownership:** App teams own their spread and anti-affinity rules, because those rules follow from the availability target they promised. The platform team owns zone labels and how many nodes exist in each failure domain. Detect problems by tracking how uneven the spread has become, and by watching for Pending Pods during a zone outage. Reduce the damage with soft spread plus a PDB ([Chapter 24](24-production-best-practices.md)).
 
 | Do | Don't |
 |----|-------|
@@ -286,13 +304,21 @@ What breaks if `whenUnsatisfiable: DoNotSchedule` meets a single-zone outage: ne
 
 ### In plain terms
 
-**Taints** mark nodes so ordinary Pods are *repelled* unless they **tolerate** the taint. Control-plane nodes typically wear `node-role.kubernetes.io/control-plane:NoSchedule`. GPU pools often use a dedicated taint so only prepared workloads land there.
+A **taint** is a mark you put on a node that pushes Pods away. A **toleration** is a matching mark you put on a Pod that says "this one is allowed here anyway." Taints go on nodes. Tolerations go on Pods. They only work as a pair.
 
-Taints protect reserved capacity; tolerations are the explicit opt-in. You might think sprinkling tolerations on all Deployments is harmless—that defeats reservation and lets batch jobs steal GPU nodes.
+Why is this a separate mechanism from affinity? Because affinity and taints point in opposite directions, and you usually want both. Affinity is the Pod choosing a node. A taint is the node refusing Pods it did not invite. Only the node side can protect expensive hardware, because it works even against a Pod whose author never heard of your GPU pool. Control-plane nodes rely on this: they carry `node-role.kubernetes.io/control-plane:NoSchedule` so ordinary workloads stay off them without every team having to remember.
+
+Think of it as a roped-off VIP section. Affinity is a guest deciding to sit near the stage. A taint is the rope. A toleration is the wristband that gets you past it.
+
+> 💡 **In one line:** Affinity is the Pod asking for a node; a taint is the node refusing Pods, and a toleration is the wristband that gets one in anyway.
+
+That difference explains the most common misuse. Adding tolerations to every Deployment "so nothing gets stuck" removes the rope entirely. Batch jobs then land on the GPU nodes you were reserving, and the GPU work waits behind them.
 
 > ⚠️ **Common Pitfall:** Applying `NoExecute` to a busy node without a drain plan can evict production Pods immediately.
 
 ### Under the hood
+
+Here is what each taint effect actually does:
 
 | Effect | Behavior |
 |--------|----------|
@@ -333,7 +359,7 @@ What breaks if you remove a GPU taint “temporarily”: general workloads sched
 
 ### In production
 
-**Ownership:** Platform owns custom taints on node pools; app teams add matching tolerations only for intended pools. Detect with unexpected Pods on reserved nodes and Pending GPU jobs. Mitigate with admission policies that block broad tolerations.
+**Ownership:** The platform team owns every custom taint on every node pool. App teams add a matching toleration only for the pool they were actually granted. Detect misuse by watching for unexpected Pods on reserved nodes and for GPU jobs sitting Pending. Prevent it with admission policies that reject tolerations broad enough to match anything.
 
 | Do | Don't |
 |----|-------|
@@ -353,13 +379,19 @@ What breaks if you remove a GPU taint “temporarily”: general workloads sched
 
 ### In plain terms
 
-When the venue is full, who gets a seat? A **PriorityClass** assigns an integer priority to Pods. Higher-priority Pods can **preempt** (evict) lower-priority Pods so they can schedule—like asking standby guests to leave for the headliner. Without priorities, everyone competes equally and critical control-plane-adjacent workloads can starve.
+A **PriorityClass** is a named object that carries a number. Attach one to a Pod and you have told the cluster how important that Pod is. **Preemption** is what the scheduler does with that number when the cluster is full: it deletes a lower-priority Pod to free room for a higher-priority one.
 
-Preemption is controlled blast radius: you choose who yields under contention. You might think making every Deployment “high” is safe—then nothing yields and critical work still Pending.
+Why is this worth setting up? Because "full" is when the decision actually matters. Without priorities, an overnight batch job and your customer-facing API compete for the last free node on equal terms, and whichever asked first wins. With priorities, you decide in advance who yields — long before the 3 a.m. page.
+
+Back to the venue: when every seat is taken, standby guests are asked to leave so the headliner can go on. Nobody argues about it in the moment, because the rule was set when the tickets were sold.
+
+The way people break this is predictable. Every team marks their own workload "high," so nothing is lower than anything else, nothing ever yields, and your critical Pod is still Pending. Priorities only help when they genuinely differ. Keep the ladder short.
 
 > ⚠️ **Common Pitfall:** Reusing `system-cluster-critical` for ordinary apps. Those classes protect essential components—do not dilute them.
 
 ### Under the hood
+
+Here is a two-rung ladder, one class for user-facing work and one for batch:
 
 ```yaml
 apiVersion: scheduling.k8s.io/v1
@@ -451,7 +483,7 @@ What breaks if victims have PDBs that block eviction while you use mechanisms th
 
 ### In production
 
-**Ownership:** Platform owns the priority ladder catalog; app teams request a class from that ladder, not invent values. Detect starvation with Pending high-priority Pods while low-priority Jobs consume the cluster. Mitigate with a small ladder and staging contention tests.
+**Ownership:** The platform team publishes the priority ladder. App teams pick a class from it and never invent their own numbers. Detect starvation when high-priority Pods sit Pending while low-priority Jobs fill the cluster. Reduce the risk by keeping the ladder short and by testing contention in staging before you rely on it.
 
 | Do | Don't |
 |----|-------|
@@ -471,13 +503,19 @@ What breaks if victims have PDBs that block eviction while you use mechanisms th
 
 ### In plain terms
 
-Two different “please leave” mechanisms exist. **Node-pressure eviction** is the kubelet acting as a firefighter when the node is out of memory or disk—it may kill Pods based on QoS and consumption to save the node. **API-initiated eviction** is a polite request through the Eviction API (what `kubectl drain` and many autoscalers use)—it respects PodDisruptionBudgets. Confusing them leads to false confidence in PDBs during OOM storms.
+Eviction means a running Pod is removed from its node. Kubernetes has two completely separate ways of doing that, and mixing them up causes real outages.
 
-Change safety for maintenance depends on voluntary eviction + PDB. Node pressure is a capacity incident, not a maintenance workflow. You might think a PDB means “this Pod never dies”—PDBs do not restrain kubelet pressure eviction or `kubectl delete pod`.
+**Node-pressure eviction** is the kubelet acting as a firefighter. The node is running out of memory or disk, and if nothing gives, the whole machine goes down and takes every Pod with it. So the kubelet picks victims and kills them locally. It does not ask the API server for permission.
+
+**API-initiated eviction** is a polite request sent to the API server. This is what `kubectl drain` and most autoscalers use when they want a node emptied for maintenance. Because it goes through the API, it respects a **PDB** (PodDisruptionBudget), an object that says how many replicas of a workload may be taken down at one time. If honoring the request would break that budget, the request is refused.
+
+Why does the distinction matter so much? Because people assume a PDB protects a Pod from everything. It does not. A PDB restrains planned, voluntary disruption only. It has no power over the kubelet reclaiming memory, and none over someone typing `kubectl delete pod`. Planned maintenance is a workflow you control. Node pressure is a capacity incident, and the fix is capacity — not a budget object.
 
 > ⚠️ **Common Pitfall:** Believing a PDB will save you from node MemoryPressure. PDBs do not restrain kubelet pressure eviction.
 
 ### Under the hood
+
+Here is how each mechanism works on the machine.
 
 #### Node-pressure (kubelet) eviction
 

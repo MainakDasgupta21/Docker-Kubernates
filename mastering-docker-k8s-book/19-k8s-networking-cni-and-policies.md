@@ -567,9 +567,9 @@ flowchart LR
 
 ### In production
 
-**Ownership:** Platform publishes the default-deny + DNS allow pattern; app teams maintain the namespace traffic matrix and PR policy changes. Change safety: never apply default-deny to a busy namespace without a rollback NetworkPolicy set and a staging soak.
+**Ownership:** The platform team publishes the default-deny plus DNS-allow pattern that every namespace starts from. App teams keep the list of who calls whom current, and send policy changes as pull requests. Change safety: never apply default-deny to a busy namespace without a prepared rollback set of policies and a soak period in staging.
 
-**Failure mode:** Missing allow → total namespace outage or DNS blackhole. Detect with synthetic checks and error budgets on dependency success rates. Mitigate by applying DNS allow *with* default-deny in one change, then opening app paths incrementally.
+**Failure mode:** One missing allow rule takes down the whole namespace, or blackholes DNS for every Pod in it. Detect it with checks that run continuously and with error budgets on how often calls to each dependency succeed. Keep it small by shipping the DNS allow *together with* default-deny in one change, then opening application paths a few at a time.
 
 | Do | Don't |
 |----|-------|
@@ -683,11 +683,14 @@ Service `ipFamilyPolicy` / `ipFamilies` basics live in [Chapter 15](15-k8s-servi
 
 ## 19.13 Key takeaways
 
-- CNI plugins assign Pod IPs and implement cross-node connectivity; monitor them as critical infrastructure.
-- Calico, Flannel, Cilium, and cloud CNIs trade simplicity, policy, and observability differently.
-- CoreDNS powers service discovery; apps should use Service names.
-- NetworkPolicies are deny-by-exception once a Pod is selected—start from default-deny and open least-privilege paths, including DNS.
-- Dual-stack multiplies address families; cross-check Chapters 15 and 32 before enabling it in production.
+- Kubernetes does not do Pod networking itself. A CNI plugin does, and it can fail on its own.
+- Run one main CNI. Two plugins fight over the same interfaces and routes.
+- Applying NetworkPolicy YAML proves nothing until you confirm your CNI enforces it.
+- Call Services by name. Pod IPs change every time a Pod is replaced.
+- Check DNS before you debug the app. When CoreDNS hurts, everything looks broken.
+- NetworkPolicy has no deny rules. Selecting a Pod builds the wall; each rule cuts a door.
+- Start from default-deny, allow DNS in the same change, then open paths one at a time.
+- Dual-stack means two address families to allow, two sets of routes, and two sets of firewall rules.
 
 ---
 

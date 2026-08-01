@@ -4,27 +4,27 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain what problem Compose solves and why a declarative file beats a pile of `docker run` commands
-> - Write a `compose.yaml` using the modern **Compose Specification** (not obsolete "v3 syntax" framing)
-> - Define services, networks, and volumes, and wire them together
-> - Manage configuration with environment variables, `.env` files, profiles, and overrides
-> - Add health checks and readiness-based startup ordering
-> - Use Compose **Watch** (`develop.watch`) for a hands-off local edit loop
-> - Build and run a realistic multi-service Task API with Postgres
+> - Say what problem Compose solves, and why one file beats a pile of `docker run` commands
+> - Write a `compose.yaml` the modern way, following the **Compose Specification** instead of old "v3 syntax" advice
+> - Describe services, networks, and volumes in one file and connect them together
+> - Keep settings out of the file itself using environment variables, `.env` files, profiles, and overrides
+> - Add health checks so one service waits until the service it needs is truly ready
+> - Turn on Compose **Watch** (`develop.watch`) so your edits reach the container with no extra commands
+> - Build and run a real two-service app: a Task API with Postgres
 
 ---
 
 ## 08.1 The orchestra score
 
-By now you can run a container the way a musician plays an instrument. A real application is an orchestra: a web API, a database, a cache, maybe a worker — each needing the right networks, volumes, ports, and environment, started in a sensible order.
+By now you can run a container the way a musician plays one instrument. A real application is more like an orchestra. A web API, a database, a cache, maybe a background worker — each one needs the right network, volume, ports, and settings, started in a sensible order.
 
 ![Orchestra conductor coordinating multi-service applications](assets/analogy-orchestra.png)
 
 *Figure 08.A: Compose is the conductor that starts each section when the score (compose.yaml) says so.*
 
-You *could* conduct by shouting individual `docker run` lines every time. Or you could hand everyone a **score**: one document that describes each player and how they fit together.
+You *could* conduct that orchestra by shouting one `docker run` line at a time, every time. Or you could hand everyone a **score**: one document that describes each player and how they fit together.
 
-Docker Compose is that score. You describe the application in YAML; `docker compose up` performs it. The file is *declarative and versionable* — it lives in Git, documents architecture, and makes "works on my machine" mean "works on every machine with Docker."
+Docker Compose is that score. You describe the application in YAML, and `docker compose up` performs it. The file is **declarative**, which means it states the result you want rather than the steps to get there. Because it is just a file, it lives in Git, records your architecture, and turns "works on my machine" into "works on every machine with Docker."
 
 ---
 
@@ -32,11 +32,15 @@ Docker Compose is that score. You describe the application in YAML; `docker comp
 
 ### In plain terms
 
-Compose V2 ships with modern Docker as the `docker compose` subcommand (the old standalone `docker-compose` Python binary is history). One file, one command, a whole stack.
+Compose is a tool that reads one YAML file and then starts, stops, and connects every container your application needs.
 
-The problem Compose solves is *reproducibility of a whole system*. A single `docker run` is fine for one container, but a real app is a set of containers plus the networks and volumes that wire them together, started in the right order with the right environment. Doing that by hand means a growing pile of shell commands that only live in one person's terminal history — the definition of "works on my machine." Compose moves that entire description into one declarative file you commit to Git, so the stack is the same on your laptop, a teammate's, and CI.
+You should care because a single `docker run` is fine for one container, but a real app is several containers plus the networks and volumes that join them, started in the right order with the right settings. Doing that by hand leaves you with a growing pile of shell commands that live only in one person's terminal history. That is the definition of "works on my machine." Compose moves the whole description into one file you commit to Git, so the stack comes up the same way on your laptop, on a teammate's laptop, and in CI.
 
-> ⚠️ **Common Pitfall:** You might type `docker-compose` (with a hyphen) out of muscle memory from old tutorials. That was the standalone Python V1 tool, now retired. Modern Compose is the `docker compose` *subcommand* (space, not hyphen), built into the Docker CLI; commands and file format have moved on, so follow V2 docs, not V1 blog posts.
+Compose V2 ships with modern Docker as the `docker compose` subcommand. The old standalone `docker-compose` Python program is history. One file, one command, a whole stack.
+
+> 💡 **In one line:** Compose is not magic. It reads your file and runs the same container, network, and volume operations you would type by hand — in the right order, every time, with names based on the project.
+
+> ⚠️ **Common Pitfall:** You might type `docker-compose` with a hyphen out of muscle memory from old tutorials. That was the standalone Python V1 tool, now retired. Modern Compose is the `docker compose` *subcommand* — a space, not a hyphen — built into the Docker CLI. The commands and the file format have both moved on, so follow V2 docs rather than V1 blog posts.
 
 ### Under the hood
 
@@ -93,9 +97,9 @@ Write spec-style files: no `version:` key, `compose.yaml` as the name.
 
 ### In production
 
-Commit `compose.yaml` next to the app. Treat Compose as the local and CI contract for "how this stack runs." Production at scale may move to Swarm stacks (Chapter 09) or Kubernetes (Part II), but the *declarative multi-service* habit starts here.
+Commit `compose.yaml` next to the app. Treat Compose as the agreed answer to "how does this stack run?" for local work and CI. Production at scale may move on to Swarm stacks (Chapter 09) or Kubernetes (Part II), but the habit of describing many services in one file starts here.
 
-**Who owns this:** the app team owns `compose.yaml` as source — it is code, reviewed and versioned like any other file. **Failure mode and detection:** the quiet trap is treating Compose as a *deployment* tool for production traffic when it has no multi-host scheduling, self-healing across nodes, or rolling-update guarantees; a single host running `docker compose up` is a single point of failure. Detect the mismatch when someone asks "what happens when this host dies?" and the answer is "the whole app is down." **Do** use Compose as the local/CI contract and the on-ramp to Swarm/Kubernetes semantics; **don't** treat one `compose up` on one VM as a resilient production platform.
+**Who owns this:** the app team owns `compose.yaml` as source code. It gets reviewed and versioned like any other file. **Failure mode and detection:** the quiet trap is using Compose to run production traffic. Compose cannot schedule across several machines, cannot heal a workload when a node dies, and gives you no rolling-update guarantees. One host running `docker compose up` is a single point of failure. You spot the mismatch the moment someone asks "what happens when this host dies?" and the answer is "the whole app goes down." **Do** use Compose for local work, CI, and as your on-ramp to Swarm and Kubernetes ideas; **don't** treat one `compose up` on one VM as a resilient production platform.
 
 **Before you leave this section**
 
@@ -109,13 +113,17 @@ Commit `compose.yaml` next to the app. Treat Compose as the local and CI contrac
 
 ### In plain terms
 
-A Compose file has three main pillars — containers to run, networks that connect them, and volumes that persist data — the same concepts from Chapters 05–07, written once.
+A Compose file has three main parts: `services` are the containers to run, `networks` connect them, and `volumes` keep their data.
 
-Nothing new is being invented here — that is the point. `services` are the containers from Chapter 05, `networks` are the user-defined networks from Chapter 06, and `volumes` are the named volumes from Chapter 07. Compose just lets you declare all three in one place and wires them together automatically: it creates a project network, attaches every service to it, and gives each service a DNS name equal to its key in the file. That is why `api` can reach `db` with no IPs configured anywhere.
+You should care because these are exactly the pieces you already learned, now written down in one place. `services` are the containers from Chapter 05. `networks` are the networks you created yourself in Chapter 06. `volumes` are the named volumes from Chapter 07. Nothing new is being invented here, and that is the point.
 
-> ⚠️ **Common Pitfall:** You might expect to reach another service by `localhost` because "they're in the same Compose project." Inside a container `localhost` is that container itself. Services find each other by *service name* on the shared project network (`db`, `api`, `cache`) — the same lesson from Chapter 06, now automatic.
+Compose also wires the three together for you. It creates one network for the project, attaches every service to it, and gives each service a DNS name equal to its key in the file. That is why `api` can reach `db` with no IP address configured anywhere.
+
+> ⚠️ **Common Pitfall:** You might expect to reach another service at `localhost` because "they're in the same Compose project." Inside a container, `localhost` means that container itself. Services find each other by *service name* on the shared project network — `db`, `api`, `cache`. It is the same lesson from Chapter 06, except Compose now sets it up for you.
 
 ### Under the hood
+
+Here is what the three top-level keys look like in a file:
 
 ```yaml
 services:      # the containers to run, and how
@@ -170,9 +178,9 @@ Notice what the `db` service does **not** have: a `ports:` entry. It does not ne
 
 ### In production
 
-Do not publish database ports unless a human tool on the host truly needs them. Keep data stores on internal networks; publish only the API (or put a reverse proxy in front).
+Do not publish database ports unless a tool a human runs on the host truly needs them. Keep datastores on internal networks. Publish only the API, or put a reverse proxy in front of it.
 
-**Who owns this:** the app team owns which services declare `ports:`; every published port is a security-relevant line in the file that a reviewer should question. **Failure mode and detection:** a `ports:` on a datastore added for local debugging gets committed and rides to a shared or cloud host, where scanners find it within hours. Detect it by grepping the committed Compose files for datastore `ports:` entries and by scanning the host from outside with `ss -ltnp` / an external port check. **Do** keep databases and caches port-less on an internal network and reach them only from other services; **don't** publish a datastore port by habit — bind to `127.0.0.1` if a host tool genuinely needs it.
+**Who owns this:** the app team owns which services declare `ports:`. Every published port is a security decision written into the file, and a reviewer should question each one. **Failure mode and detection:** a `ports:` entry added to a datastore for local debugging gets committed, rides along to a shared or cloud host, and scanners find it within hours. Look for it by searching committed Compose files for `ports:` on datastores, and by checking the host from outside with `ss -ltnp` or an external port check. **Do** keep databases and caches with no published port on an internal network, reachable only from other services; **don't** publish a datastore port out of habit — bind to `127.0.0.1` if a host tool genuinely needs it.
 
 > 🏭 **Production floor:** Adding `ports:` to a database or cache service is a blast-radius decision, not a convenience. On a public host it can expose the datastore to the internet and may bypass the host firewall via Docker's own packet-filter rules. Review every `ports:` entry like a firewall change: justify it, bind to `127.0.0.1` for host-local tooling, and default to no published port so datastores stay reachable only over the internal project network.
 
@@ -188,13 +196,17 @@ Do not publish database ports unless a human tool on the host truly needs them. 
 
 ### In plain terms
 
-Keep secrets and environment-specific knobs *out of hard-coded YAML strings* where you can. Compose interpolates variables, merges files, and can gate optional services behind **profiles**.
+Compose can pull values in from outside the file, stack several files on top of each other, and switch optional services on and off with **profiles**.
 
-The reason to externalize configuration is that one `compose.yaml` often has to serve many contexts — your laptop, a teammate's, CI, a demo environment — that differ only in a handful of values (a port, an image tag, a password). Hard-coding those values forks the file per environment and invites drift. Compose gives you three complementary tools: `${VAR}` interpolation fed by an auto-loaded `.env` file, per-service environment injection (`environment:` / `env_file:`), and file layering plus profiles to reshape *which* services and settings apply. Used well, one committed file plus a small uncommitted `.env` covers every environment.
+You need this because one `compose.yaml` usually has to serve many situations — your laptop, a teammate's laptop, CI, a demo box — that differ by only a handful of values, such as a port, an image tag, or a password. Hard-code those values and you end up with one copy of the file per environment. Copies drift apart, and then nobody knows which one is right.
 
-> ⚠️ **Common Pitfall:** You might assume `.env` and `env_file:` do the same thing. They do not. `.env` is auto-loaded to fill `${VAR}` placeholders *inside the Compose file itself* (host-side interpolation). `env_file:` injects variables *into a service's container* at runtime. A value you need for `${DB_PASSWORD}` interpolation must be in `.env`; a value the app reads at runtime belongs in `env_file:`/`environment:`.
+Compose gives you three tools that work together. First, `${VAR}` placeholders filled in from a `.env` file that Compose loads on its own. Second, per-service settings pushed into the container with `environment:` or `env_file:`. Third, extra files layered on top, plus profiles, which change *which* services and settings apply at all. Used well, one committed file plus one small uncommitted `.env` covers every environment. Keep secrets and environment-specific values out of hard-coded YAML strings wherever you can.
+
+> ⚠️ **Common Pitfall:** You might assume `.env` and `env_file:` do the same thing. They do not. Compose loads `.env` on the host to fill `${VAR}` placeholders *inside the Compose file itself*. `env_file:` sets variables *inside a service's container* when it runs. A value you need for `${DB_PASSWORD}` must be in `.env`. A value the app reads while running belongs in `env_file:` or `environment:`.
 
 ### Under the hood
+
+Here is exactly what each mechanism touches:
 
 **`.env` vs `env_file:` vs `environment:`**
 
@@ -259,9 +271,9 @@ $ docker compose --profile debug up -d     # api + pgadmin
 
 ### In production
 
-Use profiles for debug UIs, seed jobs, and heavy optional components — not for secretly forking prod topology. Prefer overlay files when whole *environments* differ (dev vs staging settings for the same services).
+Use profiles for debug UIs, seed jobs, and heavy optional components. Do not use them to quietly build a different production layout. Use extra layered files when whole *environments* differ, such as dev versus staging settings for the same services.
 
-**Who owns this:** the app team owns the layering scheme (which values live in `.env`, which in `environment:`, which in an overlay file) and the discipline of never committing real secrets. **Failure mode and detection:** the recurring incident is a `.env` with a real password committed to Git, where it lives in history forever even after deletion. Detect it with a secret scanner in CI and a pre-commit hook, and confirm `.env` is in `.gitignore`. A quieter failure is override precedence surprises — a later `-f` file or `compose.override.yaml` silently changing a value; use `docker compose config` to render the final merged file and see exactly what will run. **Do** commit `compose.yaml`, gitignore secret-bearing `.env`, and render `config` before deploying; **don't** paste production credentials into any committed file.
+**Who owns this:** the app team owns the layering scheme — which values live in `.env`, which in `environment:`, which in a layered file — and the discipline of never committing a real secret. **Failure mode and detection:** the incident that keeps happening is a `.env` holding a real password committed to Git, where it stays in the history forever even after you delete the line. Catch it with a secret scanner in CI and a pre-commit hook, and confirm `.env` is listed in `.gitignore`. A quieter failure is a surprise about which file wins: a later `-f` file or `compose.override.yaml` silently changes a value. Run `docker compose config` to print the final merged file and see exactly what will run. **Do** commit `compose.yaml`, gitignore any `.env` holding secrets, and print `config` before you deploy; **don't** paste production credentials into any committed file.
 
 **Before you leave this section**
 

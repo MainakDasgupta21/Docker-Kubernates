@@ -364,15 +364,15 @@ The containerd image store is **incompatible with `userns-remap`**. If your secu
 
 ### In production
 
-1. **Write-heavy workloads belong on volumes.** Copy-on-write on the image store is the wrong place for database files and high-churn queues.
-2. **Plan migrations.** Push or save local images before enabling the containerd image store; expect a temporary empty `docker images` list after the switch.
-3. **Know your data roots.** Monitor disk on both `/var/lib/docker` and `/var/lib/containerd` after Engine 29 fresh installs or migrations.
-4. **Do not reconfigure weekly.** Prefer volumes and registry workflows over chasing storage-driver micro-optimizations.
-5. **Document remapping.** If `userns-remap` is required, treat containerd image store enablement as a blocked change until remapping is retired or replaced.
+1. **Write-heavy workloads belong on volumes.** Copy-on-write in the image store is the wrong place for database files and queues that change constantly.
+2. **Plan migrations.** Push or save local images before you enable the containerd image store, and expect `docker images` to look empty right after the switch.
+3. **Know your data roots.** Monitor disk on both `/var/lib/docker` and `/var/lib/containerd` after a fresh Engine 29 install or a migration.
+4. **Do not reconfigure weekly.** Spend your effort on volumes and registry workflows instead of chasing small storage-driver tuning wins.
+5. **Document remapping.** If `userns-remap` is required, block any change that enables the containerd image store until remapping is retired or replaced.
 
 > 💡 **Tip:** On Docker Desktop, the containerd image store is already the default on modern clean installs. Desktop users usually do not edit graph-driver settings the way Linux Engine admins do.
 
-**Who owns this:** the platform team owns the storage backend decision, the migration plan, and disk monitoring on the data roots; app teams should never flip `containerd-snapshotter` on a shared daemon on a whim. **Failure mode and detection:** the two migration surprises are (1) local images appearing to vanish after the switch — they are hidden, not deleted, and reappear if you switch back or after you push/`docker save` them first — and (2) enabling the containerd image store on a `userns-remap` daemon, an **unsupported combination**. Detect the backend with `docker info --format '{{.Driver}}'` (`overlayfs` = containerd image store, `overlay2` = legacy graph driver) and confirm `userns-remap` status before any migration. **Do** push or save local images before switching; **don't** enable it on a remapped daemon without first retiring or replacing remapping.
+**Who owns this:** the platform team owns the choice of storage backend, the migration plan, and disk monitoring on the data roots. App teams must never flip `containerd-snapshotter` on a shared daemon on a whim. **Failure mode and detection:** two surprises show up during migration. First, local images look like they vanished after the switch — they are hidden, not deleted, and they come back if you switch again, so push them or run `docker save` first. Second, enabling the containerd image store on a `userns-remap` daemon is an **unsupported combination**. Check the backend with `docker info --format '{{.Driver}}'` (`overlayfs` means the containerd image store, `overlay2` means the legacy graph driver) and confirm whether `userns-remap` is on before any migration. **Do** push or save local images before switching; **don't** enable it on a remapped daemon until remapping is retired or replaced.
 
 **Before you leave this section**
 
@@ -386,13 +386,17 @@ The containerd image store is **incompatible with `userns-remap`**. If your secu
 
 ### In plain terms
 
-Do not dig through `/var/lib/docker` by hand. Run a short-lived helper container that mounts the volume and a host backup directory, then archive with `tar`.
+Backing up a volume means starting one short-lived helper container, mounting both the volume and a host folder into it, and copying the data across with `tar`.
 
-The reason for the helper-container pattern is that a volume's on-disk location is an implementation detail Docker owns — poking at `/var/lib/docker/volumes/...` directly is brittle, breaks under the containerd image store, and risks corrupting data if you touch files a running container is using. Instead you let a throwaway container mount the volume the normal way, alongside a host directory, and `tar` bridges the two. It is portable, works the same on every backend, and never assumes a path.
+Why not just copy the files off the host directly? Because where a volume sits on disk is Docker's business, not yours. Reaching into `/var/lib/docker/volumes/...` by hand is fragile, does not hold up across storage backends, and can corrupt data if you touch files a running container is using.
+
+The helper container avoids all of that. It mounts the volume the normal, supported way, right next to a host directory, and `tar` carries files between the two. The pattern behaves the same on every storage backend and never assumes a path, so the same commands work on your laptop and on a server.
 
 > ⚠️ **Common Pitfall:** You might expect `docker volume prune` to only remove truly junk volumes. By default it removes unused *anonymous* volumes — but `--all` also sweeps unused *named* volumes, and "unused" only means "no container currently references it." A database volume whose container is temporarily stopped or recreated can look unused and get deleted. This is an irreversible, data-losing command.
 
 ### Under the hood
+
+Here is what actually happens on the machine, in both directions:
 
 **Backup:**
 
@@ -445,11 +449,11 @@ $ docker volume prune
 
 ### In production
 
-A file-level copy of a *running* database can capture a torn, inconsistent state. Stop the container first, or — better — use the database's own tooling (`pg_dump`, `mysqldump`) and archive that output. Automate backups; test restores on a schedule, not on incident day.
+Copying the files of a *running* database can capture a half-written, inconsistent state. Stop the container first, or better, use the database's own tools (`pg_dump`, `mysqldump`) and archive that output instead. Automate the backups. Test the restores on a schedule, not on the day of an incident.
 
-**Who owns this:** the platform/on-call team owns backup automation and restore drills; the app team owns knowing which volumes are precious and how to produce a consistent dump for its datastore. The incident nobody forgets is a reflexive `docker volume prune --all` or a copy-pasted `docker system prune --volumes` on the wrong host that wipes a production database with no tested restore path.
+**Who owns this:** the platform/on-call team owns backup automation and restore drills. The app team owns knowing which volumes are precious and how to produce a clean dump for its datastore. The incident nobody forgets is a reflex `docker volume prune --all`, or a pasted `docker system prune --volumes` on the wrong host, that wipes a production database with no tested way back.
 
-**Failure mode and detection:** the failure is total and instantaneous, so the only meaningful "detection" is prevention plus verified backups. Test restores on a schedule and alert if a backup job stops producing artifacts. **Do** protect prod hosts from bulk prune commands and keep an off-host copy of backups; **don't** run `prune --all`/`system prune --volumes` interactively on anything holding real data.
+**Failure mode and detection:** the loss is total and instant, so the only real "detection" is prevention plus backups you have proven work. Test restores on a schedule, and raise an alert if a backup job stops producing files. **Do** keep bulk prune commands away from production hosts and keep a copy of backups off the host; **don't** type `prune --all` or `system prune --volumes` by hand on anything holding real data.
 
 > 🏭 **Production floor:** `docker volume rm` and `docker volume prune --all` (and `docker system prune --volumes`) are irreversible data-deletion commands with no image or registry to fall back on. Treat them as change-managed on any host with production data: require an explicit named target rather than a blanket prune, confirm a fresh tested backup exists first, and never run bulk prune commands on a shared or production host out of habit. A single misfired prune is a full data-loss incident, not a cleanup.
 
@@ -545,11 +549,14 @@ Run a temporary container that mounts the volume read-only and bind-mounts a hos
 
 ## 07.12 Key takeaways
 
-- The container writable layer is disposable; data that must outlive a container belongs in a mount.
-- **Named volumes** for real data, **bind mounts** for development convenience, **tmpfs** for RAM-only scratch.
-- An empty named volume can be pre-populated from the image; a bind mount hides image content instead.
-- **Engine 29.x fresh installs** default to the **containerd image store**; legacy **`overlay2`** graph drivers remain on many upgrades but are **deprecated**. Content lives under paths such as `/var/lib/containerd`; the store is **incompatible with `userns-remap`**.
-- Back up volumes with a throwaway container plus `tar`; for databases, prefer native dump tools or stop first.
+- The writable layer is throwaway. Anything that must outlive the container belongs in a mount.
+- Stopping a container keeps its files. Removing it deletes them, with no undo.
+- **Named volumes** hold real data. **Bind mounts** are for editing code live. **tmpfs** is RAM-only scratch — cap it with `size=`.
+- An empty named volume gets pre-filled from the image. An empty bind mount hides the image's files instead.
+- Name every volume you care about. Anonymous volumes are the ones nobody backs up.
+- Fresh **Engine 29.x** installs default to the **containerd image store** (`overlayfs`, content under paths such as `/var/lib/containerd`). Many upgraded hosts still run **`overlay2`**, which is **deprecated**. The containerd image store is **incompatible with `userns-remap`**. Run `docker info` to see which you have.
+- Back up a volume with a throwaway container plus `tar`. For databases, use the native dump tool or stop the container first.
+- `docker volume rm` and `prune --all` delete data for good. Your backup is the only way back.
 
 ---
 
