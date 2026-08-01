@@ -334,15 +334,15 @@ If commands suddenly reach the wrong machine, check the active context:
 $ docker context show
 ```
 
-**What breaks if the active context points at a dead endpoint:** every command fails with connection errors even though Desktop looks fine on another context. Switch back with `docker context use …`.
+**What breaks if the active context points at an endpoint that is gone:** every command fails with connection errors, even though Desktop is healthy under a different context. Switch back with `docker context use …`.
 
 ### In production
 
-**Ownership:** platform documents approved contexts for remote engines; developers own not leaving experimental `DOCKER_HOST` values in shared shells.
+**Ownership:** the platform team documents which contexts are approved for remote engines. Developers own not leaving experimental `DOCKER_HOST` values behind in shared shells.
 
-Document which context developers and CI use. Prefer explicit contexts for remote engines over ad-hoc `DOCKER_HOST` changes that linger in shells. Never expose an unauthenticated Docker API over the public internet.
+Write down which context developers use and which one CI uses. Use named contexts for remote engines instead of one-off `DOCKER_HOST` changes that stay set long after you forget them. Never put an unauthenticated Docker API on the public internet.
 
-**Do:** `docker context show` before destructive prune commands. **Don’t:** point a laptop context at production Engine without strong auth and change control.
+**Do:** run `docker context show` before any command that deletes things, such as `prune`. **Don’t:** point a laptop context at a production engine without strong authentication and a change process.
 
 **Before you leave this section**
 
@@ -356,13 +356,15 @@ Document which context developers and CI use. Prefer explicit contexts for remot
 
 ### In plain terms
 
-One command hides a pipeline: talk to the engine, find or pull an image, create a container, start a process, print a message, exit, maybe clean up. Learning the pipeline turns opaque failures into categorized ones—pull versus create versus start versus app exit.
+`docker run hello-world` looks like one action, but it is a short assembly line: talk to the engine, find or download the image, create a container, start a process, print a message, exit, and maybe clean up.
 
-> ⚠️ **Common Pitfall:** Reading an application crash as “Docker is broken.” If the image pulled and the container was created, Docker did its job; the process exited non-zero.
+Why learn the assembly line? Because it turns one useless error message into a specific one. Instead of “it failed,” you can say the download failed, or the create step failed, or the app exited on its own. Each of those has a different owner and a different fix.
+
+> ⚠️ **Common Pitfall:** Reading an application crash as “Docker is broken.” If the image downloaded and the container was created, Docker did its job. Your process exited with a non-zero code, and that is an application problem.
 
 ### Under the hood
 
-Layered view:
+Here is what actually happens on the machine, in order:
 
 1. **CLI** validates arguments and calls the Engine API “create + start.”
 2. **Engine** checks for the `hello-world` image locally.
@@ -396,19 +398,19 @@ $ docker run --rm hello-world
 $ docker images hello-world
 ```
 
-**What breaks if the image architecture does not match the engine:** create/start can fail with `exec format error`. Pull with `--platform` or build for the target arch (Chapter 03).
+**What breaks if the image was built for a different CPU architecture than the engine runs:** create or start fails with `exec format error`. Pull with `--platform`, or build an image for the architecture you are targeting (Chapter 03).
 
-Understanding this pipeline makes later failures diagnosable: pull problems versus create problems versus start problems versus app crashes.
+Once you know these steps, later failures stop being mysterious. Every one of them lands on a step: the download, the create, the start, or the app itself.
 
 ### In production
 
-**Ownership:** on-call uses the same pipeline language in tickets; platform owns registry reachability; app owners own process exit codes.
+**Ownership:** on-call engineers use these step names in tickets. The platform team owns whether the registry is reachable. App owners own their process exit codes.
 
-Teach on-call the same pipeline. A failed deploy is often “registry auth,” “disk full,” “image missing for this architecture,” or “process exited 1”—not a mysterious Docker ghost.
+Teach on-call the same steps. A failed deploy is usually registry credentials, a full disk, an image missing for this CPU architecture, or a process that exited with code 1. It is almost never a ghost in Docker.
 
-**Failure mode:** CI cannot pull base images behind a proxy. **Detect:** failures at step 3 with TLS/timeout/`403`/`429`. **Mitigate:** mirror/cache, authenticated pulls, document proxy settings.
+**Failure mode:** CI cannot download base images through a company proxy. **Detect:** failures at step 3 with TLS errors, timeouts, `403`, or `429`. **Mitigate:** run a mirror or cache, log in for pulls, and document the proxy settings.
 
-**Do:** name the failing step in the incident summary. **Don’t:** restart the daemon as step zero for every exit code 1.
+**Do:** name the failing step in the incident summary. **Don’t:** restart the daemon as your first move every time something exits 1.
 
 **Before you leave this section**
 
@@ -422,9 +424,13 @@ Teach on-call the same pipeline. A failed deploy is often “registry auth,” �
 
 ### In plain terms
 
-On Mac and Windows, your containers do not run directly on the host kernel. They run inside a Linux environment Desktop manages. That explains resource knobs, file-sharing quirks, and why Client OS and Server OS differ.
+On Mac and Windows, your containers do not run on your computer’s own kernel. Docker Desktop quietly runs a small Linux virtual machine, and your containers live inside that.
 
-The misconception is “Docker on Mac is slower because containers are slow.” Often the bottleneck is the VM’s CPU/RAM ceiling or bind-mount chatiness across the VM boundary—not the container idea itself.
+Why care? Because this one fact explains most of the surprises: why Desktop has CPU and memory sliders, why sharing folders is slow or has odd permissions, and why `docker version` shows one operating system for the client and another for the server.
+
+The common misconception is “Docker on Mac is slow because containers are slow.” Usually the real limit is the memory and CPU you gave the virtual machine, or the cost of passing every file read across the boundary between your host and that VM. The container idea is not the slow part.
+
+> 💡 **In one line:** On Mac and Windows, Docker runs a hidden Linux VM, so your containers are always one boundary away from your own filesystem.
 
 ```mermaid
 flowchart TB
@@ -441,29 +447,31 @@ flowchart TB
 
 *Figure 02.4: On Desktop, the client runs on the host OS while containers run inside a managed Linux engine.*
 
-> ⚠️ **Common Pitfall:** Bind-mounting huge Windows home directories into containers and blaming Flask for multi-second file I/O. Prefer project files inside WSL2’s Linux filesystem when on Windows.
+> ⚠️ **Common Pitfall:** Mounting a huge Windows home directory into a container and then blaming Flask for file reads that take seconds. On Windows, keep project files inside the WSL2 Linux filesystem instead.
 
 ### Under the hood
 
-- **Resources:** Desktop allocates CPU/RAM/disk to the Linux VM. If builds are slow or containers OOM, raise resources in Desktop settings.
-- **File sharing:** Bind-mounting host directories requires shared paths; permission quirks are common on Mac/Windows. Prefer working inside WSL2 filesystems on Windows when possible.
-- **Linux containers vs Windows containers:** This book uses **Linux containers**. On Windows, ensure Desktop is in Linux container mode.
-- **Optional Kubernetes:** Desktop can enable a single-node cluster—useful later in Part II, not required for Part I.
-- **Compose V2:** Prefer `docker compose` (plugin) on Docker Engine 29.x over the legacy `docker-compose` standalone binary.
+Here is what actually happens on the machine.
+
+- **Resources:** Desktop hands a fixed amount of CPU, memory, and disk to the Linux VM. If builds crawl or containers get killed for using too much memory (**OOM**, out of memory), raise those limits in Desktop settings.
+- **File sharing:** Mounting a host directory into a container requires that path to be shared with the VM, and permissions behave oddly on Mac and Windows. On Windows, work inside the WSL2 filesystem when you can.
+- **Linux containers vs Windows containers:** This book uses **Linux containers** everywhere. On Windows, make sure Desktop is in Linux container mode.
+- **Optional Kubernetes:** Desktop can turn on a single-node cluster. That is handy in Part II and not needed for Part I.
+- **Compose V2:** On Docker Engine 29.x, use `docker compose` (the built-in plugin) rather than the old standalone `docker-compose` program.
 
 ```bash
 $ docker version --format 'Client={{.Client.Os}}/{{.Client.Arch}} Server={{.Server.Os}}/{{.Server.Arch}}'
 ```
 
-**What breaks if Desktop’s disk image fills:** pulls and builds fail; containers may refuse to start. Reclaim space (`docker system df`, prune) and raise the disk limit in Desktop settings.
+**What breaks if Desktop’s virtual disk fills up:** pulls and builds fail, and containers may refuse to start. Free space with `docker system df` and a prune, then raise the disk limit in Desktop settings.
 
 ### In production
 
-**Ownership:** developer experience / platform publishes Desktop settings baselines; CI owns Linux runners that match production architecture.
+**Ownership:** the developer-experience or platform team publishes the recommended Desktop settings. CI owns Linux runners that match the production architecture.
 
-For local parity with Linux servers, develop inside WSL2 or a Linux VM when path and performance quirks matter. For CI, prefer Linux runners that match production architecture (`linux/amd64` versus `linux/arm64`).
+To match Linux servers closely on your laptop, develop inside WSL2 or a Linux VM whenever file paths or speed start to matter. For CI, use Linux runners with the same CPU architecture as production—`linux/amd64` or `linux/arm64`.
 
-**Do:** treat Desktop as a lab that approximates Linux Engine. **Don’t:** use Desktop resource defaults as capacity planning for servers.
+**Do:** treat Desktop as a lab that comes close to Linux Engine. **Don’t:** use Desktop’s default resource sliders as the basis for sizing servers.
 
 **Before you leave this section**
 
@@ -557,12 +565,14 @@ Talk to the engine → find or pull the image → create the container → start
 
 ## 02.11 Key Takeaways
 
-- Install Docker Desktop (Mac/Windows) or Docker Engine (Linux), then verify with `docker version` and `hello-world`.
-- Architecture: **Client → Engine API → dockerd → containerd/runc → process**.
-- Desktop runs a Linux engine in a VM; that split explains many path and resource quirks.
-- Distinguish failures: daemon down, pull failed, container exited—architecture tells you where to look.
-- Compose V2 via `docker compose` matches this book’s Docker Engine 29.x assumptions.
-- Treat the Docker socket like sudo; record Server Engine version and OS/Arch in every support ticket.
+- **Installed is not running.** You do not have Docker until `docker version` shows a **Server** section.
+- The chain is **client → API → dockerd → containerd → runc → your process**. Failures belong to one link.
+- The `docker` command **only sends messages**. `dockerd` does the work.
+- On Mac and Windows, containers run in a **hidden Linux VM**. That is why client OS and server OS differ.
+- Name the broken step: daemon down, pull failed, create failed, or the app exited.
+- **The Docker socket is sudo.** Guard it that way.
+- Use `docker compose`, the plugin. The old standalone `docker-compose` is not what this book assumes.
+- Put **Server engine version and OS/Arch** in every support ticket you open.
 
 ---
 

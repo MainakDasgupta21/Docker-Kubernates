@@ -350,13 +350,15 @@ That message names the exact filter that rejected each node. It is one of the mo
 
 ### In plain terms
 
-`kube-controller-manager` is one process containing roughly thirty independent control loops. Grouping them into one binary is an operational convenience, not a design statement: each loop still watches the API and reconciles one kind of gap.
+The **controller manager** (`kube-controller-manager`) is one program that contains about thirty separate control loops. They are bundled into one program only to make it easier to run. Each loop still works on its own: it watches the API and closes one kind of gap.
 
-The **cloud-controller-manager** is a sibling process that holds the loops that need to talk to a *cloud provider's* API. It exists so that Kubernetes itself can stay vendor-neutral: cloud-specific code lives in a separate binary maintained by the cloud vendor.
+The **cloud controller manager** is a second program that holds the loops that must call a *cloud provider's* API. It exists so Kubernetes itself stays vendor-neutral. Cloud-specific code lives in its own program, maintained by the cloud vendor.
+
+Why learn the difference? Because it turns vague problems into specific ones. "My load balancer has no IP" belongs to the cloud controller manager. "My Deployment is stuck at 2 of 3" belongs to the Deployment and ReplicaSet loops. Naming the owner is half the fix.
 
 ### Under the hood
 
-Notable loops inside `kube-controller-manager`:
+Here are the loops worth knowing inside `kube-controller-manager`:
 
 | Controller | Reconciles |
 |------------|-----------|
@@ -390,14 +392,14 @@ $ kubectl get node mastering-k8s-worker -o jsonpath='{.metadata.labels}' | tr ',
 "kubernetes.io/os":"linux"
 ```
 
-On a cloud cluster the same command would also show `topology.kubernetes.io/region`, `topology.kubernetes.io/zone`, and `node.kubernetes.io/instance-type` — all written by the cloud controller manager. On kind those labels are absent, which is exactly why `type: LoadBalancer` Services stay `<pending>` there: no cloud controller exists to fulfill them.
+On a cloud cluster the same command would also show `topology.kubernetes.io/region`, `topology.kubernetes.io/zone`, and `node.kubernetes.io/instance-type`. The cloud controller manager writes all three. On kind those labels are missing, and that is exactly why `type: LoadBalancer` Services stay `<pending>` there. No cloud controller exists to create the load balancer.
 
 ### In production
 
-- **Know which controller owns a behavior.** "My LoadBalancer Service has no external IP" is a cloud-controller-manager question. "My Deployment is stuck at 2/3" is a Deployment/ReplicaSet question. Naming the owner cuts debugging time in half.
-- **Controller managers are leader-elected.** Only one replica is active at a time (see §12.9), so running three replicas gives you failover, not extra throughput.
-- **Cloud API rate limits are real.** A flapping Service or a thundering herd of node registrations can exhaust a cloud provider's quota and stall reconciliation cluster-wide.
-- **Out-of-tree is the rule now.** In-tree cloud providers were removed in the 1.31 cycle; on 1.36 every cloud integration is an out-of-tree cloud-controller-manager plus CSI drivers.
+- **Know which controller owns each symptom.** "My LoadBalancer Service has no external IP" is a cloud controller manager question. "My Deployment is stuck at 2/3" is a Deployment and ReplicaSet question. Naming the owner cuts debugging time in half.
+- **Controller managers use leader election.** Only one replica is active at a time (see §12.8). Running three replicas buys you failover, not extra speed.
+- **Cloud API rate limits are real.** A Service that keeps changing, or a crowd of nodes registering at once, can burn through a cloud provider's quota and stall reconciliation across the whole cluster.
+- **All cloud code now lives outside Kubernetes core.** The built-in cloud providers were removed during the 1.31 cycle. On 1.36, every cloud integration is a separate cloud controller manager plus CSI drivers.
 
 **Before you leave this section**
 
@@ -411,15 +413,17 @@ On a cloud cluster the same command would also show `topology.kubernetes.io/regi
 
 ### In plain terms
 
-Three things run on every worker node:
+Three programs run on every worker node, and together they turn objects into running processes.
 
 - **kubelet** — the node's foreman. It asks the API server "which Pods are mine?", makes them exist, and reports back. It is the only component that starts containers.
-- **The container runtime** — the thing that actually runs containers (containerd or CRI-O). The kubelet talks to it through a standard interface, the **CRI**.
-- **kube-proxy** — implements Service virtual IPs in the node's networking (some CNI plugins replace it; Chapter 19).
+- **The container runtime** — the program that actually runs containers, usually containerd or CRI-O. The kubelet talks to it through a standard interface called the **CRI** (Container Runtime Interface).
+- **kube-proxy** — sets up the node's networking so Service IP addresses work. Some CNI plugins do this job instead (Chapter 19).
+
+Remember the split this way: the control plane decides, and these three obey. When a Pod is scheduled but never starts, the answer is almost always on the node, in one of these three.
 
 ### Under the hood
 
-The kubelet's loop is a Pod-level reconciliation loop:
+The kubelet runs its own reconciliation loop, one Pod at a time:
 
 ```text
 watch API for Pods where spec.nodeName == me
@@ -432,7 +436,7 @@ watch API for Pods where spec.nodeName == me
    └─ report Pod status + node status back to the API server
 ```
 
-**The CRI (Container Runtime Interface)** is a gRPC contract with two services — `RuntimeService` (sandboxes, containers, exec, logs) and `ImageService` (pull, list, remove images) — spoken over a Unix socket:
+The **CRI (Container Runtime Interface)** is the agreed set of gRPC calls between the kubelet and any runtime. It has two services: `RuntimeService` for sandboxes, containers, exec, and logs, and `ImageService` for pulling, listing, and removing images. Both are spoken over a Unix socket on the node:
 
 ```bash
 $ kubectl get nodes -o wide
@@ -444,9 +448,9 @@ mastering-k8s-control-plane   Ready    control-plane   v1.36.0   172.18.0.4    D
 mastering-k8s-worker          Ready    <none>          v1.36.0   172.18.0.3    Debian GNU/Linux 12 (bookworm)   containerd://2.1.5
 ```
 
-Historical note worth keeping straight: Kubernetes once had a shim (**dockershim**) that let the kubelet drive Docker Engine directly. It was **removed in Kubernetes 1.24** (2022). This does not affect you: images you build with Docker are OCI images, and containerd — which Docker itself uses underneath — runs them happily.
+One piece of history worth keeping straight. Kubernetes once shipped an adapter called **dockershim** that let the kubelet drive Docker Engine directly. It was **removed in Kubernetes 1.24** (2022). This does not affect your work. The images you build with Docker are OCI images, and containerd — which Docker itself uses underneath — runs them without changes.
 
-Debugging at the CRI level, when the API-level view is not enough:
+When the API-level view is not enough, you can debug at the runtime level:
 
 ```bash
 # on the node (kind: docker exec -it mastering-k8s-worker bash)
@@ -460,7 +464,7 @@ CONTAINER      IMAGE          CREATED         STATE     NAME       POD ID       
 
 #### cgroup v2: how limits are actually enforced
 
-The kubelet does not invent resource enforcement; it delegates to Linux **cgroups**, and modern Kubernetes assumes **cgroup v2** (the unified hierarchy). Kubernetes 1.36 requires cgroup v2 for several features you will meet later, including in-place Pod resize (Chapter 13), memory QoS, and PSI-based pressure reporting (`/sys/fs/cgroup/…/{cpu,memory,io}.pressure`), which graduated to stable in 1.36.
+The kubelet does not enforce CPU and memory limits itself. It hands that job to Linux **cgroups**, the kernel feature that caps how much CPU, memory, and IO a group of processes may use. Modern Kubernetes assumes **cgroup v2**, the newer single-hierarchy version. Kubernetes 1.36 needs cgroup v2 for several features you will meet later: in-place Pod resize (Chapter 13), memory QoS, and PSI-based pressure reporting (`/sys/fs/cgroup/…/{cpu,memory,io}.pressure`), which became stable in 1.36.
 
 ```bash
 # on a node: which cgroup version is in use?
@@ -477,10 +481,10 @@ cgroup2fs
 
 ### In production
 
-- **The kubelet is the last line of defense for a node.** Its eviction thresholds (`memory.available`, `nodefs.available`, `imagefs.available`) protect the machine by evicting Pods. Tune them; do not disable them.
-- **Watch node conditions, not just `Ready`.** `MemoryPressure`, `DiskPressure`, and `PIDPressure` explain most mysterious evictions.
-- **Keep the kubelet within one minor version of the control plane.** The supported skew is that the kubelet may be up to three minor versions older than the API server, never newer.
-- **Prefer runtime-level debugging as a last resort.** `crictl` on a node is powerful and unsafe: it bypasses the API and therefore your audit trail and RBAC.
+- **The kubelet is the node's last line of defense.** Its eviction thresholds (`memory.available`, `nodefs.available`, `imagefs.available`) protect the machine by removing Pods. Tune them. Never turn them off.
+- **Read all node conditions, not just `Ready`.** `MemoryPressure`, `DiskPressure`, and `PIDPressure` explain most evictions that otherwise look random.
+- **Keep the kubelet close to the control plane version.** The kubelet may be up to three minor versions older than the API server, and never newer.
+- **Use `crictl` on a node only as a last resort.** It is powerful, and it goes around the API — which means around RBAC and around your audit trail.
 
 **Before you leave this section**
 
@@ -494,13 +498,15 @@ cgroup2fs
 
 ### In plain terms
 
-How does the control plane know a node is alive? The node keeps saying so. Instead of writing a full Node object every few seconds — expensive, because every write goes to etcd and wakes every watcher — the kubelet updates a tiny object called a **Lease**, once every ten seconds by default. A Lease is essentially a timestamped "I am here" note.
+A **Lease** is a tiny object holding a name and a timestamp. It means "this holder was still alive at this moment." Kubernetes uses it as a heartbeat.
 
-The same primitive solves a second problem: when three copies of a controller run for redundancy, which one is in charge? They race to hold a Lease. The winner works; the losers wait. That is **leader election**.
+Why not just update the Node object? Because that is expensive. Every write goes to etcd and wakes up every watcher. So the kubelet updates a small Lease instead, once every ten seconds by default. Cheap writes mean a cluster can have thousands of nodes without drowning the control plane.
+
+The same small object solves a second problem. When three copies of a controller run for safety, which one is in charge? They race to hold one Lease. The winner does the work, and the losers wait for it to go stale. That race is called **leader election**.
 
 ### Under the hood
 
-Node heartbeats live in their own namespace, `kube-node-lease`, one Lease per node:
+Node heartbeats live in their own namespace, `kube-node-lease`, with one Lease per node:
 
 ```bash
 $ kubectl get leases -n kube-node-lease
@@ -529,7 +535,7 @@ spec:
   renewTime: "2026-07-25T18:41:07.512345Z"
 ```
 
-The important field is `renewTime`. The node lifecycle controller compares it to now:
+The field that matters is `renewTime`. The node lifecycle controller keeps comparing it to the current time:
 
 ```mermaid
 flowchart TD
@@ -543,7 +549,7 @@ flowchart TD
 
 *Figure 12.4: A dead node's Lease goes stale, then Ready turns Unknown, then Pods evacuate after the taint toleration window.*
 
-That chain is why a hard node failure takes roughly five to six minutes to result in Pods being recreated elsewhere — a timeline that surprises people during their first node outage.
+That chain is why a dead node takes roughly five to six minutes before its Pods appear elsewhere. Almost everyone is surprised by that delay during their first node outage.
 
 Leader-election Leases live in `kube-system`, one per component:
 
@@ -567,14 +573,14 @@ $ kubectl get lease kube-scheduler -n kube-system \
 mastering-k8s-control-plane_9a8b7c6d-1e2f-4a3b-8c9d-0e1f2a3b4c5d  renewed: 2026-07-25T18:41:09.884210Z
 ```
 
-There is also an `apiserver-*` Lease per API server instance (used for identity and, with coordinated leader election, for coordinating which instance leads).
+There is also one `apiserver-*` Lease per API server instance. It gives each instance an identity and, with coordinated leader election, decides which instance leads.
 
 ### In production
 
-- **`kube-node-lease` should be quiet and boring.** A flood of Lease update failures in kubelet logs means networking to the API server is unhealthy — often before anything else looks wrong.
-- **Tune eviction timing consciously.** Shrinking `--default-not-ready-toleration-seconds` speeds recovery from real failures but makes brief network partitions cause unnecessary Pod churn. Fast failover requires spare capacity to absorb it.
-- **Never write to `kube-node-lease` yourself,** and be careful with RBAC there: whoever can update a node's Lease can make a dead node look alive.
-- **Custom controllers should use Leases too.** The `coordination.k8s.io/v1` Lease API plus a leader-election library is the standard way to run a controller with N replicas but one active instance.
+- **`kube-node-lease` should stay quiet and boring.** A flood of Lease update failures in the kubelet log means the network path to the API server is sick, often before anything else looks wrong.
+- **Change eviction timing on purpose, not by accident.** Lowering `--default-not-ready-toleration-seconds` recovers faster from real failures. It also makes short network blips move Pods for no reason. Fast failover needs spare capacity to land on.
+- **Never write to `kube-node-lease` yourself,** and keep RBAC tight there. Anyone who can update a node's Lease can make a dead node look alive.
+- **Give your own controllers a Lease too.** The `coordination.k8s.io/v1` Lease API plus a leader-election library is the standard way to run several replicas with only one doing work.
 
 > 💡 **Tip:** If a node shows `Ready` but its Pods are unreachable, check the Lease `renewTime` first. A fresh Lease with broken workloads points at the CNI or kube-proxy; a stale Lease points at the kubelet or the network path to the API server.
 
@@ -592,7 +598,9 @@ There is also an `apiserver-*` Lease per API server instance (used for identity 
 
 ### In plain terms
 
-Nine components, one Pod, ten seconds. Following the path once removes most of the mystery from Kubernetes forever.
+One command, several components, about ten seconds. This section follows a single `kubectl apply` all the way to a running container.
+
+Walk the path once and Kubernetes stops feeling like magic. You will also know where to look when it fails, because each stage fails in its own recognizable way.
 
 ### Under the hood
 
@@ -643,11 +651,11 @@ LAST SEEN   TYPE     REASON      OBJECT         MESSAGE
 13s         Normal   Started     pod/task-api   Started container task-api
 ```
 
-Notice which component reported each event (`default-scheduler`, then `kubelet`). That column is a map of the pipeline.
+Look at which component reported each event: first `default-scheduler`, then `kubelet`. That column is a map of the whole pipeline.
 
 ### In production
 
-Read the trace backwards when debugging, and the failure symptom tells you where to look:
+When debugging, walk the trace backwards. The symptom tells you which stage failed:
 
 | Symptom | Stage that failed | First command |
 |---------|-------------------|---------------|
@@ -671,11 +679,13 @@ Read the trace backwards when debugging, and the failure symptom tells you where
 
 ### In plain terms
 
-A **namespace** is a folder for API objects, plus a scope for names, quotas, and access control. Two Services can both be called `task-api` as long as they live in different namespaces. Namespaces organize; they do not, by themselves, isolate.
+A **namespace** is a folder for Kubernetes objects. Names must be unique inside one namespace, so two Services can both be called `task-api` as long as they sit in different namespaces.
+
+Namespaces exist so teams can share one cluster without colliding. They also give you a place to attach limits: quotas on how much a team may use, RBAC rules for who may act, and security levels for what Pods may do. But be clear about the limit: a namespace organizes objects. On its own it does not isolate anything.
 
 ### Under the hood
 
-Every cluster ships with four:
+Every cluster starts with four namespaces:
 
 ```bash
 $ kubectl get namespaces

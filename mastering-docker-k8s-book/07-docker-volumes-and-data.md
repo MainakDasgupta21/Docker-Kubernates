@@ -166,13 +166,19 @@ Give every volume that holds real data a name. Use named volumes for databases a
 
 ### In plain terms
 
-A **bind mount** maps a specific host path into the container. Edit files on your laptop; the container sees the change immediately. That tight loop is why bind mounts dominate local development.
+A **bind mount** maps one exact folder from the host machine into a container.
 
-The trade-off is that a bind mount ties the container to a *specific host's directory layout*. Where a named volume says "give me managed storage, I don't care where," a bind mount says "use exactly `/home/dev/project/site` on this machine." That is perfect for development — your editor and the container share the same files in real time — and fragile for production, because the path may not exist on another host, and the container now reads and writes with the host's raw UID/GID and permissions.
+You want this while you are writing code. Save a file on your laptop and the container sees the new version instantly, with no rebuild and no copy step. That fast loop is why bind mounts dominate local development.
 
-> ⚠️ **Common Pitfall:** You might expect a bind mount to behave like a named volume when the target directory has files in the image — copying them out first. It does not. A bind mount *covers* the target: whatever is on the host path wins, and image content at that path becomes invisible. Mount an empty host dir over `/etc/nginx` and nginx sees an empty config directory.
+The trade-off is that a bind mount ties the container to one machine's folder layout. A named volume says "give me managed storage, I do not care where it lives." A bind mount says "use exactly `/home/dev/project/site` on this machine." That is perfect for development, where your editor and the container share the same files in real time. It is fragile in production, because the path may not exist on another host. The container also reads and writes as the host's raw **UID/GID** — the numeric user and group IDs Linux uses for file ownership — so the host's own permissions apply directly.
+
+> 💡 **In one line:** A **named volume** is storage Docker owns and you address by name, and it is the right home for real data. A **bind mount** is a folder *you* own on one specific host, and it is the right tool for editing code live.
+
+> ⚠️ **Common Pitfall:** When the target directory already holds files from the image, you might expect a bind mount to copy them out first, the way a named volume does. It does not. A bind mount *covers* the target. Whatever sits on the host path wins, and the image's content at that path becomes invisible. Mount an empty host folder over `/etc/nginx` and nginx sees an empty config directory.
 
 ### Under the hood
+
+Here is what actually happens on the machine:
 
 ```bash
 $ docker run -d --name devweb \
@@ -193,11 +199,11 @@ $ docker run -d --mount type=bind,source="$(pwd)/site",target=/usr/share/nginx/h
 
 ### In production
 
-Bind mounts depend on host directory layout, skip copy-on-first-mount, and share raw UID/GID with the host. That makes them less portable and more permission-sensitive than named volumes. Use them for live source and host config in development; prefer named volumes (or Kubernetes PVCs later) for production state.
+Bind mounts depend on the host's folder layout, skip the copy-on-first-mount behavior, and share raw UID/GID with the host. That makes them less portable and more sensitive to permissions than named volumes. Use them for live source code and host config files in development. Use named volumes (or Kubernetes PVCs later) for production state.
 
-**Who owns this:** whoever writes the run/Compose definition owns the host-path assumption. A bind mount is a coupling between the container and one machine's filesystem, so it is the app team's job to document it and the platform team's job to guarantee the path exists with the right ownership on every host that runs the workload.
+**Who owns this:** whoever writes the run command or Compose file owns the assumption about the host path. A bind mount ties the container to one machine's filesystem. So the app team must document it, and the platform team must guarantee the path exists with the right ownership on every host that runs the workload.
 
-**Failure mode and detection:** two failure shapes dominate. First, **permission mismatches** — the container process runs as UID 1000 but the host directory is owned by root, so writes fail with `permission denied`; on SELinux hosts you also need `:z`/`:Z` labels or the mount is silently unreadable. Second, a bind mount of a sensitive host path (`/`, `/var/run/docker.sock`, `/etc`) hands the container far more of the host than intended. Detect the first with the app's own error logs and `ls -ln` on the host path; detect the second in review. **Do** keep bind mounts read-only (`:ro`) whenever the container only reads; **don't** bind-mount the Docker socket or host root into application containers.
+**Failure mode and detection:** two failures dominate. First, **permission mismatches**: the container process runs as UID 1000 but the host directory belongs to root, so writes fail with `permission denied`. On SELinux hosts you also need `:z`/`:Z` labels or the mount is silently unreadable. Second, a bind mount of a sensitive host path (`/`, `/var/run/docker.sock`, `/etc`) hands the container far more of the host than you intended. Find the first in the app's own error logs plus `ls -ln` on the host path. Find the second in review. **Do** keep bind mounts read-only (`:ro`) whenever the container only reads; **don't** bind-mount the Docker socket or the host root into application containers.
 
 > 🏭 **Production floor:** Bind mounts read and write the host filesystem directly with the container's UID/GID and no Docker-managed boundary. Mounting a sensitive host path — the Docker socket, `/etc`, or `/` — gives a compromised container a direct lever on the host, so treat any such mount as a change-managed, security-reviewed decision. Default to `:ro`, scope the path as narrowly as possible, and prefer named volumes for anything that is real production state rather than live-edited source.
 
@@ -213,13 +219,17 @@ Bind mounts depend on host directory layout, skip copy-on-first-mount, and share
 
 ### In plain terms
 
-A **tmpfs** mount lives in RAM. Fast, never written to disk, gone when the container stops. Ideal for scratch, caches, or secrets you do not want lingering on disk.
+A **tmpfs** mount is a directory that lives in the machine's memory (RAM) instead of on a disk.
 
-The deciding property is *where the bytes physically live*. Named volumes and bind mounts persist on disk; a tmpfs mount is memory that merely looks like a directory. That makes it the natural home for two very different needs: throwaway speed (a scratch or cache directory a batch job rewrites constantly) and disk hygiene (a decrypted secret or session token you specifically do not want surviving on the host's disk, where forensics or a stray backup could recover it).
+You reach for it in two very different situations. The first is speed for throwaway files, such as a scratch or cache directory that a batch job rewrites constantly. The second is disk hygiene: a decrypted password or a session token that must not be left on the host's disk, where a stray backup or a forensic tool could recover it later.
 
-> ⚠️ **Common Pitfall:** You might treat tmpfs as "just a fast volume" and forget it competes for real RAM. An unbounded or oversized tmpfs under load can consume enough memory to trigger the kernel OOM killer, which then reaps *some other* container — a confusing incident where the victim is not the culprit. Always cap it with `size=`.
+The question that decides everything here is where the bytes physically live. Named volumes and bind mounts keep bytes on disk. A tmpfs mount is memory that merely looks like a directory. So it is fast, it is never written to disk, and it is gone the moment the container stops.
+
+> ⚠️ **Common Pitfall:** You might treat tmpfs as "just a fast volume" and forget that it competes for the machine's real RAM. Under load, a tmpfs with no size cap can eat enough memory to trigger the kernel's OOM killer, which then kills *some other* container. The result is a confusing incident where the victim is not the culprit. Always cap the mount with `size=`.
 
 ### Under the hood
+
+Here is what actually happens on the machine:
 
 ```bash
 $ docker run -d --name worker \
@@ -231,9 +241,9 @@ tmpfs mounts are Linux-oriented in classic Engine usage and cannot be shared bet
 
 ### In production
 
-Pair tmpfs with `--read-only` root filesystems (Chapter 10) so temporary paths still work. Size the mount; unbounded tmpfs can pressure host memory under load.
+Pair tmpfs with a `--read-only` root filesystem (Chapter 10) so temporary paths still work. Always set a size. A tmpfs with no cap can starve the host of memory under load.
 
-**Who owns this:** the app team owns which paths are scratch versus durable and sets the `size=` cap based on real working-set measurements. **Failure mode and detection:** watch host memory and container OOM events (`docker events`, `dmesg` OOM lines) — a runaway tmpfs shows up as memory pressure rather than a disk-full error. **Do** size every tmpfs and use it to keep secrets off disk; **don't** point durable state at it or leave it uncapped.
+**Who owns this:** the app team decides which paths are scratch and which must last, and sets the `size=` cap from real measurements of how much the app writes. **Failure mode and detection:** watch host memory and container OOM events (`docker events`, OOM lines in `dmesg`). A runaway tmpfs shows up as memory pressure, not as a disk-full error. **Do** size every tmpfs and use it to keep secrets off disk; **don't** store data you need to keep there, and don't leave it uncapped.
 
 **Before you leave this section**
 
@@ -279,11 +289,17 @@ Volumes hold the data you deliberately persist. Image layers and the container's
 
 ### In plain terms
 
-Think of image layers as floors of a building and the running container as a temporary rooftop patio. The patio can change; the floors underneath stay shared and read-only until someone rewrites a tile — then Docker copies that tile onto the patio first (**copy-on-write**). Volumes are a separate filing cabinet bolted on from outside the building: they bypass that copy-on-write path for native-speed I/O.
+The **image store** is the part of Docker that keeps image layers on disk and hands each container its writable layer.
 
-The backend that manages those floors and the patio is what changed in Docker Engine 29.x. It used to be a Docker-specific component (a **graph driver** such as `overlay2`); the modern default on fresh installs is the **containerd image store**, the same storage machinery Kubernetes nodes already use under the hood. For everyday work you rarely touch it — but knowing which backend you are on matters the day you migrate, debug disk usage, or hit the `userns-remap` incompatibility below.
+You should care for three reasons. It decides how much disk your images use, how fast writes inside a container are, and which migration work you owe your hosts on Docker Engine 29.x. For everyday work you never touch it. It matters the day you migrate a host, chase down disk usage, or hit the `userns-remap` conflict described below.
 
-> ⚠️ **Common Pitfall:** You might assume every Docker 29 host uses the containerd image store. Only *fresh* Engine 29.x installs default to it; a host **upgraded** from an older Engine typically keeps the legacy `overlay2` graph driver until you deliberately migrate. Never assume — check with `docker info` before making claims about a given machine.
+Think of image layers as the floors of a building, and the running container as a temporary rooftop patio. The patio can change. The floors underneath stay shared and read-only until someone rewrites a tile, and at that moment Docker copies the tile up onto the patio first. That behavior is called **copy-on-write**. Volumes are a separate filing cabinet bolted onto the outside of the building. They skip the copy-on-write path entirely, which is why their reads and writes run at native speed.
+
+Which component manages those floors and that patio is what changed in Docker Engine 29.x. It used to be a Docker-specific piece called a **graph driver**, such as `overlay2`. The default on fresh installs is now the **containerd image store**, the same storage machinery Kubernetes nodes already use underneath.
+
+> 💡 **In one line:** Fresh Engine 29.x installs default to the containerd image store, while hosts upgraded from an older Engine usually stay on the deprecated `overlay2` graph driver until you migrate — so run `docker info` to find out which one a machine is actually using.
+
+> ⚠️ **Common Pitfall:** You might assume every Docker 29 host uses the containerd image store. Only *fresh* Engine 29.x installs default to it. A host **upgraded** from an older Engine normally keeps the legacy `overlay2` graph driver until you deliberately migrate. Never assume — check with `docker info` before you make claims about a given machine.
 
 ```mermaid
 flowchart TB
@@ -299,6 +315,8 @@ flowchart TB
 *Figure 07.3: Persist write-heavy data on volumes — leave copy-on-write for ephemeral container filesystem changes.*
 
 ### Under the hood
+
+Here is what actually sits on the machine, and how you check which backend you are on:
 
 #### Fresh Engine 29.x installs: containerd image store
 

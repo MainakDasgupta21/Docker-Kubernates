@@ -4,28 +4,32 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain image layers and the union filesystem model
-> - Read image names: registry, repository, tag, and digest
-> - Pull, list, inspect, history, tag, and remove images safely
-> - Reason about cache reuse, layer sharing, and image size
-> - Work with multi-platform images and basic `docker buildx` concepts
-> - Distinguish “latest” convenience from production pinning habits
+> - Explain what image layers are and how they stack into one filesystem
+> - Read an image name part by part: registry, repository, tag, and digest
+> - Pull, list, inspect, tag, and remove images without breaking things
+> - Say why a rebuild was fast or slow, and why an image got bigger
+> - Build and pull images for more than one CPU type using `docker buildx`
+> - Explain why `latest` is fine for a demo and wrong for production
 
 ---
 
 ## 03.1 Skyscrapers Built From Floors
 
-Imagine a skyscraper assembled from prefabricated floors. The foundation floor is a slim Linux userspace. The next floor adds a language runtime. The next copies your application. Upper floors can differ without rebuilding the foundation—as long as lower floors stay identical.
+Imagine a skyscraper built from pre-made floors, dropped into place one at a time. The ground floor is a small set of Linux files. The next floor adds a language runtime, such as Python. The floor above that holds your application code.
+
+Two buildings can share the same lower floors and still differ at the top. You only rebuild a floor when that floor changes, and every floor above it.
 
 ![Skyscraper cutaway showing stacked floors like image layers](assets/analogy-skyscraper-layers.png)
 
 *Figure 03.A: Image layers stack like floors of a building—shared below, unique on top.*
 
-Docker **images** work the same way. Each change during a build usually creates a **layer**. Containers started from the same image share those read-only layers on disk, saving space and pull time. When you finally understand layers, image size, build speed, and security scanning all become less mysterious.
+Docker **images** are built the same way. Each step of a build usually adds one **layer**, a saved set of file changes. Containers made from the same image share those read-only layers on disk, which saves both space and download time.
 
-This chapter is where “promote the same thing” becomes concrete. By the end you should refuse to treat a movable tag as identity, you should read `RepoDigests` without fear, and you should expect platform (amd64 vs arm64) to be part of every pull and build conversation.
+Once layers click, three other things stop being mysterious: why images are the size they are, why some rebuilds take seconds and others take ten minutes, and what a security scanner is actually looking at.
 
-> ⚠️ **Common Pitfall:** You might think learning image commands is optional because “CI builds for me.” When a node cannot pull, when two environments disagree, or when `exec format error` appears, image literacy is the on-call skill—not a specialty chapter you can skip.
+This is also the chapter where “ship the exact same thing everywhere” becomes real. By the end you should refuse to treat a movable tag as an identity, read `RepoDigests` without flinching, and ask “which CPU type?” before every build.
+
+> ⚠️ **Common Pitfall:** You might think image commands are optional because CI builds everything for you. They are not. When a server cannot download an image, when two environments disagree, or when you see `exec format error`, this is the knowledge that ends the outage.
 
 ---
 
@@ -33,21 +37,27 @@ This chapter is where “promote the same thing” becomes concrete. By the end 
 
 ### In plain terms
 
-An image is not “just files.” It is a stacked set of filesystem diffs plus a configuration that says how to start the app. When a container starts, Docker adds a thin writable “rooftop patio” on top; the floors underneath stay read-only and shareable.
+An image is a stack of saved file changes plus a small settings file that says how to start the app. Each saved set of changes is a **layer**, and each layer records only what that build step added, changed, or deleted.
 
-That design solves two problems at once: **sharing** (ten containers can reuse the same base layers on disk) and **immutability** (the lower floors do not change under your feet when a container writes a log file). If you only remember “image = tarball of my app,” you will be surprised by layer caching, digest identity, and why deleting one container does not delete the base OS layer.
+Why not just one big folder? Because stacking gives you two things at once. The first is **sharing**: ten containers can use the same base layers on disk instead of ten copies. The second is **immutability**: the lower layers never change, so a container writing a log file cannot alter the image other containers are using.
 
-> ⚠️ **Common Pitfall:** You might think editing files inside a running container changes the image. It does not. You changed the container’s writable layer. A new container from the same image starts clean unless you commit (discouraged) or rebuild.
+When a container starts, Docker adds a thin writable layer on top—a rooftop patio built on floors that stay read-only. Anything the app writes lands on the patio, not in the building.
+
+If your mental model stays at “an image is a zip file of my app,” three things will keep surprising you: why some rebuilds skip most steps, why a digest is a stronger name than a tag, and why deleting one container does not free the base operating system layer.
+
+> 💡 **In one line:** An image is a stack of read-only layers shared by every container that uses it; each container only owns the thin writable layer on top.
+
+> ⚠️ **Common Pitfall:** You might think editing a file inside a running container changes the image. It does not. You changed that container’s writable layer only. A new container from the same image starts clean, unless you rebuild the image (or run `docker commit`, which is discouraged).
 
 ### Under the hood
 
-An image includes:
+Here is what actually sits inside an image:
 
-- A stack of **filesystem layers** (each a diff)
-- **Config JSON**: default command, entrypoint, env vars, working directory, user, exposed ports, volumes, labels
-- **Metadata** used by registries and the engine (architecture, OS, digests)
+- A stack of **filesystem layers**, where each layer is a set of file changes (a **diff**)
+- A **config JSON** file: default command, entrypoint, environment variables, working directory, user, exposed ports, volumes, and labels
+- **Metadata** the registry and engine use: CPU architecture, operating system, and digests
 
-When a container starts, Docker adds a thin **writable layer** on top. Changes inside the running container live there (unless you mount volumes). The underlying image layers stay immutable.
+When a container starts, Docker adds a thin **writable layer** on top. Every change made inside the running container lands there, unless you mounted a volume for it. The image layers below never change.
 
 ```mermaid
 flowchart TB

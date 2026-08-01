@@ -229,15 +229,17 @@ What breaks if underlay firewalls allow node→node but not the overlay UDP port
 
 ### In plain terms
 
-CoreDNS is the cluster phone book. Pods ask it for `task-api` and get the Service ClusterIP. Applications should call **Services by DNS name**, not Pod IPs—those change on every reschedule.
+**CoreDNS** is the name server that runs inside your cluster. A Pod asks it for `task-api`, and it answers with the ClusterIP of that Service. It is the cluster's phone book.
 
-DNS failure is a force multiplier: every microservice looks “down” at once. You might think scaling the app Deployment fixes “intermittent 503s” when CoreDNS is saturated or NetworkPolicy blocked UDP/TCP 53. Always verify resolution before deep application debugging.
+Why does this need its own section? Because Pod IP addresses change constantly. A Pod that restarts on another node comes back with a different address. If your app has that address written in a config file, it now talks to nothing. Calling a Service by name keeps working no matter how many times the Pods behind it are replaced.
+
+DNS trouble is also the loudest failure in the cluster, because everything depends on it. When CoreDNS struggles, every service appears broken at the same moment. You will be tempted to scale up the application that is throwing errors. That rarely helps if CoreDNS is overloaded or if a NetworkPolicy quietly blocked port 53. Confirm that names still resolve before you debug any application code.
 
 > ⚠️ **Common Pitfall:** Calling `localhost` from one Pod expecting to reach another Pod. `localhost` is always *this* network namespace. Use the Service DNS name.
 
 ### Under the hood
 
-CoreDNS runs as a Deployment in `kube-system` and backs the cluster DNS Service (often still labeled `kube-dns`). Pods receive nameserver and search domains from the kubelet.
+Here is how name lookup is wired inside the cluster. CoreDNS runs as a Deployment in `kube-system` and backs the cluster DNS Service (often still labeled `kube-dns`). Pods receive nameserver and search domains from the kubelet.
 
 | Query | Resolves to |
 |-------|-------------|
@@ -269,7 +271,7 @@ What breaks if CoreDNS replicas are undersized at peak QPS: NXDOMAIN spikes and 
 
 ### In production
 
-**Ownership:** Platform owns CoreDNS sizing, PDB, and DNS SLOs; app teams own correct Service DNS names (short vs FQDN). Detect with CoreDNS latency/error metrics and synthetic `nslookup` probes. Mitigate with HPA where supported, caching discipline, and NetworkPolicy DNS allows before default-deny egress.
+**Ownership:** The platform team sizes CoreDNS, protects it with a **PDB** (PodDisruptionBudget, a rule that stops voluntary maintenance from taking down too many replicas at once), and owns the DNS **SLO** (service level objective, the target for how fast and how reliably lookups must answer). App teams own using the right names — short name inside the namespace, full name across namespaces. Detect trouble with CoreDNS latency and error metrics plus a probe that runs `nslookup` on a schedule. Reduce the risk with autoscaling where your platform supports it, sensible client-side caching, and a DNS allow rule that lands *before* any default-deny egress policy.
 
 | Do | Don't |
 |----|-------|
@@ -289,15 +291,19 @@ What breaks if CoreDNS replicas are undersized at peak QPS: NXDOMAIN spikes and 
 
 ### In plain terms
 
-**Dual-stack** means Pods and Services can use both IPv4 and IPv6. Think of every building getting both a street number and a new postal code system at once. Clients may dial either family; Services can expose one or both.
+**Dual-stack** means Pods and Services can hold addresses in both address systems at once: the older IPv4 and the newer, much larger IPv6. Each system is called an **address family**.
 
-Enabling dual-stack is a cluster-wide networking change, not a Service annotation experiment. You might think flipping `ipFamilyPolicy` on one Service is harmless; without CNI, routes, and firewall parity for IPv6, you create half-working endpoints and confusing client behavior.
+Why would you want both? Usually because you are running out of IPv4 addresses, or because clients outside the cluster have already moved to IPv6. Running both lets old and new clients connect during the years-long migration between them.
+
+Think of every building keeping its existing street number while the city rolls out a second, completely new addressing system. Both are painted on the door. Visitors use whichever one they know.
+
+Here is the part that catches teams out. Turning on dual-stack is a change to the whole cluster, not a field you flip on one Service. Setting `ipFamilyPolicy` looks harmless. But unless the CNI, the routes, and the firewall rules all handle IPv6 too, you get endpoints that only half work and clients that behave differently depending on which family they happened to pick.
 
 > ⚠️ **Common Pitfall:** You might think NetworkPolicy IPv4 allows cover IPv6 peers. Dual-stack doubles the families you must allow intentionally.
 
 ### Under the hood
 
-Kubernetes dual-stack touches:
+Here is every layer dual-stack touches, which is why it is a cluster-level project:
 
 - Cluster and Pod CIDRs for both families
 - Service `spec.ipFamilyPolicy` and `spec.ipFamilies`
@@ -333,7 +339,7 @@ NetworkPolicies can reference IPv4 and IPv6 CIDRs in `ipBlock` peers. Default-de
 
 ### In production
 
-**Ownership:** Platform owns dual-stack enablement (CIDRs, CNI, cloud LB). App teams align Service `ipFamilyPolicy` with how clients actually connect. Detect with dual-family connectivity tests and LB health on both families.
+**Ownership:** The platform team turns dual-stack on, which means the address ranges, the CNI, and the cloud load balancers. App teams set `ipFamilyPolicy` to match how their clients actually connect. Detect gaps by testing connectivity on both families and by checking load balancer health on both.
 
 | Do | Don't |
 |----|-------|
@@ -353,13 +359,21 @@ NetworkPolicies can reference IPv4 and IPv6 CIDRs in `ipBlock` peers. Default-de
 
 ### In plain terms
 
-A **NetworkPolicy** selects Pods and lists who may talk to them (ingress) and whom they may call (egress). Once any policy selects a Pod in a direction, traffic not explicitly allowed in that direction is denied. Policies are additive allow-lists, not competing deny engines.
+A **NetworkPolicy** is an object that picks a group of Pods by label and then lists the traffic those Pods are allowed to have. Incoming traffic is called **ingress**. Outgoing traffic is called **egress**.
 
-This is the primary in-cluster lateral-movement control. You might think a deny rule somewhere will override allows—Kubernetes NetworkPolicy has no deny rules; isolation comes from selecting a Pod and omitting traffic from the allow-list. Mis-labeled Pods are either wide open (no selecting policy) or mysteriously blocked (selected but no matching peer).
+Why do you need it? Because of that wide-open default from the start of the chapter. Any Pod can reach any other Pod. If an attacker gets into one container — through a vulnerable library, a leaked token, anything — they can immediately probe your databases, your internal APIs, and your admin tooling. Moving sideways like that is called lateral movement, and NetworkPolicy is the main tool inside the cluster that stops it.
+
+Now the rule that trips up nearly every beginner. Kubernetes NetworkPolicy has **no deny rules at all**. You cannot write "block this." Instead, the moment *any* policy selects a Pod for a direction, everything in that direction is blocked except what a policy explicitly allows. Selecting a Pod is what turns the wall on. Listing peers is what cuts doors into it.
+
+That single rule explains both confusing outcomes you will see. A Pod that no policy selects is completely open, because no wall was ever built around it. A Pod that a policy selects but whose caller is not listed is completely blocked, even though you never wrote the word deny anywhere. Labels decide which case you are in, so a careless label rename can flip a Pod from one to the other.
+
+> 💡 **In one line:** NetworkPolicy has no deny rules — selecting a Pod builds a wall around it in that direction, and each rule you write cuts one door into that wall.
 
 > ⚠️ **Common Pitfall:** You might think policies select Services. They select **Pods** by label—keep Service selectors and NetworkPolicy selectors aligned.
 
 ### Under the hood
+
+Here is the shape of the object and the rules that govern it:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -391,7 +405,7 @@ What breaks if labels drift between Deployment and NetworkPolicy: production tra
 
 ### In production
 
-**Ownership:** Security/platform own baseline policy posture; app teams own allow-lists for their namespace traffic matrix. Detect with connectivity tests in CI and denied-flow metrics (Cilium Hubble, Calico flow logs). Mitigate by generating policies from a traffic matrix, not hand-editing during incidents.
+**Ownership:** Security and platform own the baseline posture — what every namespace starts with. App teams own the allow list for their own namespace, built from a written list of who calls whom. Detect breakage with connectivity tests that run in CI, and watch metrics for denied flows (Cilium Hubble, Calico flow logs). Keep changes safe by generating policies from that written traffic list, never by hand-editing YAML in the middle of an incident.
 
 | Do | Don't |
 |----|-------|
@@ -411,13 +425,19 @@ What breaks if labels drift between Deployment and NetworkPolicy: production tra
 
 ### In plain terms
 
-Lock every door, then hand out specific keys: DNS, frontend to API, monitoring scrapes. Forgetting DNS is the classic foot-gun—apps fail with “name resolution” errors that look like application bugs.
+**Default-deny** is a policy that selects every Pod in a namespace and allows nothing. It builds the wall. You then add small policies that cut specific doors: DNS, frontend to API, monitoring scrapes.
 
-Default-deny is a blast-radius control: a compromised Pod should not freely scan the cluster or exfiltrate to the internet. You might think applying default-deny in production first is “more secure”—without a traffic map and staging rehearsal, you create a self-inflicted outage. Roll out detect→mitigate style: observe flows, write allows, then close the wall.
+Why start from nothing? Because it limits the damage of a break-in. A compromised Pod in an open namespace can scan every service around it and send data out to the internet. In a default-deny namespace, that same Pod can only reach the few destinations you deliberately listed. That is the difference between losing one container and losing a cluster.
+
+There is a right order and a wrong order for getting there. Applying default-deny to production first feels like the secure move. It is actually how you cause your own outage, because nobody has a complete list of what talks to what. Do it the other way around. Watch the real traffic first, write allow rules that cover it, then put the wall up.
+
+DNS deserves its own warning. It is the door everyone forgets. Close egress without allowing port 53, and your apps start failing with name-resolution errors that look exactly like application bugs. Ship the DNS allow rule in the same change as the wall.
 
 > ⚠️ **Common Pitfall:** Creating a default-deny egress policy and forgetting DNS (UDP/TCP 53 to CoreDNS).
 
 ### Under the hood
+
+Here is the wall itself. An empty `podSelector` selects every Pod in the namespace:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
