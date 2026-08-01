@@ -771,13 +771,14 @@ First, confirm you targeted the intended cluster and namespace (`kubectl config 
 
 ## 11.12 Key takeaways
 
-- Orchestration exists because someone has to hold the promise "this should be running," and a human at 3 a.m. is the wrong someone.
-- Kubernetes is **declarative**: you write `spec`, controllers write `status`, and a reconciliation loop closes the gap forever. Self-healing is that loop, observed.
-- Every object shares the shape `apiVersion` / `kind` / `metadata` / `spec`, so learning to read one manifest teaches you to read all of them.
-- Prefer `kubectl apply` with manifests in Git; use imperative commands to explore and to generate YAML, not to operate.
-- **kind** with `kindest/node:v1.36.0` gives you a real multi-node Kubernetes 1.36 cluster on a laptop; always verify your context before acting.
-- Bare Pods are for learning. Controllers (Chapter 14) are for production — and Services, probes, and resource requests turn a demo into a deployment.
-- Kubernetes is not a PaaS, not a security boundary by default, and not a substitute for sound application design.
+- Something has to hold the promise "this should be running." A human at 3 a.m. is the wrong something.
+- Kubernetes is **declarative**: you write `spec`, controllers write `status`, and a loop closes the gap forever.
+- Self-healing is not magic. It is that loop, running while you are not looking.
+- Every object has the same four fields you write — `apiVersion`, `kind`, `metadata`, `spec` — so reading one manifest teaches you to read all of them.
+- Use `kubectl apply` with files in Git. Use imperative commands to explore and to generate YAML, not to operate.
+- **kind** gives you a real multi-node Kubernetes 1.36 cluster on a laptop. Check your context before every risky command.
+- Bare Pods are for learning. Controllers are for production, plus Services, probes, and resource requests.
+- Kubernetes is not a PaaS, not a security wall by itself, and not a cure for bad application design.
 
 ---
 

@@ -4,27 +4,27 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain what a CNI plugin does and how Pods get IP addresses
-> - Compare Calico, Flannel, Cilium, and common managed CNIs at a practical level
-> - Trace a packet from a Pod on one node to a Pod on another
-> - Describe how CoreDNS resolves Service and Pod names
-> - Write NetworkPolicies, including a default-deny baseline with DNS egress
-> - Cross-reference dual-stack IPv4/IPv6 Service behavior with Chapters 15 and 32
-> - Debug common “why can’t these Pods talk?” failures
+> - Explain what a CNI plugin does and how a Pod gets its IP address
+> - Compare Calico, Flannel, Cilium, and the common cloud CNIs, and know when to pick each
+> - Follow a packet from a Pod on one node to a Pod on another
+> - Describe how CoreDNS turns a Service name into an address
+> - Write NetworkPolicies, starting from a default-deny baseline that still allows DNS
+> - Know where dual-stack IPv4/IPv6 Service behavior is covered (Chapters 15 and 32)
+> - Work through the usual “why can’t these two Pods talk?” failures
 
 ---
 
 ## 19.1 The city street grid
 
-Think of your cluster as a city. Every Pod is a building with its own street address (IP). Nodes are neighborhoods. Without a city planning department, buildings would have conflicting addresses and no roads between neighborhoods.
+Think of your cluster as a city. Every Pod is a building with its own street address, which here is an IP address. Nodes are the neighborhoods those buildings sit in. Without a planning department, two buildings would end up with the same address and no roads would connect the neighborhoods.
 
 ![City street grid for cluster networking and policies](assets/analogy-city-grid.png)
 
 *Figure 19.A: CNI lays the roads; NetworkPolicies are the traffic lights between neighborhoods.*
 
-The **Container Network Interface (CNI)** is that planning department: it assigns Pod IPs, wires virtual interfaces, and ensures packets can leave one node and arrive at another. **Services** ([Chapter 15](15-k8s-services.md)) give stable names on top of those changing IPs. **NetworkPolicies** are the zoning laws—who is allowed to call whom.
+The **Container Network Interface (CNI)** is that planning department. A CNI plugin is the piece of software that hands each new Pod an address, builds its network connection, and makes sure a packet can leave one node and arrive at another. **Services** ([Chapter 15](15-k8s-services.md)) sit on top and give steady names to those constantly changing addresses. **NetworkPolicies** are the zoning laws that say who may call whom.
 
-By default, Kubernetes assumes a flat, reachable Pod network: any Pod can talk to any other Pod unless you deliberately restrict it. That openness is great for getting started and dangerous for production multi-tenant clusters.
+One default surprises almost everyone. Kubernetes assumes every Pod can reach every other Pod, in any namespace, with no rules in the way. That is wonderful on day one, when you just want things to work. It is dangerous later, because one compromised container can then knock on every door in the cluster.
 
 ---
 
@@ -32,15 +32,19 @@ By default, Kubernetes assumes a flat, reachable Pod network: any Pod can talk t
 
 ### In plain terms
 
-When the kubelet creates a Pod, it does not invent networking itself. It calls the configured CNI plugin: “Give this Pod an address and a working network interface.” Without a healthy CNI, Pods sit in `ContainerCreating` with network setup errors—like buildings with no street numbers and no curb cuts.
+A **CNI plugin** is a small program the kubelet runs every time it starts a Pod. Its job is simple to state: give this Pod an address and a working network connection. Kubernetes itself does not do this. It delegates.
 
-CNI solves the “how do containers on different nodes share a routable fabric?” problem so Services, NetworkPolicies, and mesh layers have something real to stand on. You might think networking is “just the cloud VPC”—kubelet still needs a CNI ADD/DEL hook per Pod; a healthy VPC with a crashed CNI DaemonSet still yields stuck Pods.
+Why does that split matter to you? Because the network under your Pods is not built into Kubernetes, so it can fail on its own. When the CNI plugin on a node is broken, Pods on that node get stuck in `ContainerCreating` with network setup errors, while every other node looks perfectly healthy. Knowing the plugin exists turns a baffling symptom into a two-minute check.
+
+Back to the city. A building without a street number and without a curb cut is finished but unusable. Nobody can find it and nothing can be delivered. That is a Pod without CNI.
+
+There is a tempting shortcut belief worth naming: "networking is just the cloud network, and that is already fine." Not quite. The kubelet still calls the plugin once to add the Pod to the network and once to remove it. A perfectly healthy cloud network plus a crashed CNI DaemonSet still gives you stuck Pods.
 
 > ⚠️ **Common Pitfall:** You might think NotReady nodes are always kubelet or disk. A CNI CrashLoop on one node often presents as ContainerCreating / networkPlugin errors while other nodes look fine.
 
 ### Under the hood
 
-A typical CNI hook sequence:
+Here is what the plugin actually does on the machine, in order:
 
 1. Allocate an IP from the Pod CIDR (IPAM)
 2. Create a network interface inside the Pod’s network namespace
@@ -70,9 +74,9 @@ What breaks if Pod CIDR overlaps a peered VPC: return traffic blackholes; sympto
 
 ### In production
 
-**Ownership:** Platform owns CNI choice, DaemonSet health, and CIDR documentation. App teams own Service/NetworkPolicy labels on top of a working fabric. Incident evidence: CNI DaemonSet status, node PodCIDR, kubelet network plugin events.
+**Ownership:** The platform team picks the CNI, keeps its DaemonSet healthy, and writes down the address ranges. App teams own the labels their Services and NetworkPolicies match on. Evidence to gather during an incident: CNI DaemonSet status, each node's PodCIDR, and kubelet network plugin events.
 
-**Failure mode:** CNI node agent down → Pods stuck ContainerCreating on that node. Detect with DaemonSet unavailable and node NotReady / network plugin errors. Mitigate with page-worthy alerts, staged CNI upgrades, and a rollback plan equal to a Kubernetes upgrade.
+**Failure mode:** When the CNI agent on a node dies, every new Pod on that node stays in ContainerCreating. Detect it through unavailable DaemonSet Pods and node NotReady or network plugin errors. Reduce the risk with alerts that page a human, CNI upgrades rolled out one group at a time, and a rollback plan as serious as the one you write for a Kubernetes upgrade.
 
 | Do | Don't |
 |----|-------|
@@ -92,13 +96,19 @@ What breaks if Pod CIDR overlaps a peered VPC: return traffic blackholes; sympto
 
 ### In plain terms
 
-You usually pick **one** primary CNI per cluster. Flannel is the simple overlay for labs. Calico emphasizes routing and mature policy. Cilium bets on eBPF for performance, identity-aware policy, and observability. Managed providers often choose for you—know what you inherited.
+A cluster runs **one** main CNI plugin. This section is about choosing it, or recognizing which one you inherited.
 
-The decision is really about dataplane + policy + observability trade-offs, not brand loyalty. You might think you can “add Calico later for policy” on top of an incompatible stack—many combinations fight over interfaces and routes. Pick a primary dataplane and design policy around what it actually enforces.
+Why is one choice enough? Because the plugin owns the wiring on every node, and two owners fight. The real decision has three parts: how packets move between nodes, whether the plugin enforces NetworkPolicy, and how much visibility you get into blocked traffic. Brand preference does not enter into it.
+
+In short: Flannel is the simple choice for labs. Calico focuses on routing and has mature, well-tested policy support. Cilium uses **eBPF**, a Linux feature that runs small safe programs inside the kernel, to get speed, identity-based policy, and detailed traffic visibility. Cloud providers usually make the choice for you, so find out what you already have.
+
+One plan that sounds reasonable and often is not: "we will add Calico later, just for policy." Many combinations of plugins argue over the same network interfaces and routes. Pick your main plugin first, then write policy that matches what that plugin actually enforces.
 
 > ⚠️ **Common Pitfall:** You might think applying NetworkPolicy YAML proves isolation. On a CNI that does not enforce policy, you only have false confidence.
 
 ### Under the hood
+
+Here is how the common plugins compare on the points that decide the choice:
 
 | Plugin | Style | Strengths | Notes |
 |--------|-------|-----------|-------|
@@ -126,9 +136,9 @@ flowchart TB
 
 ### In production
 
-**Ownership:** Platform owns CNI selection and upgrade path; security/platform jointly own “is NetworkPolicy enforced?” evidence. App teams should not invent a second CNI for one namespace.
+**Ownership:** The platform team picks the CNI and owns the upgrade path. Security and platform together own the proof that NetworkPolicy is really enforced. App teams must not install a second CNI for one namespace.
 
-**Failure mode:** Competing CNIs or MTU mismatch → packet loss and mysterious timeouts. Detect with cross-node connectivity probes and MTU path tests. Mitigate by standardizing one dataplane and documenting encapsulation overhead for latency-sensitive apps.
+**Failure mode:** Two plugins competing, or a mismatched **MTU** (maximum transmission unit, the largest packet size a link accepts), causes dropped packets and timeouts nobody can explain. Detect it with connectivity probes that run between nodes and with MTU path tests. Prevent it by standardizing on one plugin and writing down how much extra header overhead the encapsulation adds for latency-sensitive apps.
 
 | Do | Don't |
 |----|-------|
@@ -148,15 +158,19 @@ flowchart TB
 
 ### In plain terms
 
-Pod A on Node 1 calling Pod B on Node 2 is like a letter leaving one neighborhood, riding the city’s trunk roads (the underlay), and being delivered to another neighborhood. The CNI either **encapsulates** that letter in a tunnel (overlay) or **advertises routes** so the underlay can deliver it directly.
+Cross-node packet flow is the path a request takes when the Pod sending it and the Pod receiving it live on different machines. There are only two ways to do it, and your CNI picks one.
 
-Understanding this path matters because “Pods can’t talk” is rarely one failure—DNS, NetworkPolicy, kube-proxy, and underlay firewalls all sit on different hops. You might think `kubectl exec` ping success proves the Service path works; ClusterIP and EndpointSlice add hops that Pod-to-Pod never takes.
+Why learn the path? Because "the Pods can't talk" is almost never a single failure. DNS, NetworkPolicy, kube-proxy, and the firewalls of the network underneath all sit at different points along the route. If you cannot name the hops, you cannot say which one broke, and three teams end up changing three things at once.
+
+Think of a letter leaving one neighborhood, traveling the city's main roads, and arriving in another neighborhood. Those main roads are the **underlay**, the ordinary network your nodes already sit on. The CNI has two ways to use it. It can wrap your packet inside another packet and send it through a tunnel, which is called an **overlay**. Or it can tell the underlay routers exactly which node owns which Pod addresses, so the packet travels directly with no wrapper.
+
+Here is a check that fools people. A successful `ping` between two Pods does not prove a Service works. Pod-to-Pod is the shortest path in the cluster. Reaching a Service adds a ClusterIP and an EndpointSlice lookup, and either of those can be broken while ping is perfectly happy.
 
 > ⚠️ **Common Pitfall:** You might think fixing a Security Group for node IPs automatically covers Pod IPs. On some CNIs Pods use different addresses; on others they share the node ENI—know which model you run.
 
 ### Under the hood
 
-Suppose Pod A (`10.244.1.10`) calls Pod B (`10.244.2.20:8000`).
+Here is the actual path a packet takes. Suppose Pod A (`10.244.1.10`) calls Pod B (`10.244.2.20:8000`).
 
 Simplified VXLAN-style path:
 
@@ -195,7 +209,7 @@ What breaks if underlay firewalls allow node→node but not the overlay UDP port
 
 ### In production
 
-**Ownership:** Platform owns underlay/overlay health; app teams provide reproduce steps (source Pod, dest Pod/Service, port). Detect with synthetic probes across nodes and zones. Mitigate by separating DNS vs policy vs routing in the runbook before changing three layers at once.
+**Ownership:** The platform team keeps the underlay and overlay healthy. App teams supply exact reproduction steps: source Pod, destination Pod or Service, and port. Detect problems early with test traffic that runs continuously between nodes and between zones. Keep the damage small by having the runbook separate DNS, policy, and routing into three checks, so nobody changes all three layers in one panic.
 
 | Do | Don't |
 |----|-------|

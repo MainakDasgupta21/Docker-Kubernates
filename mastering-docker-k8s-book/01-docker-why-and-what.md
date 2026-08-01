@@ -552,11 +552,13 @@ Any of: cluster multi-host scheduling, application design quality, secrets disci
 
 ## 01.10 Key Takeaways
 
-- Containers reduce environment drift by packaging the app with its dependency filesystem.
-- VMs virtualize hardware; containers isolate processes using shared-kernel OS features.
-- Master the quartet: **image**, **container**, **registry**, **engine**.
-- Docker is the popular toolkit for that workflow—not magic, not a full orchestrator.
-- Use containers for portable, repeatable app deployment; know their isolation limits.
+- Ship the app **with its files**, not just the source code. That is what kills environment drift.
+- **Image = the package. Container = the package running.** Never swap the two words.
+- A **VM brings its own kernel. A container borrows the host’s.** That is the whole difference.
+- **Registry = where images live** so other machines can pull them. **Engine = what actually runs them.**
+- Docker is packaging plus a runtime—**not** an orchestrator, and **not** security for free.
+- Promote by **digest**, not by tag. A tag can be repointed; a digest cannot.
+- Containers fit repeatable, same-kernel apps. If you need another kernel, use a VM.
 
 ---
 

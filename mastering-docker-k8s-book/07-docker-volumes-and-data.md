@@ -4,25 +4,25 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Explain why data written inside a container disappears when the container is removed
-> - Choose among named volumes, bind mounts, and tmpfs mounts for a given job
-> - Manage volumes with the `docker volume` command family
-> - Contrast the **containerd image store** (Engine 29.x default on fresh installs) with legacy **graph drivers** such as `overlay2`
-> - Back up and restore volume data with a dependable pattern
+> - Say why files written inside a container vanish once you delete that container
+> - Pick the right mount for a job: a named volume, a bind mount, or a tmpfs mount
+> - Create, list, inspect, and delete volumes with the `docker volume` commands
+> - Tell apart the **containerd image store** (the default on fresh Engine 29.x installs) and older **graph drivers** such as `overlay2`
+> - Copy volume data out for a backup and put it back again, using a pattern you can trust
 
 ---
 
 ## 07.1 The whiteboard and the filing cabinet
 
-Think of a container's writable layer as a **whiteboard in a rented meeting room**. You can scribble during the meeting; when the booking ends and the room resets, the board is wiped. Removing a container deletes its writable layer the same way.
+Think of a container's **writable layer** — the private scratch space where a running container's file changes land — as a whiteboard in a rented meeting room. You can scribble on it all through the meeting. When the booking ends and the room is reset, the board is wiped clean. Deleting a container wipes its writable layer in exactly the same way.
 
 ![Whiteboard and filing cabinet for ephemeral versus persistent data](assets/analogy-whiteboard-filing.png)
 
 *Figure 07.A: Whiteboards wipe clean; filing cabinets keep records after the meeting ends.*
 
-A **volume** is a filing cabinet that lives *outside* the meeting room. Wheel it in, store documents, wheel it out. Reset the room a hundred times — the cabinet survives.
+A **volume** is a filing cabinet that lives *outside* the meeting room. Wheel it in, store your documents, wheel it back out. Reset the room a hundred times and the cabinet is still full.
 
-Containers are disposable on purpose. You want to delete and recreate freely for upgrades and fixes. Data that must outlive any single container therefore needs a mount Docker's lifecycle cannot erase. Choosing the right mount — and understanding what still lives under the image store — is the skill of this chapter.
+Containers are meant to be thrown away. You want to delete and recreate them freely for upgrades and fixes. So any data that must outlive a single container needs a home that Docker's cleanup cannot reach. Picking the right home — and knowing what still lives inside the image store — is the skill of this chapter.
 
 ---
 
@@ -30,13 +30,17 @@ Containers are disposable on purpose. You want to delete and recreate freely for
 
 ### In plain terms
 
-If you write a file inside a container and then `docker rm` that container, the file is gone. A *stopped* container keeps its writable layer; a *removed* container does not.
+Write a file inside a container, run `docker rm` on that container, and the file is gone for good.
 
-The distinction that trips people up is **stopped versus removed**. A stopped container is a parked car — the luggage in the trunk is still there when you start it again. A removed container is a car sent to the crusher — trunk and all. Because the whole point of containers is that you delete and recreate them freely (for upgrades, config changes, image bumps), any data living only in that writable layer is on borrowed time. It will survive your `stop`/`start` testing and then vanish the first time a deploy does `docker rm` and `docker run` with a new image.
+This matters because deleting and recreating containers is normal, everyday work. You do it for upgrades, config changes, and new image versions. So any data that lives only in the writable layer is on borrowed time. It will survive all your `stop` and `start` testing, then disappear the first time a deploy runs `docker rm` and starts a fresh container from a newer image.
 
-> ⚠️ **Common Pitfall:** You might conclude "my data persisted, so the container filesystem is fine" after a `docker restart`. Restart keeps the same container and its writable layer, so the test passes — and gives false confidence. The data loss only shows up on *removal*, which is exactly what your upgrade pipeline does.
+The detail that trips people up is **stopped versus removed**. A stopped container keeps its writable layer. A removed container does not. A stopped container is a parked car: the luggage in the trunk is still there when you start it again. A removed container is a car sent to the crusher, trunk and all.
+
+> ⚠️ **Common Pitfall:** After a `docker restart` you might conclude "my data survived, so the container filesystem is fine." Restart keeps the same container and the same writable layer, so the test passes and gives you false confidence. The data loss only shows up on *removal* — which is exactly what your upgrade pipeline does.
 
 ### Under the hood
+
+Here is what actually happens on the machine, in four commands:
 
 ```bash
 $ docker run -it --name scratch alpine:3.20 sh
@@ -67,11 +71,11 @@ flowchart LR
 
 ### In production
 
-Treat the container filesystem as ephemeral scratch. Persist deliberately with volumes (or bind mounts in carefully controlled cases). Databases that write only to the writable layer are a production incident waiting to happen.
+Treat the container filesystem as throwaway scratch space. Keep data on purpose, using volumes (or bind mounts in carefully controlled cases). A database that writes only to the writable layer is a production incident waiting to happen.
 
-**Who owns this:** the app team owns the decision of *what* must persist; the platform team owns *where* it persists (which volume, which backing storage, which backup job). The incident that crosses both is a stateful service — a database, an upload directory, a queue — that was never given a volume, ran fine for weeks, and lost everything the day an unrelated image bump triggered a recreate.
+**Who owns this:** the app team decides *what* must be kept. The platform team decides *where* it is kept — which volume, which backing storage, which backup job. The incident that crosses both is a stateful service — a database, an upload directory, a queue — that was never given a volume, ran fine for weeks, and lost everything the day an unrelated image bump recreated the container.
 
-**Failure mode and detection:** you rarely get a warning; the container is healthy right up to removal. Catch it in review, not in prod: audit that every stateful service declares a `-v`/`--mount`, and treat "database with no volume" as a blocking finding. **Do** map every path a service writes real data to onto a named volume; **don't** trust `docker restart` survival as evidence of persistence.
+**Failure mode and detection:** you rarely get a warning, because the container looks healthy right up to the moment it is removed. Catch this in review, not in production. Check that every stateful service declares a `-v` or `--mount`, and treat "database with no volume" as a blocking finding. **Do** map every path where a service writes real data onto a named volume; **don't** treat surviving a `docker restart` as proof that data is safe.
 
 **Before you leave this section**
 
@@ -85,13 +89,17 @@ Treat the container filesystem as ephemeral scratch. Persist deliberately with v
 
 ### In plain terms
 
-A **named volume** is Docker-managed storage you refer to by name. You do not care where it lives on disk; Docker places it under its data root and keeps it when containers come and go.
+A **named volume** is storage that Docker creates and manages for you, which you refer to by a plain name such as `app-data`.
 
-The value of "you do not care where it lives" is portability and safety. You reference `app-data` by a stable name; Docker handles the on-disk path, permissions plumbing, and lifecycle. The volume has an independent life from any container — you can stop the database, delete its container, start a new container on a newer Postgres image, point it at the same `app-data`, and your rows are still there. That decoupling is precisely what the writable layer could not give you.
+You should care because it splits the life of your data away from the life of any container. You never need to know where the files sit on disk. Docker keeps them under its own data root and handles the path, the permissions plumbing, and the cleanup rules. That means you can stop the database, delete its container, start a new container on a newer Postgres image, point it at the same `app-data`, and every row is still there. This split is exactly what the writable layer could not give you.
 
-> ⚠️ **Common Pitfall:** You might think "volume" and "the writable layer" are two names for the same thing. They are not: the writable layer is copy-on-write scratch tied to one container's lifecycle, while a named volume is a separate, Docker-managed store that outlives containers and takes a faster, direct I/O path (Section 07.7). Confusing them is why people put databases in the wrong place.
+Picture the filing cabinet from the opening story. The label on the drawer is all you need. You never have to ask which warehouse shelf the cabinet is parked on.
+
+> ⚠️ **Common Pitfall:** You might think "volume" and "writable layer" are two names for one thing. They are not. The writable layer is copy-on-write scratch space tied to one container's life, and it dies with that container. A named volume is a separate store that Docker manages, outlives containers, and reads and writes over a faster, direct path (Section 07.7). Mixing up the two is why people put databases in the wrong place.
 
 ### Under the hood
+
+Here is what actually happens on the machine — create the volume, then hand it to a container:
 
 ```bash
 $ docker volume create app-data
@@ -140,11 +148,11 @@ If you mount the same named volume into a second container, both see the same fi
 
 ### In production
 
-Name every volume that holds real data. Prefer named volumes for databases and application state. Avoid anonymous volumes from bare `VOLUME` instructions when you care about finding and backing up the data later — they are easy to lose track of, and `docker rm -v` deletes them with the container.
+Give every volume that holds real data a name. Use named volumes for databases and application state. Stay away from anonymous volumes created by a bare `VOLUME` instruction when you will need to find and back up that data later. They are easy to lose track of, and `docker rm -v` deletes them along with the container.
 
-**Who owns this:** the app team owns naming and knowing which volume holds which dataset; the platform team owns where the Docker data root lives, its disk capacity, and whether it is backed up. The recurring failure is the **anonymous volume**: a bare `VOLUME /data` in an image or a `-v /data` with no name creates a random-hashed volume that nobody can identify later, so it is neither backed up nor cleaned up — it just accumulates until disk fills.
+**Who owns this:** the app team owns the names and knows which volume holds which dataset. The platform team owns where the Docker data root lives, how much disk it has, and whether it is backed up. The failure that keeps recurring is the **anonymous volume** — a volume with no name, created by a bare `VOLUME /data` in an image or a `-v /data` with no source. Docker gives it a random hex name that nobody can match to an app later, so it is never backed up and never cleaned up. It just piles up until the disk fills.
 
-**Failure mode and detection:** run `docker volume ls` and look for a growing list of hex-named volumes with no owner; those are anonymous volumes leaking disk. Detect capacity pressure by monitoring the filesystem under the Docker data root. **Do** give every real dataset an explicit name and label (`--label app=tasks`); **don't** rely on anonymous volumes for anything you would miss.
+**Failure mode and detection:** run `docker volume ls` and look for a growing list of hex-named volumes that no one claims. Those are anonymous volumes eating disk. Watch for capacity trouble by monitoring the filesystem under the Docker data root. **Do** give every real dataset a name and a label (`--label app=tasks`); **don't** keep anything you would miss in an anonymous volume.
 
 **Before you leave this section**
 

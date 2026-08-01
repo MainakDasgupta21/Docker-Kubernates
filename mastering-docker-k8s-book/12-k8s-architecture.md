@@ -4,30 +4,32 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Draw the two halves of a cluster — control plane and nodes — and name what runs in each
-> - Explain the roles of the API server, etcd, scheduler, controller manager, and cloud controller manager
-> - Describe how the kubelet, the container runtime (through the CRI), and kube-proxy turn objects into running processes
-> - Explain how nodes prove they are alive using Leases, and where leader-election Leases live
-> - Trace a `kubectl apply` from your terminal to a running container, naming every component it touches
-> - Use namespaces, labels, and selectors deliberately, including the four namespaces every cluster ships with
-> - Explain owner references and how garbage collection cleans up dependent objects
-> - Discover which API groups and versions your own cluster serves
+> - Draw the two halves of a cluster — control plane and nodes — and say what runs in each
+> - Say what the API server, etcd, scheduler, controller manager, and cloud controller manager each do
+> - Explain how the kubelet, the container runtime (through the CRI), and kube-proxy turn your files into running programs
+> - Explain how a node proves it is still alive with a Lease, and where leader-election Leases live
+> - Follow one `kubectl apply` from your terminal to a running container, naming each part it touches
+> - Use namespaces, labels, and selectors on purpose, including the four namespaces every cluster starts with
+> - Explain owner references, and how deleting a parent cleans up its children
+> - Find out which API groups and versions your own cluster offers
 
 ---
 
 ## 12.1 The control tower
 
-An airport does not run on heroics. It runs on a control tower, a single radio frequency, and a written record of every flight.
+An airport does not run on brave individuals. It runs on a control tower, one shared radio frequency, and a written record of every flight.
 
-Pilots do not negotiate with each other about runways. They talk to one authority. That authority keeps the definitive record — which aircraft exists, where it is going, which gate it was assigned — and every specialist (ground crew, de-icing, baggage) reads that record and does one narrow job well. Nobody phones anybody. If the de-icing crew goes on break, planes still land; the work simply waits in the record until someone picks it up.
+Pilots do not argue with each other about runways. They all talk to one authority. That authority keeps the official record: which aircraft exists, where it is going, which gate it got. Every specialist — ground crew, de-icing, baggage — reads that record and does one narrow job well.
 
-Kubernetes is built the same way, and the payoff is the same: components can restart, lag, or be replaced without the airport closing.
+Nobody phones anybody. If the de-icing crew takes a break, planes still land. The work just sits in the record until someone picks it up.
+
+Kubernetes is built the same way, and it gets the same payoff. Parts can restart, fall behind, or be swapped out, and the airport stays open.
 
 - The **radio frequency** is the API server. It is the *only* way in.
 - The **written record** is etcd. It is the *only* source of truth.
-- The **specialists** are the scheduler, the controllers, and the kubelet on every machine. Each watches the record and does one job.
+- The **specialists** are the scheduler, the controllers, and the kubelet on every machine. Each one watches the record and does one job.
 
-Chapter 11 gave you the mental model (declare state, controllers converge). This chapter opens the machine and shows you the parts, because from here on, every debugging session is a question of *which component is unhappy*.
+Chapter 11 gave you the idea: you declare state, and controllers make it real. This chapter opens the machine and shows you the parts. From here on, most debugging boils down to one question: *which part is unhappy?*
 
 ```mermaid
 flowchart LR
@@ -64,14 +66,20 @@ flowchart LR
 
 ### In plain terms
 
-Every Kubernetes cluster splits into two kinds of machine roles:
+A **cluster** is a group of machines managed as one pool. Every machine in it plays one of two roles.
 
-- The **control plane** decides. It accepts your wishes, stores them, and figures out what must happen.
-- The **nodes** (the data plane) do. They run your containers and report back.
+- The **control plane** decides. It takes your requests, stores them, and works out what must happen.
+- The **nodes** do the work. They run your containers and report back. Together the nodes are also called the **data plane**.
 
-A node can be a cloud VM, a bare-metal server, or — in kind — a Docker container. Small clusters sometimes run control plane and workloads on the same machines; production clusters usually keep the control plane separate so a runaway workload cannot starve the brain of the cluster.
+Why split them? Because deciding and doing have very different needs. Deciding must stay available and consistent even when machines die. Doing needs CPU and memory, and it is where your risky code runs. Keeping them apart means a badly behaved app cannot starve the part of the cluster that thinks.
+
+A **node** is one machine in the pool. It can be a cloud VM, a physical server, or — in kind — a Docker container. Small clusters sometimes run the control plane and your workloads on the same machines. Production clusters usually keep the control plane on separate machines.
+
+> 💡 **In one line:** The control plane decides what should run; nodes are the machines that actually run it.
 
 ### Under the hood
+
+Here is what actually sits on each machine.
 
 ```mermaid
 flowchart TB
@@ -110,10 +118,10 @@ flowchart TB
 
 *Figure 12.2: Everything goes through the API server; nodes initiate contact and run Pods under the kubelet.*
 
-Two rules explain nearly all cluster behavior:
+Two rules explain almost everything a cluster does:
 
-1. **Everything goes through the API server.** The scheduler does not call the kubelet. Controllers do not call each other. They read and write objects; the API server is the hub, and the components are spokes.
-2. **Communication is node-to-control-plane initiated.** Kubelets dial out to the API server, not the reverse. That is why nodes behind NAT work fine, and why the API server needs credentials to reach a kubelet (for `kubectl logs` and `exec`, which are the exceptions).
+1. **Everything goes through the API server.** The scheduler does not call the kubelet. Controllers do not call each other. They read and write objects instead. The API server is the hub; every component is a spoke.
+2. **Nodes start the conversation.** Kubelets call out to the API server, never the other way around. That is why nodes behind NAT work fine. It is also why the API server needs its own credentials to reach a kubelet, which it does for `kubectl logs` and `kubectl exec` — the two exceptions.
 
 On your kind cluster you can see both halves:
 
@@ -146,10 +154,10 @@ kube-scheduler-mastering-k8s-control-plane            mastering-k8s-control-plan
 
 ### In production
 
-- **Run three (or five) control plane replicas.** etcd needs an odd number for quorum; two replicas are *worse* than one, because a single failure loses quorum.
-- **Isolate the control plane.** Managed services (EKS, GKE, AKS) do this for you and you never see those Pods. Self-managed clusters should taint control plane nodes so ordinary workloads land elsewhere.
-- **Back up etcd, and test restores.** Everything else can be rebuilt from manifests; etcd is the only thing that cannot (Chapter 24).
-- **Watch the control plane like an application.** API server request latency and error rate, etcd fsync duration, and scheduler queue depth are the four signals that tell you the brain is struggling before users notice.
+- **Run three (or five) control plane replicas.** etcd needs an odd number to reach **quorum**, meaning a majority that agrees on each write. Two replicas are *worse* than one, because losing either one loses the majority.
+- **Keep the control plane separate.** Managed services (EKS, GKE, AKS) do this for you, and you never see those Pods. On self-managed clusters, taint the control plane nodes so normal workloads land elsewhere.
+- **Back up etcd, and test the restore.** You can rebuild everything else from manifests. etcd is the one thing you cannot (Chapter 24).
+- **Watch the control plane like an application.** Four signals tell you the brain is struggling before users notice: API server request latency, API server error rate, etcd fsync duration, and scheduler queue depth.
 
 > 💡 **Tip:** In kind, the control plane components run as **static Pods** on the control plane node — Pods defined by files on disk rather than by API objects. That is why they appear in `kubectl get pods -n kube-system` but have no controller managing them. Chapter 13 covers static Pods in detail.
 
@@ -167,11 +175,13 @@ kube-scheduler-mastering-k8s-control-plane            mastering-k8s-control-plan
 
 ### In plain terms
 
-`kube-apiserver` is a REST API in front of the cluster's database. Every actor — you, `kubectl`, controllers, kubelets, dashboards, CI pipelines — speaks HTTP to it. If it is down, nothing new can be created or changed. Existing containers keep running, which surprises people pleasantly during outages, but the cluster stops adapting.
+The **API server** (`kube-apiserver`) is a web service that sits in front of the cluster's database. Everything talks HTTP to it: you, `kubectl`, controllers, kubelets, dashboards, and CI pipelines. Nothing reaches the database any other way.
+
+Why does that matter to you? Because one door means one place for checks. Login, permissions, policy, validation, and the audit log all happen there, once. It also tells you what to expect during an outage. If the API server is down, nothing new can be created or changed. Containers that are already running keep serving traffic. What stops is *change*, not service.
 
 ### Under the hood
 
-Every request walks the same pipeline:
+Here is the path every single request takes:
 
 ```mermaid
 flowchart TD
@@ -187,10 +197,10 @@ flowchart TD
 
 Two features you will rely on constantly:
 
-- **Watches.** Clients open a long-lived connection and receive a stream of changes. This is how controllers and kubelets learn about work without polling, and how `kubectl get pods -w` works.
-- **Resource versions.** Every object carries `metadata.resourceVersion`. Updates are optimistically concurrent: if two writers race, the loser gets `409 Conflict` and retries. No locks, no corruption.
+- **Watches.** A client opens one long-lived connection and receives changes as they happen. This is how controllers and kubelets hear about work without asking over and over, and it is what `kubectl get pods -w` uses.
+- **Resource versions.** Every object carries `metadata.resourceVersion`. If two writers change the same object at once, the second one gets `409 Conflict` and tries again. No locks are needed, and nothing gets corrupted.
 
-You can talk to the API directly, which is a great way to demystify it:
+You can call the API directly, which takes the mystery out of it fast:
 
 ```bash
 $ kubectl get --raw='/readyz?verbose' | head -n 6
@@ -213,14 +223,14 @@ $ kubectl get pod task-api -v=6 2>&1 | grep GET
 GET https://127.0.0.1:60093/api/v1/namespaces/default/pods/task-api 200 OK in 12 milliseconds
 ```
 
-`kubectl` is a thin, friendly HTTP client. Raising `-v` shows you the URLs, which makes API paths concrete: `/api/v1/...` for core resources, `/apis/<group>/<version>/...` for everything else.
+`kubectl` is just a friendly HTTP client. Raising `-v` prints the URLs it calls, which makes the API paths real: `/api/v1/...` for core resources, `/apis/<group>/<version>/...` for everything else.
 
 ### In production
 
-- **Admission is where platform policy lives.** Kubernetes 1.36 ships both **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** as GA CEL-based, in-process alternatives to webhooks — no extra server to keep highly available. Prefer them over custom webhooks when CEL is expressive enough.
-- **Protect the API server from stampedes.** API Priority and Fairness classifies requests into flows so one runaway controller cannot starve kubelets. Watch for `apiserver_flowcontrol_rejected_requests_total` before your users find it.
-- **Audit everything.** The audit log is the only record of who did what. Enable it, ship it off-cluster, and keep it longer than your incident timeline.
-- **Expect the API server to be a bottleneck at scale.** Huge Secrets and ConfigMaps, chatty controllers, and unbounded `list` calls (rather than watches) are the usual culprits.
+- **Admission is where platform rules live.** Kubernetes 1.36 ships **ValidatingAdmissionPolicy** and **MutatingAdmissionPolicy** as GA. Both run rules written in CEL inside the API server itself, so there is no extra webhook server for you to keep alive. Use them instead of custom webhooks whenever CEL can express the rule.
+- **Protect the API server from floods.** API Priority and Fairness sorts requests into separate flows, so one runaway controller cannot crowd out kubelets. Watch `apiserver_flowcontrol_rejected_requests_total` so you see rejections before your users do.
+- **Turn on the audit log.** It is the only record of who did what. Ship it off the cluster, and keep it longer than your incident review takes.
+- **At scale, the API server becomes the bottleneck.** The usual causes are huge Secrets and ConfigMaps, controllers that talk too much, and code that calls `list` on everything instead of using a watch.
 
 > ⚠️ **Warning:** A component being unable to reach the API server is not the same as your app being down. During a control plane outage, running Pods keep serving traffic; what stops is *change* — no rollouts, no rescheduling, no scaling. Knowing this distinction keeps incident response calm.
 
@@ -238,14 +248,18 @@ GET https://127.0.0.1:60093/api/v1/namespaces/default/pods/task-api 200 OK in 12
 
 ### In plain terms
 
-**etcd** is a distributed key-value store with strong consistency. It holds every object in your cluster — the flight record from §12.1. It is small, boring, and the single most precious thing you operate. Lose etcd without a backup and you have lost the cluster's memory, even if every container is still running.
+**etcd** is the database Kubernetes stores everything in. It is a **key-value store**, meaning it saves values under path-like keys, and it is **strongly consistent**, meaning every reader sees the same latest write. It holds every object in your cluster — the flight record from §12.1.
+
+Here is why you should care. etcd is small, boring, and the most precious thing you operate. Lose it without a backup and you have lost the cluster's memory, even if every container is still running happily. That is why backups and restore drills belong to whoever owns the cluster.
 
 ### Under the hood
 
-- etcd uses the **Raft** consensus algorithm: one leader, N followers, writes acknowledged by a majority. A three-member cluster tolerates one failure; five tolerates two.
-- Only the API server talks to etcd. No other component has (or should have) credentials.
-- Keys look like paths: `/registry/pods/default/task-api`. Values are serialized objects, by default in Protobuf.
-- **Compaction and defragmentation** matter: etcd keeps a revision history, and without periodic compaction the database grows until it hits its quota (commonly 2 GiB) and goes read-only.
+Here is how etcd stays correct when machines fail:
+
+- etcd uses the **Raft** consensus algorithm: one leader, N followers, and every write confirmed by a majority. A three-member cluster survives one failure; five survives two.
+- Only the API server talks to etcd. No other component has credentials for it, and none should.
+- Keys look like file paths: `/registry/pods/default/task-api`. Values are encoded objects, by default in Protobuf.
+- **Compaction and defragmentation** matter. etcd keeps a history of every revision. Without regular compaction the database grows until it hits its quota (commonly 2 GiB), and then it goes read-only.
 
 ```bash
 $ kubectl get --raw='/metrics' | grep -m3 '^etcd_request_duration_seconds_count'
@@ -259,10 +273,10 @@ etcd_request_duration_seconds_count{operation="list",type="*core.Pod"} 96
 
 ### In production
 
-- **etcd is latency-sensitive, not throughput-sensitive.** It wants fast fsync. Put it on SSD/NVMe and never on network storage with variable latency. Disk latency spikes show up as cluster-wide slowness.
-- **Back up on a schedule** (`etcdctl snapshot save`) and *practice restoring*. An untested backup is a rumor.
-- **Encrypt at rest.** Secrets are only base64-encoded inside etcd unless you configure encryption providers — ideally KMS-backed (Chapter 17).
-- **Keep objects small and few.** Events, giant ConfigMaps, and one-object-per-request patterns are what turn a healthy etcd into an incident.
+- **etcd cares about fast disk writes, not big ones.** It needs quick fsync. Put it on SSD or NVMe, never on network storage with unpredictable latency. A disk latency spike shows up as the whole cluster feeling slow.
+- **Back up on a schedule** with `etcdctl snapshot save`, and *practice the restore*. A backup you have never restored is a rumor.
+- **Encrypt data at rest.** Inside etcd, Secrets are only base64-encoded until you configure an encryption provider — ideally one backed by a KMS (Chapter 17).
+- **Keep objects small and few.** Floods of Events, giant ConfigMaps, and code that writes one object per request are what turn a healthy etcd into an incident.
 
 > 📘 **Deep Dive (optional):** Managed Kubernetes hides etcd entirely, and some distributions replace it — k3s can use SQLite or an external SQL database. The abstraction holds because only the API server ever touches the store, which is a nice demonstration of why the hub-and-spoke design pays off.
 
@@ -278,16 +292,18 @@ etcd_request_duration_seconds_count{operation="list",type="*core.Pod"} 96
 
 ### In plain terms
 
-The **kube-scheduler** answers one question: *which node should this new Pod run on?* It does not start containers; it writes one field — `spec.nodeName` — and the kubelet on that node takes it from there. A Pod with no node assigned sits in `Pending`.
+The **scheduler** (`kube-scheduler`) answers exactly one question: *which node should this new Pod run on?* It never starts a container. It writes one field, `spec.nodeName`, and the kubelet on that node does the rest. Until a node is chosen, the Pod sits in `Pending`.
 
-Think of it as the gate assignment desk: it knows every gate's size and current occupancy, the aircraft's requirements, and the airline's preferences, then makes a booking.
+You care because this is where "why is my Pod not starting?" usually begins. A Pod stuck in `Pending` almost always means the scheduler could not find a node that fits, and it will tell you exactly why.
+
+Think of it as the gate assignment desk at the airport. It knows the size of every gate, which gates are taken, what the aircraft needs, and what the airline prefers. Then it books one gate.
 
 ### Under the hood
 
-Scheduling runs in two phases:
+Here is how the choice is actually made. Scheduling runs in two phases:
 
-1. **Filtering** — eliminate nodes that *cannot* work: not enough allocatable CPU or memory for the Pod's **requests**, missing node labels required by `nodeSelector` or affinity, unmatched taints, no free host port, volume topology mismatch.
-2. **Scoring** — rank the survivors: spread across nodes and zones, prefer nodes that already have the image, honor affinity preferences and topology spread constraints. Highest score wins; ties are broken randomly.
+1. **Filtering** — throw out nodes that *cannot* work. Reasons include: not enough free CPU or memory for the Pod's **requests**, missing node labels required by `nodeSelector` or affinity, taints the Pod does not tolerate, a host port already in use, or a volume that lives in the wrong zone.
+2. **Scoring** — rank the nodes that survived. Scoring spreads Pods across nodes and zones, prefers nodes that already have the image, and honors affinity preferences and topology spread constraints. The highest score wins, and ties are broken at random.
 
 ```bash
 $ kubectl get pod task-api -o jsonpath='{.spec.nodeName}{"\n"}'
@@ -309,16 +325,16 @@ Events:
              preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod.
 ```
 
-That message is the scheduler telling you exactly which filter rejected each node. It is one of the most useful strings in Kubernetes.
+That message names the exact filter that rejected each node. It is one of the most useful lines of text in all of Kubernetes.
 
 > 💡 **Tip:** The scheduler compares **requests**, not actual usage. A node running at 5% CPU can still be "full" if the Pods on it requested everything. Conversely, a node with no requests left can be idle. This is the number one source of "why is my Pod Pending on an empty cluster?"
 
 ### In production
 
-- **Set requests on everything.** They are the scheduler's only input for capacity.
-- **Use topology spread constraints** to survive zone failures instead of hoping default scoring spreads replicas well (Chapter 20).
-- **Understand preemption.** Higher-priority Pods can evict lower-priority ones. Use PriorityClasses deliberately, and give platform components higher priority than batch jobs.
-- **Watch `Pending` as an SLO.** A rising count of unschedulable Pods is your earliest signal that the cluster needs to grow — it is the trigger most cluster autoscalers use.
+- **Set requests on every container.** They are the only capacity numbers the scheduler can see.
+- **Use topology spread constraints** so you survive a zone failure. Do not hope that default scoring spreads replicas well (Chapter 20).
+- **Know how preemption works.** A higher-priority Pod can evict a lower-priority one to make room. Assign PriorityClasses on purpose, and rank platform components above batch jobs.
+- **Track `Pending` Pods as a signal you act on.** A rising count of Pods that cannot be scheduled is the earliest sign the cluster needs more nodes, and it is the trigger most cluster autoscalers use.
 
 > ⚠️ **Common Pitfall:** Reading live CPU usage to explain Pending Pods. The scheduler compares **requests** to allocatable—not `kubectl top`.
 

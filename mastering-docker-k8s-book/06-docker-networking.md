@@ -380,11 +380,11 @@ $ docker run -d --name api --link db:database my-api:1.0
 
 ### In production
 
-Segment by trust boundary: put databases on a backend network, frontends on a frontend network, and attach the API to both. Publish only the ports that must leave the host. Compose (Chapter 08) makes this pattern the default.
+Split your networks along trust boundaries. Put databases on a backend network, frontends on a frontend network, and attach the API to both. Publish only the ports that truly must leave the host. Compose (Chapter 08) makes this pattern the default.
 
-**Who owns this:** the app team owns the network segmentation because it encodes the application's trust model — which components are allowed to talk to the datastore at all. A flat single network where everything can reach everything is the networking equivalent of running every process as root: convenient until one compromised frontend can open a socket straight to the database.
+**Who owns this:** the app team owns how the networks are split, because that split writes down the application's trust model — which parts are allowed to talk to the datastore at all. One flat network where everything reaches everything is the networking version of running every process as root. It is convenient until one hacked frontend can open a connection straight to the database.
 
-**Failure mode and detection:** the quiet failure is *over-connection* — a service that works fine but is reachable by more peers than it should be, widening blast radius without ever throwing an error. Audit with `docker network inspect <net>` to list attached containers, and treat any datastore attached to a frontend-facing network as a finding. **Do** keep databases on a backend-only network and bridge just the API across zones; **don't** attach everything to one network for convenience.
+**Failure mode and detection:** the quiet failure is a service that works fine but can be reached by more peers than it should be. Nothing ever throws an error; the blast radius just grows. List the attached containers with `docker network inspect <net>`, and treat any datastore sitting on a frontend-facing network as a finding you must fix. **Do** keep databases on a backend-only network and let just the API span both zones; **don't** attach everything to one network for convenience.
 
 **Before you leave this section**
 
@@ -398,11 +398,15 @@ Segment by trust boundary: put databases on a backend network, frontends on a fr
 
 ### In plain terms
 
-Bridge-network containers can talk to peers, but your laptop browser cannot reach them until you **publish** a port — the front desk forwarding an outside call to apartment 4B.
+To **publish** a port means telling Docker to forward one port on the host to one port inside a container.
 
-Publishing is where the *isolation* you have been building meets the *exposure* you actually need. A container is unreachable from outside by design; publishing punches a deliberate hole through the host's firewall to forward one host port to one container port. That is exactly what you want for the one API a service should expose — and exactly what you do *not* want for the database, the admin UI, or the metrics endpoint sitting behind it. Every published port is a door you are choosing to leave unlocked to whatever can reach the host's address.
+You need this because a container on a bridge network can talk to its peers, but your laptop's browser cannot reach it at all. That silence is by design. Publishing opens one deliberate door so outside traffic can arrive. It is exactly what you want for the single API a service should offer. It is exactly what you do *not* want for the database, the admin UI, or the metrics endpoint sitting behind that API.
 
-> ⚠️ **Common Pitfall:** You might read `-p 8080:80` and think the numbers are interchangeable or that the container port comes first. The order is always **`HOST:CONTAINER`**. Reversing it (`-p 80:8080`) silently "works" — it just opens the wrong host port and forwards to a container port nothing is listening on, so you get connection-refused and blame the app.
+Back to the apartment building: publishing is the front desk agreeing to forward an outside call to apartment 4B. Every published port is a door you chose to leave unlocked to anything that can reach the host's address. Keep the list of doors short and deliberate.
+
+> 💡 **In one line:** `-p HOST:CONTAINER` opens a real door on the host and forwards it into the container. Without it, the container is reachable only from its own network — and `EXPOSE` in a Dockerfile opens nothing at all.
+
+> ⚠️ **Common Pitfall:** You might read `-p 8080:80` and think the two numbers are interchangeable, or that the container port comes first. The order is always **`HOST:CONTAINER`**. Reverse it (`-p 80:8080`) and the command still "works" quietly. It just opens the wrong host port and forwards to a container port where nothing is listening, so you get connection-refused and blame the app.
 
 ### Under the hood
 
@@ -453,11 +457,11 @@ flowchart LR
 
 ### In production
 
-Bind management ports to `127.0.0.1` or protect them with a reverse proxy and firewall. Prefer explicit `-p` over `-P` for anything humans bookmark. On Docker Desktop, remember published ports land on the VM/host forwarding path — firewall and VPN clients can still block you.
+Bind management ports to `127.0.0.1`, or put a reverse proxy and a firewall in front of them. Use an explicit `-p` rather than `-P` for anything a human will bookmark. On Docker Desktop, remember that published ports travel through the VM's forwarding path — a firewall or VPN client can still block you.
 
-**Who owns this:** publishing a port is a shared decision between the app team (what needs to be reachable) and the platform/security team (what the host's firewall and network expose). The person who adds `-p` owns the consequence: a published port on an internet-facing host is an internet-facing service, full stop.
+**Who owns this:** publishing a port is a shared decision. The app team knows what needs to be reachable; the platform/security team knows what the host's firewall and network already expose. Whoever adds `-p` owns the result: a published port on an internet-facing host is an internet-facing service, full stop.
 
-**Failure mode and detection:** the classic incident is a "dev only" database or dashboard published with a bare `-p` on a public VM and discovered by internet-wide scanners within hours. Detect exposure from the host with `ss -ltnp` (what is listening) and from outside with an external port scan or your cloud provider's security-group view — never trust that a host firewall alone hides a Docker-published port. **Do** bind management and datastore ports to `127.0.0.1` and front real traffic with a reverse proxy; **don't** leave `0.0.0.0` publishes on anything with a public address.
+**Failure mode and detection:** the classic incident is a "dev only" database or dashboard published with a bare `-p` on a public VM, then found by internet-wide scanners within hours. Check what is listening on the host with `ss -ltnp`, and check from outside with an external port scan or your cloud provider's security-group view. Never trust a host firewall alone to hide a Docker-published port. **Do** bind management and datastore ports to `127.0.0.1` and put a reverse proxy in front of real traffic; **don't** leave `0.0.0.0` publishes on anything that has a public address.
 
 > 🏭 **Production floor:** A published port is the single largest blast-radius decision in single-host Docker. `-p 5432:5432` on a public host can expose a database to the whole internet and can sit *in front of* a host firewall you assumed was blocking it, because Docker writes its own packet-filter rules. Change-manage every new publish: justify it, bind to `127.0.0.1` unless external traffic is truly required, verify from outside the host with a real port scan, and prefer a reviewed reverse proxy over ad-hoc `-p` for anything internet-facing. When in doubt, publish nothing and reach the service over its user-defined network instead.
 
@@ -552,11 +556,13 @@ Overlay networks span hosts and rely on Swarm mode's control plane. A standalone
 
 ## 06.11 Key takeaways
 
-- Containers are network-isolated by default; publish only what you need.
-- Core drivers: `bridge`, `host`, `none`, `overlay` (Swarm), plus `macvlan` / `ipvlan` for underlay LAN attachment.
-- Always prefer **user-defined networks** for multi-container apps — DNS by name and clearer isolation.
-- Legacy `--link` is deprecated; user-defined networks replace it.
-- `-p HOST:CONTAINER` publishes explicitly; `-P` publishes all `EXPOSE`d ports randomly; `EXPOSE` alone publishes nothing.
+- Every container starts walled off. Open only the doors you need.
+- One IP address is not a service address. Container IPs change; names do not.
+- Create your own network for any multi-container app. You get name lookups and cleaner separation.
+- `bridge` = private and NATed. `host` = the host's own network, no isolation. `none` = unplugged. `overlay` = across many hosts, Swarm only. `macvlan`/`ipvlan` = straight onto the physical LAN.
+- The old `--link` flag is deprecated. A network you create replaces it.
+- `-p HOST:CONTAINER` in that order opens a host port. `-P` picks random host ports for every `EXPOSE`d port. `EXPOSE` on its own opens nothing.
+- A published port defaults to `0.0.0.0` — every host interface. Bind to `127.0.0.1` unless the world really needs in.
 
 ---
 

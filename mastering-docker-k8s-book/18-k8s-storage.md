@@ -620,13 +620,19 @@ What breaks if `readyToUse` never becomes true: restore PVCs stay Pending; check
 
 ### In plain terms
 
-**VolumeAttributesClass** lets you change mutable volume parameters (IOPS, throughput, and similar vendor knobs) after the volume exists—like upgrading the hotel mini-bar service tier without moving rooms. **Storage capacity** reporting helps the scheduler and operators know whether a class still has room to provision, instead of creating PVCs that sit Pending forever.
+A **VolumeAttributesClass** is a named set of performance settings you can apply to a volume that already exists. The settings are vendor knobs such as **IOPS** (input/output operations per second, roughly how many reads and writes a disk handles each second) and throughput (how many megabytes per second it moves). **Storage capacity** reporting is the separate feature that tells the cluster how much room a storage class still has in each zone.
 
-Performance and capacity are day-2 problems: a database that “worked in staging” can starve under production IOPS, and a zone that looks empty in the console can still refuse new PVCs if CSI capacity objects say otherwise. You might think bumping PVC size always buys more performance—size and IOPS are often independent knobs.
+Why do both exist? Because performance and space are day-two problems, and both bite after you go live. A database that felt fine in staging can crawl in production because the disk hit its IOPS ceiling. A zone that looks half empty in the cloud console can still refuse new PVCs, because the driver reports no capacity left for that class. Neither problem is visible in the manifest you wrote on day one.
+
+Back to the hotel. A VolumeAttributesClass is upgrading your mini-bar service tier without changing rooms. Storage capacity reporting is the front desk knowing how many rooms are actually free before it promises one.
+
+A note on a common assumption: making a PVC bigger does not automatically make it faster. On most cloud disks, size and IOPS are separate dials. Some products link them, many do not. Check before you resize and hope.
 
 > ⚠️ **Common Pitfall:** You might think empty CSIStorageCapacity means “the cloud is out of disks.” It means *this driver reports no remaining capacity for that class/topology*—check quotas, reserved pools, and driver bugs before opening a cloud ticket.
 
 ### Under the hood
+
+Here is a two-tier performance catalog a platform team might publish:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -677,9 +683,9 @@ With capacity-aware scheduling, the control plane can avoid placing Pods whose u
 
 ### In production
 
-**Ownership:** Platform owns VolumeAttributesClass catalog and CSIStorageCapacity monitoring; app teams request tier changes through change control with cost approval. Treat attribute classes like SLOs: document silver/gold cost and performance expectations.
+**Ownership:** The platform team owns the VolumeAttributesClass catalog and watches CSIStorageCapacity. App teams request a tier change through change control, with someone approving the extra cost. Treat each tier like a published promise: write down what silver and gold cost and what performance each one delivers.
 
-**Failure mode:** Low capacity → Pending PVCs and stuck rollouts; failed attribute modify → silent under-performance. Detect with CSIStorageCapacity alerts and PVC modify conditions. Mitigate with capacity headroom per zone and staged attribute changes.
+**Failure mode:** Low capacity leaves PVCs Pending and rollouts stuck. A failed attribute change is worse, because the volume quietly stays on the old tier while the ticket says it moved. Detect the first with alerts on CSIStorageCapacity, the second by reading the PVC modify conditions. Prevent both by keeping spare capacity in every zone and by changing attributes in stages instead of everywhere at once.
 
 | Do | Don't |
 |----|-------|
@@ -770,11 +776,14 @@ It provides a way to specify and mutate mutable volume parameters (such as IOPS/
 
 ## 18.11 Key takeaways
 
-- Ephemeral volumes serve caches and scratch; durable data needs PVs requested through PVCs.
-- StorageClasses plus CSI enable dynamic provisioning; access modes and reclaim policies must match the backend and your risk tolerance.
-- Prefer WaitForFirstConsumer for zonal block volumes; prefer StatefulSets with `volumeClaimTemplates` for databases.
-- VolumeSnapshot and VolumeGroupSnapshot (GA in 1.36) underpin backup and restore—verify driver support and practice restores.
-- VolumeAttributesClass and CSIStorageCapacity improve day-2 performance tuning and capacity-aware placement.
+- Scratch data belongs in ephemeral volumes. Data you cannot lose belongs in a PVC.
+- The PVC asks, the PV supplies, the StorageClass builds. Learn the three names in that order.
+- Reclaim policy decides whether deleting a claim also deletes the disk. Check it before you clean up.
+- `ReadWriteOnce` means one *node*, not one Pod. One RWO claim cannot feed many Deployment replicas.
+- Use `WaitForFirstConsumer` for zonal disks so the disk is created where the Pod lands.
+- Give each database replica its own disk with StatefulSet `volumeClaimTemplates`.
+- Snapshots are restore points, not backups you can trust until you have restored one.
+- VolumeAttributesClass tunes speed in place. CSIStorageCapacity tells you whether there is room left.
 
 ---
 

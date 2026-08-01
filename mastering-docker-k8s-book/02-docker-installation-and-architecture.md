@@ -4,43 +4,51 @@
 >
 > By the end of this chapter, you will be able to:
 >
-> - Install Docker on your platform and verify the engine responds
-> - Distinguish Docker Client, Docker Engine (`dockerd`), containerd, and runc
-> - Trace what happens when you run a simple container
-> - Read `docker version` and `docker info` with confidence
-> - Recognize Desktop versus Engine-on-Linux differences that affect beginners
+> - Install Docker on your computer and check that the engine answers
+> - Tell apart the Docker client, the engine (`dockerd`), containerd, and runc
+> - Follow what happens, step by step, when you run a simple container
+> - Read `docker version` and `docker info` and know what to look for
+> - Spot the differences between Docker Desktop and Engine on Linux
 
 ---
 
 ## 02.1 The Restaurant Kitchen
 
-Think of Docker as a restaurant. You (the **client**) place orders with a waiter. The **kitchen** (the **engine/daemon**) prepares dishes according to recipes (**images**) and serves plates (**containers**). Walk-in customers never flip burners themselves; they talk to the waiter API.
+Picture a restaurant. You sit at a table and give your order to a waiter. The waiter is the **client**—the `docker` command you type.
+
+The waiter carries the order to the kitchen. The kitchen is the **engine**, also called the **daemon**, a program that runs quietly in the background all day. The kitchen follows recipes (**images**) and sends out plates (**containers**).
+
+Customers never walk in and use the stove themselves. They ask the waiter. Docker works the same way.
 
 ![Restaurant kitchen stations representing Docker architecture roles](assets/analogy-restaurant-kitchen.png)
 
 *Figure 02.A: The Docker client is the waiter; the daemon is the kitchen that actually cooks.*
 
-If the kitchen is down, the waiter can still smile—but no food arrives. Beginners often install only a CLI-looking tool or forget to *start* Docker Desktop, then wonder why every command says the daemon is not running. This chapter gets the kitchen open and shows you the floor plan.
+If the kitchen is closed, the waiter still smiles and takes your order. No food ever arrives. That is exactly what a beginner sees when Docker Desktop was installed but never started: the `docker` command runs, and every request fails.
 
-Two outcomes matter by the end of the chapter. First, `docker version` must show a **Server** section on Engine **29.x** (or Desktop shipping that engine). Second, you should be able to narrate a failure as “daemon / pull / create / start / app exit” instead of “Docker is weird.” That vocabulary is the difference between flailing and debugging.
+This chapter opens the kitchen and shows you the floor plan.
 
-> ⚠️ **Common Pitfall:** You might think reinstalling Desktop is the first fix for every error. Check whether the daemon is running, which context is active, and whether the failure is a pull or an app exit—reinstall is a last resort, not step one.
+Two things should be true when you finish. First, `docker version` shows a **Server** section running Engine **29.x**, or a Desktop version that ships that engine. Second, you can describe a failure precisely: daemon down, pull failed, create failed, start failed, or the app exited. Naming the step is the difference between guessing and debugging.
+
+> ⚠️ **Common Pitfall:** You might think reinstalling Desktop is the first fix for every error. Instead, check three things: is the daemon running, which context is active, and did the image fail to download or did the app itself exit? Reinstalling is a last resort, not step one.
 
 ---
 ## 02.2 Installation Paths
 
 ### In plain terms
 
-You have two common beginner paths: **Docker Desktop** (Windows, macOS, and many Linux learners) and **Docker Engine** installed directly on Linux servers. Both give you a `docker` CLI talking to a Linux container engine. Desktop wraps that engine in a managed VM and adds a GUI; Engine-on-Linux is leaner for servers.
+There are two normal ways to get Docker: **Docker Desktop**, an app with a graphical window, and **Docker Engine**, the plain background service you install on a Linux machine.
 
-The problem this chapter solves is not “which brand logo looks nicer”—it is getting a reachable Linux engine so every later command has somewhere to land. Beginners often install a CLI-looking tool, forget to start Desktop, or mix an ancient distro package with modern Compose docs, then spend a day chasing ghosts.
+Why does the choice matter? Both give you the same `docker` command talking to the same kind of Linux engine, so your commands work either way. The difference is what surrounds it. Desktop wraps the engine in a virtual machine it manages for you and adds a window with settings. Engine on Linux is leaner and is what real servers run.
+
+The goal here is not picking a nicer logo. The goal is a Linux engine your commands can actually reach. Beginners often install something that merely looks like a CLI, or forget to start Desktop, or mix an outdated package from their Linux distribution with modern documentation. Then they lose a day chasing a problem that was never in their code.
 
 | Path | Best for | Notes |
 |------|----------|-------|
 | **Docker Desktop** | Windows, macOS, and many Linux learners | GUI, optional Kubernetes, manages a Linux VM/engine for you |
 | **Docker Engine** on Linux | Servers and Linux workstations | Install engine packages directly; no Desktop required |
 
-This book’s commands assume a working Linux container engine reachable as `docker`. On Desktop, that is automatic once Docker is running.
+Every command in this book assumes a working Linux container engine that you can reach by typing `docker`. On Desktop you get that automatically, as soon as Docker is actually running.
 
 ```mermaid
 flowchart TD
@@ -53,9 +61,11 @@ flowchart TD
 
 *Figure 02.1: Beginners usually pick Desktop on Windows/macOS or Engine on Linux — both end at the same verify step.*
 
-> ⚠️ **Common Pitfall:** You might think “I installed Docker” means the engine is running. Installation and *running* are different. Until `docker version` shows a **Server** section, you only have a client (or a stopped Desktop).
+> ⚠️ **Common Pitfall:** You might think “I installed Docker” is the same as “Docker is running.” It is not. Until `docker version` prints a **Server** section, you have only a client—or a Desktop app that is installed but stopped.
 
 ### Under the hood
+
+Here are the exact steps for each platform.
 
 #### Windows (Docker Desktop)
 
@@ -91,23 +101,23 @@ To run without `sudo`, add your user to the `docker` group, then log out and bac
 $ sudo usermod -aG docker $USER
 ```
 
-> ⚠️ **Warning:** Membership in the `docker` group is effectively root-equivalent on the host. Use it on personal lab machines thoughtfully.
+> ⚠️ **Warning:** Being in the `docker` group gives a user the same power as root on that host. Grant it deliberately, even on a personal lab machine.
 
-Always prefer the install guides on [docs.docker.com](https://docs.docker.com/engine/install/) for package names and repository setup—they change more often than conceptual architecture.
+Always use the install guides on [docs.docker.com](https://docs.docker.com/engine/install/) for package names and repository setup. Those details change far more often than the architecture ideas in this chapter.
 
-**What breaks if virtualization is disabled or WSL 2 is unhealthy:** Desktop never reaches Running; `docker version` shows Client only or connection errors. Fix the VM/WSL backend before debugging Dockerfiles.
+**What breaks if virtualization is turned off, or WSL 2 is unhealthy:** Desktop never reaches Running. `docker version` shows only the Client section, or fails to connect. Fix the VM or WSL backend first; nothing about your Dockerfile is the problem yet.
 
 ### In production
 
-**Ownership:** platform/SRE owns Engine versions on servers and golden Desktop recommendations for laptops; developers own verifying their local client can reach that baseline.
+**Ownership:** the platform or SRE team owns which Engine version runs on servers and which Desktop version laptops should use. Developers own checking that their local client reaches that version.
 
-- Pin Desktop or Engine versions in team docs so “works on my machine” includes engine minor version (**29.x** in this book).
-- On servers, install from Docker’s official repositories, enable the service at boot, and restrict who can talk to the Docker socket.
-- Treat corporate proxies and SSL inspection as first-class configuration: misconfigured TLS breaks pulls more often than “Docker is broken.”
+- Write the required Desktop or Engine version into team docs, so “works on my machine” includes the engine minor version (**29.x** in this book).
+- On servers, install from Docker’s official repositories, start the service at boot, and limit who can talk to the Docker socket.
+- Treat company proxies and SSL inspection as real configuration you must get right. Broken TLS settings stop image downloads far more often than a broken Docker does.
 
-**Failure mode:** half the team on an old Engine that lacks BuildKit defaults the docs assume. **Detect:** compare `docker version` Server lines in onboarding tickets. **Mitigate:** document and enforce a minimum Engine minor; fail CI on unsupported clients when practical.
+**Failure mode:** half the team runs an old Engine that lacks the BuildKit defaults the docs assume. **Detect:** compare the `docker version` Server lines collected during onboarding. **Mitigate:** document a minimum Engine version and enforce it; fail CI on unsupported clients when practical.
 
-**Do:** install from official docs, verify Server section, record versions. **Don’t:** scavenger-hunt random `docker-compose` binaries from old blog posts.
+**Do:** install from the official docs, confirm the Server section appears, and record the versions. **Don’t:** hunt down random `docker-compose` binaries from old blog posts.
 
 **Before you leave this section**
 
@@ -121,11 +131,15 @@ Always prefer the install guides on [docs.docker.com](https://docs.docker.com/en
 
 ### In plain terms
 
-Two commands tell you almost everything at the start: `docker version` (can the client reach a server?) and `docker run --rm hello-world` (can that server pull and run?). Verification is not bureaucracy—it is the fastest way to separate “CLI missing,” “daemon down,” “pull broken,” and “runtime broken.”
+Verifying the install means proving two things with two commands. `docker version` answers “can my client reach a server?” `docker run --rm hello-world` answers “can that server download an image and run it?”
 
-> ⚠️ **Common Pitfall:** Declaring victory after `docker` prints help text. A client without a Server section cannot build or run anything.
+Why bother, when you could just start working? Because these two commands split one vague complaint into four specific ones: the CLI is missing, the daemon is down, the download failed, or the runtime failed. Each has a different fix. Skipping this step is how people spend an afternoon editing a Dockerfile while the engine was never running.
+
+> ⚠️ **Common Pitfall:** Celebrating because `docker` printed its help text. Help text only proves the command exists. Without a Server section, that client cannot build or run anything.
 
 ### Under the hood
+
+Here is what each command shows you.
 
 #### `docker version`
 
@@ -133,7 +147,7 @@ Two commands tell you almost everything at the start: `docker version` (can the 
 $ docker version
 ```
 
-You should see **Client** and **Server** sections. If Client appears but Server errors with “Cannot connect to the Docker daemon,” the engine is not running or the client cannot reach its socket/pipe.
+You should see both a **Client** and a **Server** section. If Client appears but Server reports “Cannot connect to the Docker daemon,” then either the engine is not running, or the client cannot reach the socket or named pipe it uses to talk to the engine.
 
 Sample shape (versions will differ; this book targets **29.x**):
 
@@ -152,7 +166,7 @@ Server: Docker Desktop
   OS/Arch:          linux/amd64
 ```
 
-Notice **Client OS/Arch** may be Windows/macOS while **Server OS/Arch** is `linux/amd64` or `linux/arm64`. That is expected on Desktop: your CLI runs on the host OS; containers run in a Linux engine.
+Notice that **Client OS/Arch** may say Windows or macOS while **Server OS/Arch** says `linux/amd64` or `linux/arm64`. That is normal on Desktop. Your command line runs on your own operating system, and your containers run inside a Linux engine.
 
 #### `docker info`
 
@@ -160,7 +174,7 @@ Notice **Client OS/Arch** may be Windows/macOS while **Server OS/Arch** is `linu
 $ docker info
 ```
 
-Skim for: server version, storage driver / image store, logging driver, CPUs, total memory, and whether BuildKit is active. You do not memorize this output—you learn where to look when troubleshooting.
+Skim for the server version, the storage driver or image store, the logging driver, the CPU count, total memory, and whether BuildKit is active. Nobody memorizes this output. You just learn where to look when something is wrong.
 
 #### The classic smoke test
 
@@ -174,19 +188,19 @@ This message shows that your installation appears to be working correctly.
 ...
 ```
 
-`--rm` removes the container after it exits so your system does not accumulate one-off containers.
+`--rm` deletes the container once it exits, so you do not pile up dozens of one-shot containers.
 
-**What breaks if only `docker version` Client works:** every `run`/`build`/`pull` fails with daemon connection errors. Start Desktop or `systemctl start docker`, then re-check Server.
+**What breaks if only the Client half of `docker version` works:** every `run`, `build`, and `pull` fails with daemon connection errors. Start Desktop, or run `systemctl start docker`, then check for the Server section again.
 
 ### In production
 
-**Ownership:** whoever provisions the machine owns the post-install health check; the developer owns pasting Client/Server versions into the first support ticket.
+**Ownership:** whoever sets up the machine owns the health check that follows the install. The developer owns pasting Client and Server versions into the first support ticket.
 
-Automate a post-install health check in onboarding docs: `docker version`, `docker info`, and a known-good pull. Record Client version, Engine version, and Server OS/Arch so support tickets start with facts.
+Put a health check into your onboarding docs and run it every time: `docker version`, `docker info`, and one pull you know should work. Record the client version, the engine version, and the server OS/Arch, so support tickets start with facts instead of guesses.
 
-**Failure mode:** “Docker doesn’t work” tickets with no version output. **Detect:** missing Server section or non-29.x Engine when the book/runbook assumes 29.x. **Mitigate:** template the three commands into the ticket form.
+**Failure mode:** “Docker doesn’t work” tickets with no version output attached. **Detect:** a missing Server section, or an Engine that is not 29.x when the runbook assumes 29.x. **Mitigate:** put those three commands directly into the ticket template.
 
-**Do:** capture version output before deep debugging. **Don’t:** upgrade randomly mid-incident without noting the before/after versions.
+**Do:** capture version output before you start deep debugging. **Don’t:** upgrade at random during an incident without writing down the before and after versions.
 
 **Before you leave this section**
 
@@ -200,9 +214,13 @@ Automate a post-install health check in onboarding docs: `docker version`, `dock
 
 ### In plain terms
 
-You type `docker …`. A client sends an API request. A long-running engine accepts it, then asks lower-level runtimes to create the actual isolated process. Registries sit on the side for pull and push.
+Docker is not one program. It is a short chain of programs, and each link can fail on its own.
 
-Think of failures as layered too. “Docker is broken” almost always means one layer: wrong context, daemon down, registry unreachable, runtime cannot create, or the app process crashed. Architecture gives you a map so you stop restarting Desktop as the only trick.
+You type `docker …`. The client turns that into an API request and sends it. The engine, which has been running in the background the whole time, accepts the request. The engine then asks smaller, lower-level programs to create the isolated process. Registries sit off to the side, used only for downloads and uploads.
+
+Why should you care about the chain? Because “Docker is broken” is never true. One link is broken. It is the wrong context, or the daemon is down, or the registry cannot be reached, or the runtime could not create the container, or your app crashed on its own. Knowing the chain replaces “restart Desktop and pray” with an actual diagnosis.
+
+> 💡 **In one line:** The `docker` command only sends messages; a background service called `dockerd` does all the real work, so always ask which of the two is broken.
 
 ```mermaid
 flowchart LR
@@ -216,13 +234,15 @@ flowchart LR
 
 *Figure 02.2: A `docker` request travels from the CLI through the Engine API, dockerd, containerd, and runc to the container process.*
 
-> ⚠️ **Common Pitfall:** You might think the `docker` binary itself creates namespaces. It does not. Without a reachable daemon API, the CLI is only a client.
+> ⚠️ **Common Pitfall:** You might think the `docker` program itself creates the container’s isolation. It does not. If it cannot reach the daemon’s API, the `docker` command is just a messenger with nobody to deliver to.
 
 ### Under the hood
 
+Here is what actually happens on the machine, layer by layer.
+
 #### Docker Client
 
-The `docker` binary parses your command and sends an API request to the engine. It does not itself create namespaces or start processes (except by talking to the daemon).
+The `docker` program reads your command, checks it, and sends an API request to the engine. It never creates namespaces or starts processes itself. Everything it appears to do, it does by asking the daemon.
 
 #### Docker Engine (`dockerd`)
 
@@ -235,9 +255,9 @@ The long-running daemon that:
 
 #### containerd and runc
 
-Modern Docker uses **containerd** as a core container runtime component, which in turn often uses **runc** (or another OCI runtime) to spawn the actual container process. You rarely invoke these directly as a beginner, but error messages sometimes mention them—now you know they sit under the hood.
+Modern Docker hands the container work to **containerd**, a service that manages the container lifecycle. containerd in turn calls **runc**, a small program that actually starts the isolated process. You will rarely run either one yourself. You do need to recognize their names, because error messages mention them.
 
-On fresh Docker Engine **29.x** installs, the **containerd image store** is typically the default for image content (snapshotters such as `overlayfs`). Upgraded daemons may still report legacy graph drivers until migrated—check `docker info` when disk or multi-platform behavior looks odd (Chapter 03 and 07 expand storage implications).
+On a fresh Docker Engine **29.x** install, the **containerd image store** is normally the default place image content is kept, using snapshotters such as `overlayfs`. Engines that were upgraded from older versions may still report the older graph drivers until they are migrated. Check `docker info` when disk usage or multi-platform behavior looks strange. Chapters 03 and 07 go further into what this means for storage.
 
 ```bash
 $ docker info --format 'ServerVersion={{.ServerVersion}} Driver={{.Driver}} LoggingDriver={{.LoggingDriver}}'
@@ -254,23 +274,23 @@ The engine keeps local state:
 | Networks | How containers reach each other and the host |
 | Volumes | Persistent data managed by Docker |
 
-Chapter 03 focuses on images; Chapter 05 on containers; Chapters 06 and 07 cover networks and volumes.
+Chapter 03 covers images, Chapter 05 covers containers, and Chapters 06 and 07 cover networks and volumes.
 
-**What breaks if disk fills with images/logs:** creates and pulls fail with obscure I/O errors; the “app” looks guilty. Check `docker system df` and logging rotation before rewriting application code.
+**What breaks if the disk fills up with images and logs:** creates and pulls fail with confusing I/O errors, and the application looks guilty when it is not. Run `docker system df` and check log rotation before you touch application code.
 
 ### In production
 
-**Ownership:** platform owns daemon config, socket exposure, and engine upgrades; app teams own images/containers within that sandbox.
+**Ownership:** the platform team owns daemon configuration, who can reach the socket, and engine upgrades. App teams own their images and containers inside that boundary.
 
-Know this stack so failures map to layers: CLI/context problems, daemon down, pull/registry failures, runtime create/start failures, or application crashes.
+Learn this stack so every failure lands on a layer: a CLI or context problem, a daemon that is down, a registry that cannot be reached, a runtime that could not create or start the container, or an application that crashed.
 
-**Failure mode:** unauthenticated TCP Docker API on a public interface. **Detect:** unexpected remote `docker ps` success; security scans finding open daemon ports. **Mitigate:** local socket only; TLS + auth if remote API is required; never expose raw daemon API to the internet.
+**Failure mode:** the Docker API exposed over TCP, on a public network address, with no authentication. **Detect:** a remote `docker ps` that unexpectedly succeeds, or a security scan that finds open daemon ports. **Mitigate:** use the local socket only. If you truly need a remote API, require TLS and authentication. Never put the raw daemon API on the internet.
 
-> 🏭 **Production floor:** Anyone who can talk to the Docker socket can usually escalate to root-equivalent control of the host. Treat socket access like sudo. Incident tickets should note *which* identity had socket access when a suspicious container appeared.
+> 🏭 **Production floor:** Anyone who can talk to the Docker socket can usually take root-level control of the host. Treat socket access like sudo. When a suspicious container appears, the incident ticket must record *which* identity had socket access.
 
-**Do:** map errors to the layer in Figure 02.2. **Don’t:** mount the socket into untrusted app containers.
+**Do:** map every error to a layer in Figure 02.2. **Don’t:** mount the socket into untrusted app containers.
 
-> 📘 **Deep Dive (optional):** The Docker API can be spoken by other clients (SDKs, CI plugins, Portainer). Anything with access to the socket can do what the CLI can do—treat socket exposure as privileged access.
+> 📘 **Deep Dive (optional):** Other tools speak the Docker API too—language SDKs, CI plugins, and dashboards like Portainer. Anything that reaches the socket can do everything the CLI can do. Treat socket access as privileged access, no matter what is holding it.
 
 **Before you leave this section**
 
@@ -284,11 +304,17 @@ Know this stack so failures map to layers: CLI/context problems, daemon down, pu
 
 ### In plain terms
 
-A **context** is a named “which kitchen am I ordering from?” setting for the client. Beginners usually stay on the default Desktop or local context. The problem contexts solve is intentional targeting: laptop versus remote jump-host engine versus CI—without editing shell profiles by accident every week.
+A **context** is a saved setting that tells the `docker` client which engine to send commands to. In restaurant terms: which kitchen am I ordering from?
 
-> ⚠️ **Common Pitfall:** Exporting `DOCKER_HOST` in a terminal profile and forgetting it. Suddenly builds land on another machine (or fail), and “my images disappeared.”
+Why care? Because you can have more than one engine available—the one on your laptop, one on a remote build server, one in CI. Contexts let you point at a specific engine on purpose, by name. Without them, people set environment variables by hand and then forget they did.
+
+Most beginners never leave the default Desktop or local context, and that is fine. Just know the setting exists, so that when commands hit the wrong machine you know where to look.
+
+> ⚠️ **Common Pitfall:** Setting `DOCKER_HOST` in a terminal profile and forgetting about it. Weeks later builds run on another machine, or fail outright, and it looks like “my images disappeared.”
 
 ### Under the hood
+
+Here is what actually happens on the machine.
 
 ```bash
 $ docker context ls
@@ -300,9 +326,9 @@ default           Current DOCKER_HOST based configuration   npipe:////./pipe/doc
 desktop-linux *   Docker Desktop                            npipe:////./pipe/dockerDesktopLinuxEngine
 ```
 
-On Linux the default API endpoint is often the Unix socket `unix:///var/run/docker.sock`. On Docker Desktop for Windows it may be an `npipe://` named pipe. You normally do not configure this by hand.
+On Linux, the default place the client sends requests is the Unix socket `unix:///var/run/docker.sock`—a special file used for local communication between programs. On Docker Desktop for Windows, it is usually an `npipe://` named pipe, which does the same job on Windows. You almost never set this by hand.
 
-If commands suddenly hit the wrong machine, check the active context:
+If commands suddenly reach the wrong machine, check the active context:
 
 ```bash
 $ docker context show
